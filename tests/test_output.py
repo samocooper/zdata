@@ -2,7 +2,7 @@ import zarr
 import numpy as np
 
 # Open the output zarr array
-zarr_path = '/home/ubuntu/zarr_work/tmp/tmp_rows.zarr'
+zarr_path = '/home/ubuntu/zarr_work/test.zdata'
 g = zarr.open_group(zarr_path, mode='r')
 
 if 'X_RM' not in g:
