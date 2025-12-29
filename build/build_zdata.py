@@ -1,5 +1,4 @@
 import zarr
-from zarr.codecs import ShardingCodec
 from scipy.sparse import csr_matrix, csc_matrix
 import numpy as np
 
@@ -9,27 +8,47 @@ with open("/home/ubuntu/zarr_work/zdata/files/2ks10c_genes.txt") as f:
 zarr_path = '/home/ubuntu/zarr_work/zarr_datasets/external_andrews_hepatolcommun_2022_34792289.zarr'
 zarr_group = zarr.open(zarr_path, mode='r')
 
-# number of columns (usually len(var))
-n_cols = zarr_group["var"]["gene"].shape[0]
+# number of columns
+n_old_cols = zarr_group["var"]["gene"].shape[0]  # Original number of columns in zarr file
+n_new_cols = len(gene_list)  # New number of columns after mapping
 n_rows = zarr_group["obs"]["barcode"].shape[0]
 
 out_path = '/home/ubuntu/zarr_work/tmp/tmp_rows.zarr'
 name = "X_RM"
 
-length, width = n_rows, n_cols
-chunks = (500, n_cols)
+length, width = n_rows, n_new_cols
+chunks = (32, n_new_cols)  # 32 rows per chunk, with 32 chunks per shard = 32x32 = 1024 rows per shard
 dtype = np.float32
 shard_length = 32
 
-# Configure sharding codec
-sharding_codec = ShardingCodec(chunks_per_shard=shard_length)
+# Configure codec with sharding
+# In zarr v3, sharding wraps another codec
+try:
+    from zarr.codecs import ShardingCodec, BytesCodec
+    inner_codec = BytesCodec()
+    codec = ShardingCodec(codec=inner_codec, chunks_per_shard=shard_length)
+except (ImportError, AttributeError, TypeError):
+    # Fallback: try alternative sharding configuration
+    try:
+        codec = ShardingCodec(chunks_per_shard=shard_length)
+    except:
+        codec = None
+        print("Warning: Sharding codec not available, creating array without sharding")
 
 g = zarr.open_group(out_path, mode="w")  # use mode="a" to append to existing store
 
-X_RM = g.create_array(name, shape=(length, width),
-                     chunks=chunks, dtype=dtype, 
-                     codec=sharding_codec,
-                     overwrite=True, fill_value=0.0)
+create_kwargs = {
+    'shape': (length, width),
+    'chunks': chunks,
+    'dtype': dtype,
+    'overwrite': True,
+    'fill_value': 0.0
+}
+
+if codec is not None:
+    create_kwargs['codec'] = codec
+
+X_RM = g.create_array(name, **create_kwargs)
 
 X = zarr_group['X']
 gene_array = zarr_group['var']['gene']
@@ -42,10 +61,9 @@ for new_idx, gene in enumerate(gene_list):
     if gene in gene_to_old_idx:
         old_to_new_idx[gene_to_old_idx[gene]] = new_idx
 
-n_new_cols = len(gene_list)
-chunk_size = 500
+chunk_size = 32  # 32 rows per chunk to match zarr chunk size
 
-# Iterate over 500-row chunks
+# Iterate over 32-row chunks
 for r0 in range(0, n_rows, chunk_size):
     r1 = min(r0 + chunk_size, n_rows)
     chunk_n_rows = r1 - r0
@@ -63,14 +81,14 @@ for r0 in range(0, n_rows, chunk_size):
     # rebase indptr to start at zero
     indptr = indptr - start
     
-    X_chunk = csr_matrix((data, indices, indptr), shape=(chunk_n_rows, n_cols))
+    # Create matrix with original column count (n_old_cols) to match indices from zarr
+    X_chunk = csr_matrix((data, indices, indptr), shape=(chunk_n_rows, n_old_cols))
     X_chunk = X_chunk.tocsc()
     
     # Get CSC arrays
     old_data = X_chunk.data
     old_indices = X_chunk.indices
     old_indptr = X_chunk.indptr
-    n_old_cols = X_chunk.shape[1]
     
     # Initialize column storage
     new_col_data = [[] for _ in range(n_new_cols)]
