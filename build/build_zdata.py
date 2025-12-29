@@ -13,42 +13,49 @@ n_old_cols = zarr_group["var"]["gene"].shape[0]  # Original number of columns in
 n_new_cols = len(gene_list)  # New number of columns after mapping
 n_rows = zarr_group["obs"]["barcode"].shape[0]
 
-out_path = '/home/ubuntu/zarr_work/tmp/tmp_rows.zarr'
-name = "X_RM"
+out_path = '/home/ubuntu/zarr_work/test.zdata'
 
-length, width = n_rows, n_new_cols
-chunks = (32, n_new_cols)  # 32 rows per chunk, with 32 chunks per shard = 32x32 = 1024 rows per shard
-dtype = np.float32
-shard_length = 32
 
-# Configure codec with sharding
-# In zarr v3, sharding wraps another codec
-try:
-    from zarr.codecs import ShardingCodec, BytesCodec
-    inner_codec = BytesCodec()
-    codec = ShardingCodec(codec=inner_codec, chunks_per_shard=shard_length)
-except (ImportError, AttributeError, TypeError):
-    # Fallback: try alternative sharding configuration
-    try:
-        codec = ShardingCodec(chunks_per_shard=shard_length)
-    except:
-        codec = None
-        print("Warning: Sharding codec not available, creating array without sharding")
+dtype = np.uint16
+max_uint16 = np.iinfo(np.uint16).max  # 65535
 
 g = zarr.open_group(out_path, mode="w")  # use mode="a" to append to existing store
 
-create_kwargs = {
-    'shape': (length, width),
+rm_shard_size = 1024  
+rm_chunk_size = 16 # Must be divisor of shard_size
+
+shards = (rm_shard_size, n_new_cols)
+chunks = (rm_chunk_size, n_new_cols)
+
+row_major_kwargs = {
+    'shape': (n_rows, n_new_cols),
+    'shards': shards,
     'chunks': chunks,
     'dtype': dtype,
     'overwrite': True,
-    'fill_value': 0.0
+    'fill_value': 0,
+    'config':{'order': 'C'},
 }
 
-if codec is not None:
-    create_kwargs['codec'] = codec
+X_RM = g.create_array("X_RM", **row_major_kwargs)
 
-X_RM = g.create_array(name, **create_kwargs)
+cm_shard_size = 1024  
+cm_chunk_size = 16 # Must be divisor of shard_size
+
+shards = (n_rows, cm_shard_size)
+chunks = (n_rows, cm_chunk_size)
+
+column_major_kwargs = {
+    'shape': (n_rows, n_new_cols),
+    'shards': shards,
+    'chunks': chunks,
+    'dtype': dtype,
+    'overwrite': True,
+    'fill_value': 0,
+    'config':{'order': 'F'},
+}
+
+X_CM = g.create_array("X_CM", **column_major_kwargs)
 
 X = zarr_group['X']
 gene_array = zarr_group['var']['gene']
@@ -61,11 +68,10 @@ for new_idx, gene in enumerate(gene_list):
     if gene in gene_to_old_idx:
         old_to_new_idx[gene_to_old_idx[gene]] = new_idx
 
-chunk_size = 32  # 32 rows per chunk to match zarr chunk size
-
-# Iterate over 32-row chunks
-for r0 in range(0, n_rows, chunk_size):
-    r1 = min(r0 + chunk_size, n_rows)
+# Iterate over processing chunks
+process_chunk_size = rm_shard_size  # Use row-major shard size for processing
+for r0 in range(0, n_rows, process_chunk_size):
+    r1 = min(r0 + process_chunk_size, n_rows)
     chunk_n_rows = r1 - r0
     
     print(f"Processing rows {r0} to {r1-1} ({chunk_n_rows} rows)")
@@ -113,20 +119,19 @@ for r0 in range(0, n_rows, chunk_size):
         new_indices.extend(new_col_indices[new_col])
         new_indptr.append(len(new_data))
     
-    # Create new CSC matrix
+    # Create new CSC matrix, then convert to dense for efficient chunk-aligned writing
     X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), shape=(chunk_n_rows, n_new_cols)).tocsc()
     
-    # Stream sparse chunk into zarr array efficiently
-    # Convert to COO format to get (row, col, data) tuples
-    coo = X_chunk_reordered.tocoo()
+    # Convert to dense format for efficient chunk-aligned writing
+    # This improves query performance by writing full chunks
+    X_chunk_dense = X_chunk_reordered.toarray()
     
-    # Adjust row indices to global coordinates (r0 offset)
-    rows = coo.row + r0
-    cols = coo.col
-    chunk_data = coo.data.astype(dtype)
+    # Clip values to uint16 range and convert to uint16
+    X_chunk_dense = np.clip(X_chunk_dense, 0, max_uint16).astype(dtype)
     
-    # Write non-zero values directly to zarr array
-    # Using advanced indexing to write only sparse positions
-    X_RM[rows, cols] = chunk_data
+    # Write entire dense chunk at once (chunk-aligned for optimal read performance)
+    # This is more efficient than sparse writes for dense zarr arrays
+    X_RM[r0:r1, :] = X_chunk_dense
+    X_CM[r0:r1, :] = X_chunk_dense
 
 print(f"Completed processing all {n_rows} rows")
