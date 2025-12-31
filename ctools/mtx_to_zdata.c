@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -14,11 +15,11 @@
 
 /* Simple block-CSR structure (for 16 rows) */
 typedef struct {
-    int32_t nnz;         /* total nnz in this block */
-    int32_t *indptr;     /* length BLOCK_ROWS+1 */
-    int32_t *indices;    /* length nnz */
-    float   *data;       /* length nnz */
-    int32_t write_pos[BLOCK_ROWS];
+    uint32_t nnz;         /* total nnz in this block */
+    uint32_t *indptr;     /* length BLOCK_ROWS+1 */
+    uint32_t *indices;    /* length nnz */
+    uint16_t *data;       /* length nnz */
+    uint32_t write_pos[BLOCK_ROWS];
 } BlockCSR;
 
 static int skip_to_size_line(FILE *f, char *line, size_t line_sz) {
@@ -35,38 +36,37 @@ static void write_le32(uint8_t *dst, uint32_t v) {
     dst[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-static void write_lef32(uint8_t *dst, float f) {
-    uint32_t v;
-    memcpy(&v, &f, sizeof(v));
-    write_le32(dst, v);
+static void write_le16(uint8_t *dst, uint16_t v) {
+    dst[0] = (uint8_t)(v & 0xFF);
+    dst[1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
 /* Serialize a 16-row CSR block into a single contiguous blob.
    Layout (all little-endian):
      u32 magic ('ZCSR' = 0x5253435A)
-     u32 version (1)
+     u32 version (2)
      u32 start_row
-     u32 nrows_in_block (always 16 except last, but here always 16 for first 4096)
+     u32 nrows_in_block
      u32 ncols
      u32 nnz
-     i32 indptr[17]
-     i32 indices[nnz]
-     f32 data[nnz]
+     u32 indptr[17]
+     u32 indices[nnz]
+     u16 data[nnz]
 */
 static uint8_t* serialize_block(
     const BlockCSR *b,
-    int32_t start_row,
-    int32_t nrows_in_block,
-    int32_t ncols,
+    uint32_t start_row,
+    uint32_t nrows_in_block,
+    uint32_t ncols,
     size_t *out_size
 ) {
     const uint32_t magic = 0x5253435A; /* 'ZCSR' little-endian bytes */
-    const uint32_t version = 1;
+    const uint32_t version = 2;  /* Version 2: uint16_t data, uint32_t indices/indptr */
 
     size_t header_bytes = 6 * 4; /* 6 u32 */
-    size_t indptr_bytes = (BLOCK_ROWS + 1) * sizeof(int32_t);
-    size_t indices_bytes = (size_t)b->nnz * sizeof(int32_t);
-    size_t data_bytes = (size_t)b->nnz * sizeof(float);
+    size_t indptr_bytes = (BLOCK_ROWS + 1) * sizeof(uint32_t);
+    size_t indices_bytes = (size_t)b->nnz * sizeof(uint32_t);
+    size_t data_bytes = (size_t)b->nnz * sizeof(uint16_t);
 
     size_t total = header_bytes + indptr_bytes + indices_bytes + data_bytes;
     uint8_t *buf = (uint8_t*)malloc(total);
@@ -75,27 +75,27 @@ static uint8_t* serialize_block(
     size_t off = 0;
     write_le32(buf + off, magic); off += 4;
     write_le32(buf + off, version); off += 4;
-    write_le32(buf + off, (uint32_t)start_row); off += 4;
-    write_le32(buf + off, (uint32_t)nrows_in_block); off += 4;
-    write_le32(buf + off, (uint32_t)ncols); off += 4;
+    write_le32(buf + off, start_row); off += 4;
+    write_le32(buf + off, nrows_in_block); off += 4;
+    write_le32(buf + off, ncols); off += 4;
     write_le32(buf + off, (uint32_t)b->nnz); off += 4;
 
     /* indptr */
     for (int i = 0; i < BLOCK_ROWS + 1; i++) {
-        write_le32(buf + off, (uint32_t)b->indptr[i]);
+        write_le32(buf + off, b->indptr[i]);
         off += 4;
     }
 
     /* indices */
-    for (int32_t i = 0; i < b->nnz; i++) {
-        write_le32(buf + off, (uint32_t)b->indices[i]);
+    for (uint32_t i = 0; i < b->nnz; i++) {
+        write_le32(buf + off, b->indices[i]);
         off += 4;
     }
 
     /* data */
-    for (int32_t i = 0; i < b->nnz; i++) {
-        write_lef32(buf + off, b->data[i]);
-        off += 4;
+    for (uint32_t i = 0; i < b->nnz; i++) {
+        write_le16(buf + off, b->data[i]);
+        off += 2;
     }
 
     *out_size = total;
@@ -170,8 +170,8 @@ static int end_stream_to_file(ZSTD_seekable_CStream *zcs, FILE *out) {
 }
 
 /* Count nnz per row for all rows in the file (cached for reuse) */
-static int32_t* count_all_rows(FILE *f, long data_start_pos, long long nrows) {
-    int32_t *row_counts = (int32_t*)calloc((size_t)nrows, sizeof(int32_t));
+static uint32_t* count_all_rows(FILE *f, long data_start_pos, long long nrows) {
+    uint32_t *row_counts = (uint32_t*)calloc((size_t)nrows, sizeof(uint32_t));
     if (!row_counts) {
         fprintf(stderr, "OOM row_counts\n");
         return NULL;
@@ -198,60 +198,59 @@ static int32_t* count_all_rows(FILE *f, long data_start_pos, long long nrows) {
 static int process_chunk(
     FILE *f,
     long data_start_pos,
-    int32_t ncols,
+    uint32_t ncols,
     long long start_row_global,
     long long end_row_global,
-    const int32_t *cached_row_counts,  /* Pre-computed counts for all rows */
+    const uint32_t *cached_row_counts,  /* Pre-computed counts for all rows */
     const char *out_path
 ) {
-    int32_t chunk_size = (int32_t)(end_row_global - start_row_global);
-    if (chunk_size <= 0) return 1;
+    uint32_t chunk_size = (uint32_t)(end_row_global - start_row_global);
+    if (chunk_size == 0) return 1;
     if (chunk_size > MAX_ROWS) chunk_size = MAX_ROWS;
 
     /* Extract row counts for this chunk from cache */
-    int32_t *row_counts = (int32_t*)malloc(chunk_size * sizeof(int32_t));
+    uint32_t *row_counts = (uint32_t*)malloc(chunk_size * sizeof(uint32_t));
     if (!row_counts) { fprintf(stderr, "OOM row_counts\n"); return 0; }
 
-    for (int32_t i = 0; i < chunk_size; i++) {
+    for (uint32_t i = 0; i < chunk_size; i++) {
         row_counts[i] = cached_row_counts[start_row_global + i];
     }
 
-    char line[4096];
-    long long row, col;
-    double value;
-
     /* Allocate blocks */
-    int32_t nblocks = (chunk_size + BLOCK_ROWS - 1) / BLOCK_ROWS; /* ceil division */
+    uint32_t nblocks = (chunk_size + BLOCK_ROWS - 1) / BLOCK_ROWS;
     BlockCSR *blocks = (BlockCSR*)calloc(nblocks, sizeof(BlockCSR));
     if (!blocks) { fprintf(stderr, "OOM blocks\n"); free(row_counts); return 0; }
 
-    for (int32_t b = 0; b < nblocks; b++) {
-        blocks[b].indptr = (int32_t*)malloc((BLOCK_ROWS + 1) * sizeof(int32_t));
+    for (uint32_t b = 0; b < nblocks; b++) {
+        blocks[b].indptr = (uint32_t*)malloc((BLOCK_ROWS + 1) * sizeof(uint32_t));
         if (!blocks[b].indptr) { fprintf(stderr, "OOM indptr\n"); return 0; }
 
         blocks[b].indptr[0] = 0;
-        for (int32_t r = 0; r < BLOCK_ROWS; r++) {
-            int32_t local_row = b * BLOCK_ROWS + r;
-            int32_t c = (local_row < chunk_size) ? row_counts[local_row] : 0;
-            blocks[b].indptr[r + 1] = blocks[b].indptr[r] + c;
+        for (uint32_t r = 0; r < BLOCK_ROWS; r++) {
+            uint32_t local_row = b * BLOCK_ROWS + r;
+            blocks[b].indptr[r + 1] = blocks[b].indptr[r] + 
+                ((local_row < chunk_size) ? row_counts[local_row] : 0);
         }
 
         blocks[b].nnz = blocks[b].indptr[BLOCK_ROWS];
         if (blocks[b].nnz > 0) {
-            blocks[b].indices = (int32_t*)malloc((size_t)blocks[b].nnz * sizeof(int32_t));
-            blocks[b].data    = (float*)malloc((size_t)blocks[b].nnz * sizeof(float));
+            blocks[b].indices = (uint32_t*)malloc((size_t)blocks[b].nnz * sizeof(uint32_t));
+            blocks[b].data    = (uint16_t*)malloc((size_t)blocks[b].nnz * sizeof(uint16_t));
             if (!blocks[b].indices || !blocks[b].data) {
                 fprintf(stderr, "OOM indices/data\n");
                 return 0;
             }
         }
 
-        for (int32_t r = 0; r < BLOCK_ROWS; r++) {
+        for (uint32_t r = 0; r < BLOCK_ROWS; r++) {
             blocks[b].write_pos[r] = blocks[b].indptr[r];
         }
     }
 
-    /* Pass 2: fill blocks */
+    /* Fill blocks with data */
+    char line[4096];
+    long long row, col;
+    double value;
     fseek(f, data_start_pos, SEEK_SET);
     while (fgets(line, sizeof(line), f)) {
         int n = sscanf(line, "%lld %lld %lf", &row, &col, &value);
@@ -261,13 +260,22 @@ static int process_chunk(
         col -= 1;
         if (row < start_row_global || row >= end_row_global) continue;
 
-        int32_t local_row = (int32_t)(row - start_row_global);
-        int32_t b = local_row / BLOCK_ROWS;
-        int32_t r = local_row % BLOCK_ROWS;
-        int32_t pos = blocks[b].write_pos[r]++;
+        uint32_t local_row = (uint32_t)(row - start_row_global);
+        uint32_t b = local_row / BLOCK_ROWS;
+        uint32_t r = local_row % BLOCK_ROWS;
+        uint32_t pos = blocks[b].write_pos[r]++;
 
-        blocks[b].indices[pos] = (int32_t)col;
-        blocks[b].data[pos]    = (n == 3) ? (float)value : 1.0f;
+        blocks[b].indices[pos] = (uint32_t)col;
+        
+        /* Convert value to uint16_t with clamping to [0, UINT16_MAX] */
+        if (n == 3) {
+            double clamped = value;
+            if (clamped < 0.0) clamped = 0.0;
+            if (clamped > (double)UINT16_MAX) clamped = (double)UINT16_MAX;
+            blocks[b].data[pos] = (uint16_t)(clamped + 0.5);
+        } else {
+            blocks[b].data[pos] = 1;
+        }
     }
 
     /* Write seekable archive: 1 frame per block */
@@ -292,14 +300,10 @@ static int process_chunk(
         return 0;
     }
 
-    for (int32_t b = 0; b < nblocks; b++) {
-        int32_t start_row = (int32_t)start_row_global + b * BLOCK_ROWS;
-        int32_t nrows_in_block = BLOCK_ROWS;
-        if (b == nblocks - 1) {
-            /* Last block may have fewer rows */
-            int32_t remaining = chunk_size - b * BLOCK_ROWS;
-            if (remaining < BLOCK_ROWS) nrows_in_block = remaining;
-        }
+    for (uint32_t b = 0; b < nblocks; b++) {
+        uint32_t start_row = (uint32_t)start_row_global + b * BLOCK_ROWS;
+        uint32_t nrows_in_block = (b == nblocks - 1) ? 
+            (chunk_size - b * BLOCK_ROWS) : BLOCK_ROWS;
 
         size_t blob_sz = 0;
         uint8_t *blob = serialize_block(&blocks[b], start_row, nrows_in_block, ncols, &blob_sz);
@@ -325,7 +329,7 @@ static int process_chunk(
         }
 
         if ((b % 32) == 0) {
-            printf("  Wrote frame for block %d/%d\n", b, nblocks);
+            printf("  Wrote frame for block %u/%u\n", b, nblocks);
         }
     }
 
@@ -340,7 +344,7 @@ static int process_chunk(
     fclose(out);
 
     /* Cleanup CSR blocks */
-    for (int32_t b = 0; b < nblocks; b++) {
+    for (uint32_t b = 0; b < nblocks; b++) {
         free(blocks[b].indptr);
         free(blocks[b].indices);
         free(blocks[b].data);
@@ -390,12 +394,12 @@ int main(int argc, char *argv[]) {
         fclose(f);
         return 1;
     }
-    if (ncols_ll > INT32_MAX) {
-        fprintf(stderr, "ncols too large for int32\n");
+    if (ncols_ll > UINT32_MAX) {
+        fprintf(stderr, "ncols too large for uint32\n");
         fclose(f);
         return 1;
     }
-    const int32_t ncols = (int32_t)ncols_ll;
+    const uint32_t ncols = (uint32_t)ncols_ll;
 
     long data_start_pos = ftell(f);
 
@@ -418,7 +422,7 @@ int main(int argc, char *argv[]) {
 
     /* Cache: count nnz per row for all rows (single pass) */
     printf("Counting non-zeros per row (caching for all chunks)...\n");
-    int32_t *cached_row_counts = count_all_rows(f, data_start_pos, nrows_ll);
+    uint32_t *cached_row_counts = count_all_rows(f, data_start_pos, nrows_ll);
     if (!cached_row_counts) {
         fclose(f);
         return 1;

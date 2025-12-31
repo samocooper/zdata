@@ -14,6 +14,9 @@ _project_root = _test_dir.parent  # This is /home/ubuntu/zdata_work/zdata
 _parent_dir = _project_root.parent  # This is /home/ubuntu/zdata_work
 sys.path.insert(0, str(_parent_dir))
 
+# Import build_zdata
+from zdata.core.build_zdata import build_zdata
+
 # Configuration
 ZSTD_BASE = "/home/ubuntu/zstd"
 CTOOLS_DIR = _project_root / "ctools"
@@ -130,8 +133,8 @@ def compile_c_tools():
     print("\n✓ Both C tools compiled successfully!")
     return True
 
-def build_zdata(mtx_file, output_name, output_dir):
-    """Build .zdata directory from MTX file."""
+def build_zdata_directory(mtx_file, output_name, output_dir):
+    """Build .zdata directory from MTX file using build_zdata wrapper."""
     print_section("Step 2: Building .zdata from MTX File")
     
     # Check if MTX file exists
@@ -155,19 +158,15 @@ def build_zdata(mtx_file, output_name, output_dir):
     output_parent = os.path.dirname(str(output_dir))
     output_name_only = os.path.basename(str(output_dir)).replace('.zdata', '')
     
-    # Build command
-    build_cmd = [
-        str(MTX_TO_ZDATA_BIN),
-        mtx_file,
-        output_name_only
-    ]
-    
     # Change to output parent directory for the build
     original_cwd = os.getcwd()
     try:
         os.chdir(output_parent)
-        if not run_command(build_cmd, f"Building {output_name}.zdata from {os.path.basename(mtx_file)}"):
-            return False
+        print(f"\nBuilding {output_name}.zdata from {os.path.basename(mtx_file)}...")
+        zdata_dir = build_zdata(mtx_file, output_name_only)
+    except Exception as e:
+        print(f"ERROR: Failed to build .zdata directory: {e}")
+        return False
     finally:
         os.chdir(original_cwd)
     
@@ -176,13 +175,19 @@ def build_zdata(mtx_file, output_name, output_dir):
         print(f"ERROR: Output directory was not created: {output_dir}")
         return False
     
+    # Check for metadata file
+    metadata_file = Path(output_dir) / "metadata.json"
+    if not metadata_file.exists():
+        print(f"ERROR: Metadata file not found: {metadata_file}")
+        return False
+    
     # Check for .bin files
     bin_files = list(Path(output_dir).glob("*.bin"))
     if not bin_files:
         print(f"ERROR: No .bin files found in {output_dir}")
         return False
     
-    print(f"\n✓ Successfully built {output_name}.zdata with {len(bin_files)} chunk files!")
+    print(f"\n✓ Successfully built {output_name}.zdata with {len(bin_files)} chunk files and metadata!")
     return True
 
 def run_tests(zdata_path):
@@ -254,7 +259,7 @@ def main():
         return 1
     
     # Step 2: Build .zdata
-    if not build_zdata(mtx_file, output_name, output_dir):
+    if not build_zdata_directory(mtx_file, output_name, output_dir):
         print("\n✗ Pipeline failed at build step")
         return 1
     
