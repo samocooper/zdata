@@ -13,7 +13,7 @@ _project_root = _test_dir.parent  # This is /home/ubuntu/zdata_work/zdata
 _parent_dir = _project_root.parent  # This is /home/ubuntu/zdata_work
 sys.path.insert(0, str(_parent_dir))
 
-from zdata.core.read_out import ZData
+from zdata.core.zdata import ZData
 import numpy as np
 import os
 

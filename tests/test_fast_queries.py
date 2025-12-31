@@ -18,7 +18,7 @@ import numpy as np
 import time
 import random
 import os
-from zdata.core.read_out import ZData
+from zdata.core.zdata import ZData
 from scipy.sparse import csr_matrix
 
 # Parse command-line arguments
