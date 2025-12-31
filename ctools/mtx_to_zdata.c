@@ -12,7 +12,7 @@
 
 /* Default values (can be overridden via command line) */
 #define DEFAULT_BLOCK_ROWS 16
-#define DEFAULT_MAX_ROWS   4096
+#define DEFAULT_MAX_ROWS   8192
 
 /* Simple block-CSR structure (variable number of rows per block) */
 typedef struct {
@@ -22,6 +22,14 @@ typedef struct {
     uint16_t *data;       /* length nnz */
     uint32_t *write_pos;  /* length block_rows (allocated dynamically) */
 } BlockCSR;
+
+/* Full CSR structure for the entire matrix */
+typedef struct {
+    uint32_t *indptr;     /* length nrows+1 */
+    uint32_t *indices;    /* length nnz_total */
+    uint16_t *data;       /* length nnz_total */
+    long long nnz_total;  /* total non-zeros */
+} FullCSR;
 
 static int skip_to_size_line(FILE *f, char *line, size_t line_sz) {
     do {
@@ -161,53 +169,321 @@ static int end_stream_to_file(ZSTD_seekable_CStream *zcs, FILE *out) {
     return 1;
 }
 
-/* Count nnz per row for all rows in the file (cached for reuse) */
-static uint32_t* count_all_rows(FILE *f, long data_start_pos, long long nrows) {
-    uint32_t *row_counts = (uint32_t*)calloc((size_t)nrows, sizeof(uint32_t));
-    if (!row_counts) {
-        fprintf(stderr, "OOM row_counts\n");
+/* Dynamic array structure for collecting entries per row */
+typedef struct {
+    uint32_t *indices;
+    uint16_t *data;
+    uint32_t size;
+    uint32_t capacity;
+} RowEntries;
+
+/* Fast manual parsing - much faster than sscanf */
+static int parse_line_fast(const char *line, long long *row, long long *col, double *value) {
+    const char *p = line;
+    
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '\n') return 0;
+    
+    /* Parse row */
+    *row = 0;
+    while (*p >= '0' && *p <= '9') {
+        *row = *row * 10 + (*p - '0');
+        p++;
+    }
+    
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '\n') return 1;  /* Only row and col */
+    
+    /* Parse col */
+    *col = 0;
+    while (*p >= '0' && *p <= '9') {
+        *col = *col * 10 + (*p - '0');
+        p++;
+    }
+    
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '\n') return 2;  /* Row and col only */
+    
+    /* Parse value (if present) */
+    *value = 0.0;
+    int sign = 1;
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
+    
+    /* Integer part */
+    while (*p >= '0' && *p <= '9') {
+        *value = *value * 10.0 + (*p - '0');
+        p++;
+    }
+    
+    /* Decimal part */
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p >= '0' && *p <= '9') {
+            *value += (*p - '0') * frac;
+            frac *= 0.1;
+            p++;
+        }
+    }
+    
+    /* Scientific notation (basic support) */
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        int exp_sign = 1;
+        if (*p == '-') {
+            exp_sign = -1;
+            p++;
+        } else if (*p == '+') {
+            p++;
+        }
+        int exp = 0;
+        while (*p >= '0' && *p <= '9') {
+            exp = exp * 10 + (*p - '0');
+            p++;
+        }
+        for (int i = 0; i < exp; i++) {
+            if (exp_sign > 0) *value *= 10.0;
+            else *value *= 0.1;
+        }
+    }
+    
+    *value *= sign;
+    return 3;  /* Row, col, and value */
+}
+
+/* Build full CSR structure from MTX file (single pass - optimized parsing) */
+static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, long long ncols, long long row_offset) {
+    /* Set input file to fully buffered for better performance */
+    setvbuf(f, NULL, _IOFBF, 1024 * 1024);  /* 1MB buffer */
+    
+    /* Allocate dynamic arrays for each row */
+    RowEntries *rows = (RowEntries*)calloc((size_t)nrows, sizeof(RowEntries));
+    if (!rows) {
+        fprintf(stderr, "OOM rows\n");
+        return NULL;
+    }
+    
+    /* Estimate initial capacity based on average nnz per row (if we have nnz info) */
+    /* For now, use a reasonable default that reduces reallocations */
+    const uint32_t INITIAL_CAPACITY = 64;  /* Increased from 16 to reduce reallocations */
+    for (long long i = 0; i < nrows; i++) {
+        rows[i].capacity = INITIAL_CAPACITY;
+        rows[i].indices = (uint32_t*)malloc(INITIAL_CAPACITY * sizeof(uint32_t));
+        rows[i].data = (uint16_t*)malloc(INITIAL_CAPACITY * sizeof(uint16_t));
+        if (!rows[i].indices || !rows[i].data) {
+            fprintf(stderr, "OOM initial row arrays\n");
+            /* Cleanup */
+            for (long long j = 0; j <= i; j++) {
+                if (rows[j].indices) free(rows[j].indices);
+                if (rows[j].data) free(rows[j].data);
+            }
+            free(rows);
+            return NULL;
+        }
+        rows[i].size = 0;
+    }
+
+    char line[8192];  /* Increased buffer size for longer lines */
+    long long row, col;
+    double value = 0.0;  /* Initialize to avoid warning */
+    long long lines_processed = 0;
+    long long last_progress = 0;
+
+    printf("  Building CSR structure (single pass, optimized)...\n");
+    fflush(stdout);
+    fseek(f, data_start_pos, SEEK_SET);
+    
+    while (fgets(line, sizeof(line), f)) {
+        /* Fast manual parsing instead of sscanf */
+        int n = parse_line_fast(line, &row, &col, &value);
+        if (n < 2) continue;
+        
+        /* Progress reporting every 50 million lines (reduced frequency for less I/O overhead) */
+        lines_processed++;
+        if (lines_processed - last_progress >= 50000000) {
+            printf("    Processed %lld lines...\n", lines_processed);
+            fflush(stdout);
+            last_progress = lines_processed;
+        }
+        
+        /* Convert from 1-based MTX to 0-based local row index */
+        long long local_row = row - 1;
+        col -= 1;
+        
+        /* Validate local row and column indices (before applying offset) */
+        if (local_row < 0 || local_row >= nrows || col < 0 || col >= ncols) continue;
+        
+        /* Apply row_offset to get global row index */
+        long long global_row = local_row + row_offset;
+        
+        /* Validate global row index is within expected range */
+        if (global_row < 0) continue;
+        
+        RowEntries *r = &rows[local_row];
+        
+        /* Grow array if needed (exponential growth) */
+        if (r->size >= r->capacity) {
+            uint32_t new_capacity = r->capacity * 2;
+            uint32_t *new_indices = (uint32_t*)realloc(r->indices, new_capacity * sizeof(uint32_t));
+            uint16_t *new_data = (uint16_t*)realloc(r->data, new_capacity * sizeof(uint16_t));
+            if (!new_indices || !new_data) {
+                fprintf(stderr, "OOM realloc row arrays\n");
+                /* Cleanup */
+                for (long long i = 0; i < nrows; i++) {
+                    free(rows[i].indices);
+                    free(rows[i].data);
+                }
+                free(rows);
+                return NULL;
+            }
+            r->indices = new_indices;
+            r->data = new_data;
+            r->capacity = new_capacity;
+        }
+        
+        /* Add entry */
+        r->indices[r->size] = (uint32_t)col;
+        
+        /* Convert value to uint16_t with clamping */
+        if (n == 3) {
+            double clamped = value;
+            if (clamped < 0.0) clamped = 0.0;
+            if (clamped > (double)UINT16_MAX) clamped = (double)UINT16_MAX;
+            r->data[r->size] = (uint16_t)(clamped + 0.5);
+        } else {
+            r->data[r->size] = 1;  /* Default value when no value field */
+        }
+        r->size++;
+    }
+    
+    if (lines_processed > 0 && lines_processed >= 50000000) {
+        printf("    Completed reading: %lld total lines processed\n", lines_processed);
+        fflush(stdout);
+    }
+
+    /* Build indptr and compute total nnz */
+    printf("  Converting to CSR format...\n");
+    fflush(stdout);
+    uint32_t *indptr = (uint32_t*)malloc((size_t)(nrows + 1) * sizeof(uint32_t));
+    if (!indptr) {
+        fprintf(stderr, "OOM indptr\n");
+        for (long long i = 0; i < nrows; i++) {
+            free(rows[i].indices);
+            free(rows[i].data);
+        }
+        free(rows);
+        return NULL;
+    }
+    
+    indptr[0] = 0;
+    long long nnz_total = 0;
+    for (long long i = 0; i < nrows; i++) {
+        nnz_total += rows[i].size;
+        indptr[i + 1] = (uint32_t)nnz_total;
+    }
+    
+    if (nnz_total == 0) {
+        fprintf(stderr, "Error: matrix has no non-zero elements\n");
+        free(indptr);
+        for (long long i = 0; i < nrows; i++) {
+            free(rows[i].indices);
+            free(rows[i].data);
+        }
+        free(rows);
         return NULL;
     }
 
-    char line[4096];
-    long long row, col;
-    double value;
-
-    fseek(f, data_start_pos, SEEK_SET);
-    while (fgets(line, sizeof(line), f)) {
-        int n = sscanf(line, "%lld %lld %lf", &row, &col, &value);
-        if (n < 2) continue;
-        row -= 1;
-        if (row >= 0 && row < nrows) {
-            row_counts[row] += 1;
+    /* Allocate final CSR arrays */
+    uint32_t *indices = (uint32_t*)malloc((size_t)nnz_total * sizeof(uint32_t));
+    uint16_t *data = (uint16_t*)malloc((size_t)nnz_total * sizeof(uint16_t));
+    if (!indices || !data) {
+        fprintf(stderr, "OOM indices/data\n");
+        free(indptr);
+        for (long long i = 0; i < nrows; i++) {
+            free(rows[i].indices);
+            free(rows[i].data);
         }
+        free(rows);
+        if (indices) free(indices);
+        if (data) free(data);
+        return NULL;
     }
 
-    return row_counts;
+    /* Copy data from row arrays to CSR arrays */
+    uint32_t pos = 0;
+    for (long long i = 0; i < nrows; i++) {
+        if (rows[i].size > 0) {
+            memcpy(indices + pos, rows[i].indices, rows[i].size * sizeof(uint32_t));
+            memcpy(data + pos, rows[i].data, rows[i].size * sizeof(uint16_t));
+            pos += rows[i].size;
+        }
+        /* Free row arrays as we go */
+        free(rows[i].indices);
+        free(rows[i].data);
+    }
+    free(rows);
+    
+    FullCSR *csr = (FullCSR*)malloc(sizeof(FullCSR));
+    if (!csr) {
+        fprintf(stderr, "OOM FullCSR\n");
+        free(indptr);
+        free(indices);
+        free(data);
+        return NULL;
+    }
+    
+    csr->indptr = indptr;
+    csr->indices = indices;
+    csr->data = data;
+    csr->nnz_total = nnz_total;
+    
+    printf("  CSR structure complete (%lld nnz)\n", nnz_total);
+    fflush(stdout);
+    
+    return csr;
 }
 
-/* Process a chunk of rows (start_row to end_row-1) and write to output file */
-static int process_chunk(
-    FILE *f,
-    long data_start_pos,
-    uint32_t ncols,
+static void free_full_csr(FullCSR *csr) {
+    if (csr) {
+        if (csr->indptr) free(csr->indptr);
+        if (csr->indices) free(csr->indices);
+        if (csr->data) free(csr->data);
+        free(csr);
+    }
+}
+
+/* Process a chunk of rows from CSR structure (faster - no file re-reading) */
+static int process_chunk_from_csr(
+    const FullCSR *csr,
     long long start_row_global,
     long long end_row_global,
-    const uint32_t *cached_row_counts,  /* Pre-computed counts for all rows */
     const char *out_path,
     uint32_t block_rows,
-    uint32_t max_rows
+    uint32_t max_rows,
+    long long row_offset,
+    uint32_t ncols  /* ncols from MTX file header - ensures consistency across all chunks */
 ) {
     uint32_t chunk_size = (uint32_t)(end_row_global - start_row_global);
     if (chunk_size == 0) return 1;
     if (chunk_size > max_rows) chunk_size = max_rows;
 
-    /* Extract row counts for this chunk from cache */
+    long long start_row_local = start_row_global - row_offset;
+    
+    /* Extract row counts from indptr: indptr[i+1] - indptr[i] = nnz in row i */
     uint32_t *row_counts = (uint32_t*)malloc(chunk_size * sizeof(uint32_t));
     if (!row_counts) { fprintf(stderr, "OOM row_counts\n"); return 0; }
 
     for (uint32_t i = 0; i < chunk_size; i++) {
-        row_counts[i] = cached_row_counts[start_row_global + i];
+        long long row_idx = start_row_local + i;
+        row_counts[i] = csr->indptr[row_idx + 1] - csr->indptr[row_idx];
     }
 
     /* Allocate blocks */
@@ -244,34 +520,21 @@ static int process_chunk(
         }
     }
 
-    /* Fill blocks with data */
-    char line[4096];
-    long long row, col;
-    double value;
-    fseek(f, data_start_pos, SEEK_SET);
-    while (fgets(line, sizeof(line), f)) {
-        int n = sscanf(line, "%lld %lld %lf", &row, &col, &value);
-        if (n < 2) continue;
-
-        row -= 1;
-        col -= 1;
-        if (row < start_row_global || row >= end_row_global) continue;
-
-        uint32_t local_row = (uint32_t)(row - start_row_global);
-        uint32_t b = local_row / block_rows;
-        uint32_t r = local_row % block_rows;
-        uint32_t pos = blocks[b].write_pos[r]++;
-
-        blocks[b].indices[pos] = (uint32_t)col;
+    /* Fill blocks with data from CSR structure (much faster - no file I/O) */
+    for (uint32_t i = 0; i < chunk_size; i++) {
+        long long row_idx = start_row_local + i;
+        uint32_t row_start = csr->indptr[row_idx];
+        uint32_t row_end = csr->indptr[row_idx + 1];
+        uint32_t row_nnz = row_end - row_start;
         
-        /* Convert value to uint16_t with clamping to [0, UINT16_MAX] */
-        if (n == 3) {
-            double clamped = value;
-            if (clamped < 0.0) clamped = 0.0;
-            if (clamped > (double)UINT16_MAX) clamped = (double)UINT16_MAX;
-            blocks[b].data[pos] = (uint16_t)(clamped + 0.5);
-        } else {
-            blocks[b].data[pos] = 1;
+        uint32_t b = i / block_rows;
+        uint32_t r = i % block_rows;
+        
+        /* Copy indices and data for this row from CSR */
+        for (uint32_t j = 0; j < row_nnz; j++) {
+            uint32_t pos = blocks[b].write_pos[r]++;
+            blocks[b].indices[pos] = csr->indices[row_start + j];
+            blocks[b].data[pos] = csr->data[row_start + j];
         }
     }
 
@@ -280,7 +543,7 @@ static int process_chunk(
     if (!out) { perror("open out"); return 0; }
     
     /* Set output file to fully buffered for better performance (reduces system calls) */
-    setvbuf(out, NULL, _IOFBF, 65536);  /* 64KB buffer */
+    setvbuf(out, NULL, _IOFBF, 256 * 1024);  /* 256KB buffer */
 
     ZSTD_seekable_CStream *zcs = ZSTD_seekable_createCStream();
     if (!zcs) {
@@ -299,6 +562,9 @@ static int process_chunk(
         fclose(out);
         return 0;
     }
+
+    /* Use ncols from MTX file header (passed as parameter) */
+    /* This ensures consistency across all chunks, even if some columns have no non-zeros */
 
     for (uint32_t b = 0; b < nblocks; b++) {
         uint32_t start_row = (uint32_t)start_row_global + b * block_rows;
@@ -328,9 +594,7 @@ static int process_chunk(
             return 0;
         }
 
-        if ((b % 32) == 0) {
-            printf("  Wrote frame for block %u/%u\n", b, nblocks);
-        }
+        /* Progress reporting removed for better performance */
     }
 
     /* Finish: writes the seek table */
@@ -356,22 +620,26 @@ static int process_chunk(
     return 1;
 }
 
+
 int main(int argc, char *argv[]) {
-    if (argc < 3 || argc > 5) {
-        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows]\n", argv[0]);
+    if (argc < 3 || argc > 6) {
+        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset]\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews\n", argv[0]);
-        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 4096\n", argv[0]);
-        fprintf(stderr, "  Output: andrews.zdata/0.bin, andrews.zdata/1.bin, ...\n");
-        fprintf(stderr, "  Default: block_rows=16, max_rows=4096\n");
+        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192\n", argv[0]);
+        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 131072\n", argv[0]);
+        fprintf(stderr, "  Output: andrews/0.bin, andrews/1.bin, ...\n");
+        fprintf(stderr, "  Default: block_rows=16, max_rows=8192, row_offset=0\n");
+        fprintf(stderr, "  row_offset: Add this value to row indices from MTX file (for globally contiguous numbering)\n");
         return 1;
     }
 
     const char *mtx_path = argv[1];
     const char *out_name = argv[2];
     
-    /* Parse optional block_rows and max_rows parameters */
+    /* Parse optional block_rows, max_rows, and row_offset parameters */
     uint32_t block_rows = DEFAULT_BLOCK_ROWS;
     uint32_t max_rows = DEFAULT_MAX_ROWS;
+    long long row_offset = 0;  /* Offset to add to row indices from MTX file */
     
     if (argc >= 4) {
         block_rows = (uint32_t)atoi(argv[3]);
@@ -388,12 +656,21 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+    
+    if (argc >= 6) {
+        row_offset = atoll(argv[5]);
+        if (row_offset < 0) {
+            fprintf(stderr, "Error: row_offset must be >= 0, got %lld\n", row_offset);
+            return 1;
+        }
+    }
 
     FILE *f = fopen(mtx_path, "r");
     if (!f) { perror("open mtx"); return 1; }
     
     /* Set input file to fully buffered for better performance (reduces system calls) */
-    setvbuf(f, NULL, _IOFBF, 65536);  /* 64KB buffer */
+    /* Increased buffer size to 256KB for better read throughput */
+    setvbuf(f, NULL, _IOFBF, 256 * 1024);  /* 256KB buffer */
 
     char line[4096];
 
@@ -430,11 +707,13 @@ int main(int argc, char *argv[]) {
     long data_start_pos = ftell(f);
 
     printf("Matrix: %lld rows, %lld cols, %lld nnz (global)\n", nrows_ll, ncols_ll, nnz_total_ll);
+    fflush(stdout);  /* Ensure output is flushed immediately */
     printf("Processing in chunks of %u rows, %u rows per block\n", max_rows, block_rows);
+    fflush(stdout);  /* Ensure output is flushed immediately */
 
     /* Create output directory */
     char out_dir[1024];
-    snprintf(out_dir, sizeof(out_dir), "%s.zdata", out_name);
+    snprintf(out_dir, sizeof(out_dir), "%s", out_name);
     
     if (mkdir(out_dir, 0755) != 0) {
         if (errno != EEXIST) {
@@ -445,17 +724,22 @@ int main(int argc, char *argv[]) {
         /* Directory already exists, that's okay */
     }
     printf("Output directory: %s\n", out_dir);
+    fflush(stdout);  /* Ensure output is flushed immediately */
 
-    /* Cache: count nnz per row for all rows (single pass) */
-    printf("Counting non-zeros per row (caching for all chunks)...\n");
-    uint32_t *cached_row_counts = count_all_rows(f, data_start_pos, nrows_ll);
-    if (!cached_row_counts) {
+    /* Build full CSR structure once (uses indptr for row counts, eliminates file re-reading) */
+    printf("Building CSR structure from MTX file...\n");
+    fflush(stdout);  /* Ensure output is flushed immediately */
+    FullCSR *csr = build_full_csr(f, data_start_pos, nrows_ll, ncols, row_offset);
+    if (!csr) {
         fclose(f);
         return 1;
     }
-    printf("Cached row counts complete.\n");
+    
+    /* We can close the file now - all data is in memory */
+    fclose(f);
 
     /* Process file in chunks of max_rows */
+    /* Adjust start_row and end_row by row_offset to account for global row numbering */
     int chunk_num = 0;  /* Start from 0 instead of 1 */
     for (long long start_row = 0; start_row < nrows_ll; start_row += max_rows) {
         long long end_row = start_row + max_rows;
@@ -465,27 +749,24 @@ int main(int argc, char *argv[]) {
         int n = snprintf(out_path, sizeof(out_path), "%s/%d.bin", out_dir, chunk_num);
         if (n < 0 || n >= (int)sizeof(out_path)) {
             fprintf(stderr, "ERROR: Path too long for output file\n");
-            free(cached_row_counts);
-            fclose(f);
+            free_full_csr(csr);
             return 1;
         }
 
-        printf("\nProcessing chunk %d: rows %lld-%lld -> %s\n",
-               chunk_num, start_row, end_row - 1, out_path);
-
-        if (!process_chunk(f, data_start_pos, ncols, start_row, end_row, cached_row_counts, out_path, block_rows, max_rows)) {
+        long long global_start_row = start_row + row_offset;
+        long long global_end_row = end_row + row_offset;
+        
+        if (!process_chunk_from_csr(csr, global_start_row, global_end_row, out_path, block_rows, max_rows, row_offset, ncols)) {
             fprintf(stderr, "Failed to process chunk %d\n", chunk_num);
-            free(cached_row_counts);
-            fclose(f);
+            free_full_csr(csr);
             return 1;
         }
 
-        printf("Done: wrote %s\n", out_path);
         chunk_num++;
     }
 
-    free(cached_row_counts);
-    fclose(f);
+    free_full_csr(csr);
     printf("\nAll chunks processed successfully!\n");
+    fflush(stdout);  /* Ensure output is flushed immediately */
     return 0;
 }

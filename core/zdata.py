@@ -34,10 +34,11 @@ class ZData:
         Initialize the reader for a zdata directory.
         
         Args:
-            dir_name: Name of the .zdata directory (e.g., "andrews" for andrews.zdata/)
+            dir_name: Name or path of the zdata directory (e.g., "andrews" or "/path/to/andrews")
         """
         self.dir_name = dir_name
-        self.dir_path = f"{dir_name}.zdata"
+        # Use dir_name directly as path (no .zdata suffix appended)
+        self.dir_path = dir_name
         
         if not os.path.exists(self.dir_path):
             raise FileNotFoundError(f"Directory not found: {self.dir_path}")
@@ -50,7 +51,7 @@ class ZData:
         if not os.path.exists(metadata_file):
             raise FileNotFoundError(
                 f"Metadata file not found: {metadata_file}. "
-                f"Please rebuild the .zdata directory using build_zdata()"
+                f"Please rebuild the zdata directory using build_zdata()"
             )
         
         with open(metadata_file, 'r') as f:
@@ -65,7 +66,7 @@ class ZData:
         
         # Extract block configuration from metadata (with defaults for backward compatibility)
         self.block_rows = self.metadata.get('block_rows', 16)
-        self.max_rows_per_chunk = self.metadata.get('max_rows_per_chunk', 4096)
+        self.max_rows_per_chunk = self.metadata.get('max_rows_per_chunk', 8192)
         
         # Build chunk_files dict and chunk info from metadata
         self.chunk_files = {}
@@ -150,13 +151,15 @@ class ZData:
             if global_row >= self.nrows:
                 raise IndexError(f"Row {global_row} is beyond available data (max row: {self.nrows - 1})")
             
+            # Calculate chunk number: each chunk contains max_rows_per_chunk rows
+            # This matches how chunks are numbered in build_zdata.py
             chunk_num = global_row // self.max_rows_per_chunk
             local_row = global_row % self.max_rows_per_chunk
             
             if chunk_num not in self.chunk_files:
                 raise IndexError(f"Row {global_row} is beyond available data (chunk {chunk_num} not found)")
             
-            # Validate that the row is within this chunk's valid range
+            # Validate that the row is within this chunk's valid range (defensive check)
             chunk_info = self.chunk_info[chunk_num]
             chunk_start = chunk_info['start_row']
             chunk_end = chunk_info['end_row']

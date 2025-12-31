@@ -188,7 +188,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Determine ncols and block_rows by reading the first referenced block */
-    /* We need to guess block_rows first - try common value of 16 */
+    /* We need to guess block_rows first - try default value of 16 */
     uint32_t block_rows = 16;
     unsigned first_block = (unsigned)(rows_req[0] / block_rows);
     uint8_t *frameBuf = NULL;

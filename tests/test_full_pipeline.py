@@ -27,6 +27,7 @@ ZDATA_READ_BIN = CTOOLS_DIR / "zdata_read"
 
 # Default paths (can be overridden via command line)
 DEFAULT_MTX_FILE = "/home/ubuntu/zdata_work/mtx_files/external_andrews_hepatolcommun_2022_34792289.mtx"
+DEFAULT_MTX_DIR = "/home/ubuntu/zdata_work/mtx_files"  # Directory of MTX files
 DEFAULT_OUTPUT_NAME = "andrews"
 DEFAULT_OUTPUT_DIR = _parent_dir / f"{DEFAULT_OUTPUT_NAME}.zdata"
 
@@ -133,39 +134,40 @@ def compile_c_tools():
     print("\n✓ Both C tools compiled successfully!")
     return True
 
-def build_zdata_directory(mtx_file, output_name, output_dir):
-    """Build .zdata directory from MTX file using build_zdata wrapper."""
-    print_section("Step 2: Building .zdata from MTX File")
+def build_zdata_directory(mtx_input, output_name, output_dir):
+    """Build .zdata directory from MTX file or directory using build_zdata wrapper."""
+    print_section("Step 2: Building .zdata from MTX File(s)")
     
-    # Check if MTX file exists
-    if not os.path.exists(mtx_file):
-        print(f"ERROR: MTX file not found: {mtx_file}")
+    # Check if input exists (file or directory)
+    if not os.path.exists(mtx_input):
+        print(f"ERROR: MTX file/directory not found: {mtx_input}")
         return False
     
     # Check if output directory already exists
     if os.path.exists(output_dir):
         print(f"WARNING: Output directory already exists: {output_dir}")
-        response = input("Delete and rebuild? (y/N): ").strip().lower()
-        if response == 'y':
-            import shutil
-            shutil.rmtree(output_dir)
-            print(f"Deleted existing directory: {output_dir}")
-        else:
-            print("Skipping build step (using existing directory)")
-            return True
+        import shutil
+        shutil.rmtree(output_dir)
+        print(f"Deleted existing directory: {output_dir}")
     
     # Get the parent directory for the output name
     output_parent = os.path.dirname(str(output_dir))
-    output_name_only = os.path.basename(str(output_dir)).replace('.zdata', '')
+    output_name_only = os.path.basename(str(output_dir))
     
     # Change to output parent directory for the build
     original_cwd = os.getcwd()
     try:
         os.chdir(output_parent)
-        print(f"\nBuilding {output_name}.zdata from {os.path.basename(mtx_file)}...")
-        zdata_dir = build_zdata(mtx_file, output_name_only)
+        if os.path.isdir(mtx_input):
+            print(f"\nBuilding {output_name_only} from directory: {os.path.basename(mtx_input)}...")
+            print(f"  (Processing all MTX files in directory)")
+        else:
+            print(f"\nBuilding {output_name_only} from {os.path.basename(mtx_input)}...")
+        zdata_dir = build_zdata(mtx_input, output_name_only)
     except Exception as e:
         print(f"ERROR: Failed to build .zdata directory: {e}")
+        import traceback
+        traceback.print_exc()
         return False
     finally:
         os.chdir(original_cwd)
@@ -187,7 +189,19 @@ def build_zdata_directory(mtx_file, output_name, output_dir):
         print(f"ERROR: No .bin files found in {output_dir}")
         return False
     
-    print(f"\n✓ Successfully built {output_name}.zdata with {len(bin_files)} chunk files and metadata!")
+    # Read metadata to show stats
+    import json
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        num_rows = metadata.get('nrows', 'unknown')
+        num_cols = metadata.get('ncols', 'unknown')
+        num_chunks = len(bin_files)
+        print(f"\n✓ Successfully built {output_name_only} with {num_chunks} chunk files!")
+        print(f"  Matrix: {num_rows} rows × {num_cols} columns")
+    except Exception as e:
+        print(f"\n✓ Successfully built {output_name_only} with {len(bin_files)} chunk files!")
+    
     return True
 
 def run_tests(zdata_path):
@@ -229,27 +243,29 @@ def main():
     
     # Parse command line arguments
     if len(sys.argv) > 1:
-        mtx_file = sys.argv[1]
+        mtx_input = sys.argv[1]
     else:
-        mtx_file = DEFAULT_MTX_FILE
+        # Default to directory of MTX files for testing larger dataset
+        mtx_input = DEFAULT_MTX_DIR
     
     if len(sys.argv) > 2:
         output_name = sys.argv[2]
     else:
-        output_name = DEFAULT_OUTPUT_NAME
+        output_name = "atlas"  # Default name for directory-based builds
     
     # Determine output directory
-    if os.path.isabs(output_name) or output_name.endswith('.zdata'):
+    if os.path.isabs(output_name):
         # Full path provided
         output_dir = Path(output_name).absolute()
-        if not output_dir.name.endswith('.zdata'):
-            output_dir = output_dir.parent / f"{output_dir.name}.zdata"
     else:
         # Just name provided, use default location
-        output_dir = DEFAULT_OUTPUT_DIR
+        output_dir = _parent_dir / output_name
     
     print(f"Configuration:")
-    print(f"  MTX file: {mtx_file}")
+    if os.path.isdir(mtx_input):
+        print(f"  MTX directory: {mtx_input}")
+    else:
+        print(f"  MTX file: {mtx_input}")
     print(f"  Output: {output_dir}")
     print(f"  ZSTD base: {ZSTD_BASE}")
     
@@ -259,7 +275,7 @@ def main():
         return 1
     
     # Step 2: Build .zdata
-    if not build_zdata_directory(mtx_file, output_name, output_dir):
+    if not build_zdata_directory(mtx_input, output_name, output_dir):
         print("\n✗ Pipeline failed at build step")
         return 1
     

@@ -23,34 +23,19 @@ from scipy.sparse import csr_matrix
 
 # Parse command-line arguments
 if len(sys.argv) > 1:
-    zdata_path = sys.argv[1]
-    # Handle both full paths (e.g., /path/to/andrews.zdata) and directory names (e.g., andrews)
-    zdata_path = os.path.abspath(zdata_path)
+    zdata_input = sys.argv[1]
     
-    if os.path.exists(zdata_path) and os.path.isdir(zdata_path):
-        # Full path to .zdata directory provided
-        if zdata_path.endswith('.zdata'):
-            # Extract directory name and parent directory
-            parent_dir = os.path.dirname(zdata_path)
-            zdata_dir = os.path.basename(zdata_path).replace('.zdata', '')
-            # Change to parent directory so ZData can find the .zdata directory
-            original_cwd = os.getcwd()
-            os.chdir(parent_dir)
-        else:
-            # Directory without .zdata extension - assume it's the .zdata directory itself
-            parent_dir = os.path.dirname(zdata_path)
-            zdata_dir = os.path.basename(zdata_path)
-            original_cwd = os.getcwd()
-            os.chdir(parent_dir)
+    # Convert to absolute path if it's not already
+    if os.path.isabs(zdata_input):
+        zdata_dir = zdata_input
     else:
-        # Just a directory name provided (relative path) or path doesn't exist yet
-        # Remove .zdata suffix if present, ZData will add it
-        zdata_dir = zdata_path.replace('.zdata', '') if zdata_path.endswith('.zdata') else zdata_path
-        original_cwd = None
+        zdata_dir = os.path.abspath(zdata_input)
+    
+    # ZData accepts full paths directly, so we can pass it as-is
+    # It will also handle relative paths and directory names
 else:
     # Default
-    zdata_dir = 'andrews'
-    original_cwd = None
+    zdata_dir = 'atlas'
 
 # Configuration
 num_queries = 20
@@ -166,11 +151,14 @@ def format_size(size_bytes):
     return f"{size_bytes:.2f} PB"
 
 # Calculate actual on-disk size
-zdata_path = f"{zdata_dir}.zdata"
-if os.path.isdir(zdata_path):
-    disk_size = get_dir_size(zdata_path)
+# zdata_dir might be a full path or relative path
+if os.path.isdir(zdata_dir):
+    disk_size = get_dir_size(zdata_dir)
+elif os.path.isdir(zdata_dir + '.zdata'):
+    # Try with .zdata suffix (backward compatibility)
+    disk_size = get_dir_size(zdata_dir + '.zdata')
 else:
-    disk_size = os.path.getsize(zdata_path) if os.path.isfile(zdata_path) else 0
+    disk_size = 0
 
 print(f"\nOn-disk size: {format_size(disk_size)}")
 
@@ -206,7 +194,4 @@ print(f"  Total rows queried: {total_rows_queried:,}")
 print(f"  Total query time: {total_query_time:.3f} s")
 print(f"  Average rows/second: {avg_rows_per_second:,.0f}")
 
-# Restore original working directory if we changed it
-if original_cwd is not None:
-    os.chdir(original_cwd)
 
