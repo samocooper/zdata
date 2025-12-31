@@ -7,14 +7,16 @@ These files can be converted to zdata format using mtx_to_zdata.
 """
 
 import zarr
-from scipy.sparse import csr_matrix, csc_matrix, vstack
-from scipy.io import mmwrite
+from scipy.sparse import csr_matrix, csc_matrix, vstack, hstack
+from scipy.io import mmwrite, mmread
 import numpy as np
 import sys
 import os
 import json
 import argparse
 from pathlib import Path
+import tempfile
+import shutil
 
 # Default gene list path (relative to zdata package)
 _DEFAULT_GENE_LIST = Path(__file__).parent.parent / "files" / "2ks10c_genes.txt"
@@ -152,6 +154,12 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         os.makedirs(output_dir, exist_ok=True)
         print(f"Created output directory: {output_dir}")
     
+    # Create rm_mtx_files subdirectory for MTX files
+    mtx_output_dir = os.path.join(output_dir, "rm_mtx_files")
+    if not os.path.exists(mtx_output_dir):
+        os.makedirs(mtx_output_dir, exist_ok=True)
+        print(f"Created MTX output directory: {mtx_output_dir}")
+    
     # Process zarr files and accumulate rows
     chunk_size = 131072
     print(f"\nProcessing zarr files and creating MTX files (max {chunk_size} rows per file)")
@@ -244,7 +252,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             
             # Write MTX file
             row_end = current_row_start + matrix_to_write.shape[0] - 1
-            chunk_output_path = os.path.join(output_dir, f"rows_{current_row_start}_{row_end}.mtx")
+            chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
             output_files.append(chunk_output_path)
             
             print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
@@ -274,7 +282,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         combined_matrix = vstack(current_chunk_rows, format='csr')
         
         row_end = current_row_start + combined_matrix.shape[0] - 1
-        chunk_output_path = os.path.join(output_dir, f"rows_{current_row_start}_{row_end}.mtx")
+        chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
         output_files.append(chunk_output_path)
         
         print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
@@ -316,9 +324,148 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     print(f"  Total rows processed: {total_rows}")
     print(f"  Total columns: {n_new_cols}")
     print(f"  Output directory: {output_dir}")
+    print(f"  MTX files directory: {mtx_output_dir}")
     print(f"  Manifest file: {manifest_path}")
     
+    # Second pass: Create column-major fragments for efficient column access
+    print(f"\n{'='*70}")
+    print("Creating column-major fragments for efficient column access...")
+    print(f"{'='*70}")
+    create_column_major_fragments(output_dir, mtx_output_dir, output_files, n_new_cols)
+    
     return manifest_path
+
+def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols):
+    """
+    Create column-major fragments by:
+    1. Fragmenting each MTX file into 256-column chunks
+    2. Transposing each fragment (CSR -> CSC -> CSR for transposed view)
+    3. Saving transposed fragments to tmp directory
+    4. Combining fragments covering the same column range
+    5. Saving combined fragments to cm_mtx_files directory
+    
+    Args:
+        output_dir: Base output directory
+        mtx_output_dir: Directory containing row-major MTX files
+        mtx_files: List of MTX file paths
+        n_cols: Total number of columns
+    """
+    # Create tmp and cm_mtx_files directories
+    tmp_dir = os.path.join(output_dir, "tmp")
+    cm_mtx_dir = os.path.join(output_dir, "cm_mtx_files")
+    
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(cm_mtx_dir, exist_ok=True)
+    
+    print(f"  Created tmp directory: {tmp_dir}")
+    print(f"  Created cm_mtx_files directory: {cm_mtx_dir}")
+    
+    # Fragment size (columns per fragment)
+    fragment_cols = 256
+    num_fragments = (n_cols + fragment_cols - 1) // fragment_cols
+    
+    print(f"\n  Fragmenting {len(mtx_files)} MTX files into {num_fragments} column fragments ({fragment_cols} cols each)...")
+    
+    # Step 1: Fragment and transpose each MTX file, save to tmp
+    # Structure: tmp/{mtx_file_basename}_frag_{frag_idx}.mtx
+    fragment_map = {}  # Maps (frag_idx) -> list of (mtx_file, frag_file_path)
+    
+    for mtx_idx, mtx_file in enumerate(mtx_files):
+        mtx_basename = os.path.basename(mtx_file)
+        print(f"    [{mtx_idx + 1}/{len(mtx_files)}] Processing {mtx_basename}...")
+        
+        # Load MTX file and convert to CSC for efficient column indexing
+        matrix = mmread(mtx_file)
+        # Convert to CSC format for efficient column indexing (mmread may return COO)
+        if not isinstance(matrix, csc_matrix):
+            matrix = matrix.tocsc()
+        n_rows, n_cols_file = matrix.shape
+        
+        # Fragment by columns
+        for frag_idx in range(num_fragments):
+            col_start = frag_idx * fragment_cols
+            col_end = min(col_start + fragment_cols, n_cols_file)
+            
+            if col_start >= n_cols_file:
+                break
+            
+            # Extract column fragment using CSC indexing (efficient column access)
+            col_fragment = matrix[:, col_start:col_end]
+            
+            # Transpose: rows become columns (for column-major access)
+            # Transpose returns CSR format
+            transposed_fragment = col_fragment.T.tocsr()
+            
+            # Save transposed fragment to tmp
+            frag_filename = f"{os.path.splitext(mtx_basename)[0]}_frag_{frag_idx}.mtx"
+            frag_path = os.path.join(tmp_dir, frag_filename)
+            mmwrite(frag_path, transposed_fragment)
+            
+            # Track this fragment
+            if frag_idx not in fragment_map:
+                fragment_map[frag_idx] = []
+            fragment_map[frag_idx].append((mtx_file, frag_path))
+            
+            # Free memory
+            del col_fragment
+            del transposed_fragment
+        
+        # Free original matrix
+        del matrix
+    
+    print(f"  ✓ Created {sum(len(frags) for frags in fragment_map.values())} transposed fragments in tmp directory")
+    
+    # Step 2: Combine fragments covering the same column range
+    print(f"\n  Combining fragments by column range...")
+    
+    for frag_idx in range(num_fragments):
+        if frag_idx not in fragment_map:
+            continue
+        
+        frag_list = fragment_map[frag_idx]
+        col_start = frag_idx * fragment_cols
+        col_end = min(col_start + fragment_cols, n_cols)
+        
+        print(f"    Fragment {frag_idx}: columns {col_start}-{col_end-1} ({len(frag_list)} fragments to combine)...")
+        
+        # Load and combine all fragments for this column range
+        combined_fragments = []
+        for mtx_file, frag_path in frag_list:
+            frag_matrix = mmread(frag_path)
+            # Convert to CSR format if needed
+            if not isinstance(frag_matrix, csr_matrix):
+                frag_matrix = frag_matrix.tocsr()
+            combined_fragments.append(frag_matrix)
+            # Free memory immediately
+            del frag_matrix
+        
+        # Stack fragments horizontally (hstack): each fragment adds more columns (cells)
+        # After transposition: rows = genes (256), columns = cells
+        # Combining fragments from different MTX files adds more cells (columns)
+        if combined_fragments:
+            combined_matrix = hstack(combined_fragments, format='csr')
+            
+            # Save combined fragment
+            cm_filename = f"cols_{col_start}_{col_end-1}.mtx"
+            cm_path = os.path.join(cm_mtx_dir, cm_filename)
+            mmwrite(cm_path, combined_matrix)
+            
+            print(f"      ✓ Combined {len(combined_fragments)} fragments -> {combined_matrix.shape[0]} rows × {combined_matrix.shape[1]} cols")
+            
+            # Free memory
+            del combined_matrix
+            del combined_fragments
+    
+    print(f"\n  ✓ Created {num_fragments} column-major MTX files in {cm_mtx_dir}")
+    print(f"  ✓ Column-major fragments allow efficient access to gene columns")
+    
+    # Clean up temporary fragments
+    print(f"\n  Cleaning up temporary fragments...")
+    try:
+        shutil.rmtree(tmp_dir)
+        print(f"  ✓ Removed temporary directory: {tmp_dir}")
+    except Exception as e:
+        print(f"  WARNING: Could not remove temporary directory {tmp_dir}: {e}")
 
 def main():
     """Main function with command-line interface."""
@@ -334,7 +481,7 @@ def main():
     parser.add_argument(
         'output_dir',
         type=str,
-        help='Output directory where MTX files will be written (files named by row range, e.g., rows_0_131071.mtx)'
+        help='Output directory where MTX files will be written in rm_mtx_files subdirectory (files named by row range, e.g., rows_0_131071.mtx)'
     )
     parser.add_argument(
         '--gene-list',

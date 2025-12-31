@@ -144,8 +144,11 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
             else:
                 raise ValueError("Could not parse MTX file dimensions")
     
-    # Count chunk files
-    chunk_files = sorted(zdata_dir.glob("*.bin"))
+    # Count chunk files (in X_RM subdirectory)
+    xrm_dir = zdata_dir / "X_RM"
+    if not xrm_dir.exists():
+        xrm_dir.mkdir(parents=True, exist_ok=True)
+    chunk_files = sorted(xrm_dir.glob("*.bin"))
     num_chunks = len(chunk_files)
     
     # Determine blocks per chunk (each chunk has max_rows rows,
@@ -253,8 +256,9 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             # The C code will add this offset to row indices from the MTX file
             _build_zdata_from_single_file(mtx_file, str(temp_output), block_rows, max_rows, row_offset=total_rows)
             
-            # Get chunk files from temp directory
-            temp_chunk_files = sorted(temp_output.glob("*.bin"))
+            # Get chunk files from temp directory (they're in X_RM subdirectory)
+            temp_xrm_dir = temp_output / "X_RM"
+            temp_chunk_files = sorted(temp_xrm_dir.glob("*.bin")) if temp_xrm_dir.exists() else []
             num_chunks_copied = len(temp_chunk_files)
             
             # Copy and rename chunk files with correct global chunk numbering
@@ -270,7 +274,12 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
                 # Calculate global chunk number based on start_row (ensures sequential numbering)
                 # This matches the calculation used in zdata.py: chunk_num = global_row // max_rows_per_chunk
                 new_chunk_num = chunk_start_row // max_rows
-                new_chunk_file = zdata_dir / f"{new_chunk_num}.bin"
+                
+                # Create X_RM subdirectory if it doesn't exist
+                xrm_dir = zdata_dir / "X_RM"
+                xrm_dir.mkdir(parents=True, exist_ok=True)
+                
+                new_chunk_file = xrm_dir / f"{new_chunk_num}.bin"
                 
                 # Copy the file
                 shutil.copy2(temp_chunk_file, new_chunk_file)

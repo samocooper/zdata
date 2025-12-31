@@ -260,7 +260,7 @@ static int parse_line_fast(const char *line, long long *row, long long *col, dou
 }
 
 /* Build full CSR structure from MTX file (single pass - optimized parsing) */
-static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, long long ncols, long long row_offset) {
+static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, long long ncols) {
     /* Set input file to fully buffered for better performance */
     setvbuf(f, NULL, _IOFBF, 1024 * 1024);  /* 1MB buffer */
     
@@ -320,12 +320,6 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
         
         /* Validate local row and column indices (before applying offset) */
         if (local_row < 0 || local_row >= nrows || col < 0 || col >= ncols) continue;
-        
-        /* Apply row_offset to get global row index */
-        long long global_row = local_row + row_offset;
-        
-        /* Validate global row index is within expected range */
-        if (global_row < 0) continue;
         
         RowEntries *r = &rows[local_row];
         
@@ -627,7 +621,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  Example: %s matrix.mtx andrews\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 131072\n", argv[0]);
-        fprintf(stderr, "  Output: andrews/0.bin, andrews/1.bin, ...\n");
+        fprintf(stderr, "  Output: andrews/X_RM/0.bin, andrews/X_RM/1.bin, ...\n");
         fprintf(stderr, "  Default: block_rows=16, max_rows=8192, row_offset=0\n");
         fprintf(stderr, "  row_offset: Add this value to row indices from MTX file (for globally contiguous numbering)\n");
         return 1;
@@ -723,13 +717,31 @@ int main(int argc, char *argv[]) {
         }
         /* Directory already exists, that's okay */
     }
+    
+    /* Create X_RM subdirectory for .bin files */
+    char xrm_dir[2048];  /* Increased size to avoid truncation warning */
+    int n = snprintf(xrm_dir, sizeof(xrm_dir), "%s/X_RM", out_dir);
+    if (n < 0 || n >= (int)sizeof(xrm_dir)) {
+        fprintf(stderr, "ERROR: Path too long for X_RM directory\n");
+        fclose(f);
+        return 1;
+    }
+    if (mkdir(xrm_dir, 0755) != 0) {
+        if (errno != EEXIST) {
+            perror("mkdir X_RM");
+            fclose(f);
+            return 1;
+        }
+        /* Directory already exists, that's okay */
+    }
+    
     printf("Output directory: %s\n", out_dir);
     fflush(stdout);  /* Ensure output is flushed immediately */
 
     /* Build full CSR structure once (uses indptr for row counts, eliminates file re-reading) */
     printf("Building CSR structure from MTX file...\n");
     fflush(stdout);  /* Ensure output is flushed immediately */
-    FullCSR *csr = build_full_csr(f, data_start_pos, nrows_ll, ncols, row_offset);
+    FullCSR *csr = build_full_csr(f, data_start_pos, nrows_ll, ncols);
     if (!csr) {
         fclose(f);
         return 1;
@@ -746,7 +758,7 @@ int main(int argc, char *argv[]) {
         if (end_row > nrows_ll) end_row = nrows_ll;
 
         char out_path[4096];  /* Increased size to handle long paths and avoid truncation warning */
-        int n = snprintf(out_path, sizeof(out_path), "%s/%d.bin", out_dir, chunk_num);
+        int n = snprintf(out_path, sizeof(out_path), "%s/X_RM/%d.bin", out_dir, chunk_num);
         if (n < 0 || n >= (int)sizeof(out_path)) {
             fprintf(stderr, "ERROR: Path too long for output file\n");
             free_full_csr(csr);
