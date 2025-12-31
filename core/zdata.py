@@ -74,7 +74,8 @@ class ZData:
         self.file_to_chunk = {}  # Reverse mapping: file_path -> chunk_num (for O(1) lookup)
         for chunk_info in self.metadata['chunks']:
             chunk_num = chunk_info['chunk_num']
-            file_path = os.path.join(self.dir_path, chunk_info['file'])
+            # .bin files are stored in X_RM subdirectory
+            file_path = os.path.join(self.dir_path, "X_RM", chunk_info['file'])
             self.chunk_files[chunk_num] = file_path
             self.chunk_info[chunk_num] = chunk_info
             self.file_to_chunk[file_path] = chunk_num
