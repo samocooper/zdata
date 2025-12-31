@@ -69,13 +69,27 @@ class ZData:
         self.max_rows_per_chunk = self.metadata.get('max_rows_per_chunk', 8192)
         
         # Build chunk_files dict and chunk info from metadata
+        # Support both old format (chunks) and new format (chunks_rm, chunks_cm)
         self.chunk_files = {}
         self.chunk_info = {}  # Store chunk metadata for validation
         self.file_to_chunk = {}  # Reverse mapping: file_path -> chunk_num (for O(1) lookup)
-        for chunk_info in self.metadata['chunks']:
+        
+        # Check for new format with separate RM and CM chunks
+        if 'chunks_rm' in self.metadata:
+            # New format: separate chunks for X_RM
+            chunks_list = self.metadata['chunks_rm']
+            subdir = "X_RM"
+        elif 'chunks' in self.metadata:
+            # Old format: single chunks list (assume X_RM)
+            chunks_list = self.metadata['chunks']
+            subdir = "X_RM"
+        else:
+            raise ValueError("Metadata missing 'chunks' or 'chunks_rm' field")
+        
+        for chunk_info in chunks_list:
             chunk_num = chunk_info['chunk_num']
-            # .bin files are stored in X_RM subdirectory
-            file_path = os.path.join(self.dir_path, "X_RM", chunk_info['file'])
+            # .bin files are stored in subdirectory (X_RM or X_CM)
+            file_path = os.path.join(self.dir_path, subdir, chunk_info['file'])
             self.chunk_files[chunk_num] = file_path
             self.chunk_info[chunk_num] = chunk_info
             self.file_to_chunk[file_path] = chunk_num
@@ -232,6 +246,196 @@ class ZData:
         """
         rows_data = self.read_rows(global_rows)
         return self._rows_to_csr(rows_data)
+    
+    def read_rows_rm(self, global_rows):
+        """
+        Read rows from X_RM (row-major) files.
+        This is an alias for read_rows() for clarity.
+        
+        Args:
+            global_rows: List or array of global row indices (0-based)
+        
+        Returns:
+            List of (global_row_id, cols, vals) tuples
+        """
+        return self.read_rows(global_rows)
+    
+    def read_rows_rm_csr(self, global_rows):
+        """
+        Read rows from X_RM (row-major) files and return as CSR matrix.
+        
+        Args:
+            global_rows: List or array of global row indices (0-based)
+        
+        Returns:
+            scipy.sparse.csr_matrix of shape (len(global_rows), ncols)
+        """
+        return self.read_rows_csr(global_rows)
+    
+    def _build_cm_chunk_mapping(self):
+        """
+        Build chunk mapping for X_CM (column-major) files.
+        
+        Returns:
+            (cm_chunk_files, cm_chunk_info, cm_file_to_chunk) tuple
+        """
+        xcm_dir = os.path.join(self.dir_path, "X_CM")
+        if not os.path.exists(xcm_dir):
+            raise FileNotFoundError(f"X_CM directory not found: {xcm_dir}")
+        
+        xcm_path = Path(xcm_dir)
+        cm_bin_files = sorted(xcm_path.glob("*.bin"))
+        
+        if not cm_bin_files:
+            raise FileNotFoundError(f"No .bin files found in X_CM directory: {xcm_dir}")
+        
+        cm_chunk_files = {}
+        cm_chunk_info = {}
+        cm_file_to_chunk = {}
+        
+        # Build chunk mapping for X_CM files
+        for chunk_idx, bin_file in enumerate(cm_bin_files):
+            chunk_num = chunk_idx
+            file_path = str(bin_file)
+            cm_chunk_files[chunk_num] = file_path
+            cm_chunk_info[chunk_num] = {
+                'chunk_num': chunk_num,
+                'file': bin_file.name,
+                'start_row': chunk_num * self.max_rows_per_chunk,
+                'end_row': (chunk_num + 1) * self.max_rows_per_chunk
+            }
+            cm_file_to_chunk[file_path] = chunk_num
+        
+        return cm_chunk_files, cm_chunk_info, cm_file_to_chunk
+    
+    def read_cols_cm(self, global_cols):
+        """
+        Read columns (genes) from X_CM (column-major) files.
+        In X_CM files, rows represent genes (columns in original matrix).
+        
+        Args:
+            global_cols: List or array of global column (gene) indices (0-based)
+        
+        Returns:
+            List of (global_col_id, rows, vals) tuples where rows are cell indices
+        """
+        if isinstance(global_cols, (int, np.integer)):
+            global_cols = [int(global_cols)]
+        else:
+            global_cols = [int(c) for c in global_cols]
+        
+        # Build X_CM chunk mapping
+        cm_chunk_files, cm_chunk_info, cm_file_to_chunk = self._build_cm_chunk_mapping()
+        
+        # In X_CM, rows = genes, so we treat column indices as row indices
+        # The number of rows in X_CM equals the number of columns in the original matrix
+        cm_nrows = self.ncols  # Number of genes (rows in X_CM)
+        
+        # Group columns (genes) by which chunk file they belong to
+        cols_by_file = defaultdict(list)
+        
+        for idx, global_col in enumerate(global_cols):
+            if global_col < 0:
+                raise ValueError(f"Column index must be non-negative, got {global_col}")
+            
+            if global_col >= cm_nrows:
+                raise IndexError(f"Column {global_col} is beyond available data (max column: {cm_nrows - 1})")
+            
+            # Calculate chunk number: each chunk contains max_rows_per_chunk rows (genes)
+            chunk_num = global_col // self.max_rows_per_chunk
+            local_row = global_col % self.max_rows_per_chunk  # Local row in X_CM (which is a gene)
+            
+            if chunk_num not in cm_chunk_files:
+                raise IndexError(f"Column {global_col} is beyond available data (chunk {chunk_num} not found)")
+            
+            # Validate that the column is within this chunk's valid range
+            # Note: chunk_info['start_row'] and 'end_row' are gene indices (0 to ncols-1)
+            chunk_info = cm_chunk_info[chunk_num]
+            chunk_start = chunk_info['start_row']  # Gene index start
+            chunk_end = chunk_info['end_row']      # Gene index end
+            
+            if global_col < chunk_start or global_col >= chunk_end:
+                raise IndexError(
+                    f"Column {global_col} is out of range for chunk {chunk_num} "
+                    f"(valid range: {chunk_start} to {chunk_end - 1})"
+                )
+            
+            cols_by_file[cm_chunk_files[chunk_num]].append((local_row, idx, global_col))
+        
+        # Read from each file and collect results
+        all_results = [None] * len(global_cols)
+        
+        for file_path, col_info_list in cols_by_file.items():
+            # Find which chunk this file belongs to
+            chunk_num = cm_file_to_chunk.get(file_path)
+            if chunk_num is None:
+                raise ValueError(f"Could not find chunk info for file: {file_path}")
+            chunk_info = cm_chunk_info[chunk_num]
+            
+            # Validate local rows are within chunk bounds
+            chunk_start = chunk_info['start_row']
+            chunk_end = chunk_info['end_row']
+            max_local_row = chunk_end - chunk_start - 1
+            
+            for local_row, orig_idx, global_col in col_info_list:
+                if local_row > max_local_row:
+                    raise IndexError(
+                        f"Local row {local_row} exceeds chunk {chunk_num} bounds "
+                        f"(max local row: {max_local_row}, global column: {global_col})"
+                    )
+            
+            # Sort by local_row for better chunk access locality
+            col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])  # Sort by local_row
+            
+            # Extract local rows in sorted order for C tool
+            local_rows = [info[0] for info in col_info_list_sorted]
+            
+            # Read from this file (C tool returns rows in the order requested)
+            # In X_CM, ncols = nrows (original), so we get cells as columns
+            file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+            
+            # Map results back to original order
+            for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
+                if returned_local_row != local_row:
+                    raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
+                # Store in original position (orig_idx) to maintain input order
+                # rows are cell indices, vals are values
+                all_results[orig_idx] = (global_col, rows, vals)
+        
+        return all_results
+    
+    def read_cols_cm_csr(self, global_cols):
+        """
+        Read columns (genes) from X_CM (column-major) files and return as CSR matrix.
+        The returned matrix has shape (len(global_cols), nrows) where each row is a gene
+        and each column is a cell.
+        
+        Args:
+            global_cols: List or array of global column (gene) indices (0-based)
+        
+        Returns:
+            scipy.sparse.csr_matrix of shape (len(global_cols), nrows)
+        """
+        cols_data = self.read_cols_cm(global_cols)
+        
+        # Convert to CSR matrix
+        # In the result, rows = genes, columns = cells
+        ngenes = len(cols_data)
+        
+        row_indices = []
+        col_indices = []
+        values = []
+        
+        for csr_row_idx, (col_id, rows, vals) in enumerate(cols_data):
+            for row, val in zip(rows, vals):
+                row_indices.append(csr_row_idx)
+                col_indices.append(int(row))
+                values.append(float(val))
+        
+        # Create CSR matrix: shape is (ngenes, nrows) where nrows is number of cells
+        csr = csr_matrix((values, (row_indices, col_indices)), shape=(ngenes, self.nrows))
+        
+        return csr
     
     def _rows_to_csr(self, rows_data):
         """

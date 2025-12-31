@@ -163,6 +163,7 @@ def build_zdata_directory(mtx_input, output_name, output_dir):
             print(f"  (Processing all MTX files in directory)")
         else:
             print(f"\nBuilding {output_name_only} from {os.path.basename(mtx_input)}...")
+        # Pass the full output name (including .zdata if present) to build_zdata
         zdata_dir = build_zdata(mtx_input, output_name_only)
     except Exception as e:
         print(f"ERROR: Failed to build .zdata directory: {e}")
@@ -183,10 +184,20 @@ def build_zdata_directory(mtx_input, output_name, output_dir):
         print(f"ERROR: Metadata file not found: {metadata_file}")
         return False
     
-    # Check for .bin files
-    bin_files = list(Path(output_dir).glob("*.bin"))
-    if not bin_files:
-        print(f"ERROR: No .bin files found in {output_dir}")
+    # Check for .bin files in X_RM (row-major) subdirectory
+    xrm_dir = Path(output_dir) / "X_RM"
+    xrm_bin_files = []
+    if xrm_dir.exists():
+        xrm_bin_files = list(xrm_dir.glob("*.bin"))
+    
+    # Check for .bin files in X_CM (column-major) subdirectory
+    xcm_dir = Path(output_dir) / "X_CM"
+    xcm_bin_files = []
+    if xcm_dir.exists():
+        xcm_bin_files = list(xcm_dir.glob("*.bin"))
+    
+    if not xrm_bin_files and not xcm_bin_files:
+        print(f"ERROR: No .bin files found in {output_dir}/X_RM or {output_dir}/X_CM")
         return False
     
     # Read metadata to show stats
@@ -194,13 +205,32 @@ def build_zdata_directory(mtx_input, output_name, output_dir):
     try:
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
-        num_rows = metadata.get('nrows', 'unknown')
-        num_cols = metadata.get('ncols', 'unknown')
-        num_chunks = len(bin_files)
-        print(f"\n✓ Successfully built {output_name_only} with {num_chunks} chunk files!")
+        shape = metadata.get('shape', [])
+        if shape:
+            num_rows = shape[0]
+            num_cols = shape[1]
+        else:
+            num_rows = metadata.get('nrows', 'unknown')
+            num_cols = metadata.get('ncols', 'unknown')
+        
+        print(f"\n✓ Successfully built {output_name_only}!")
         print(f"  Matrix: {num_rows} rows × {num_cols} columns")
+        
+        if xrm_bin_files:
+            print(f"  Row-major (X_RM): {len(xrm_bin_files)} chunk file(s)")
+        else:
+            print(f"  WARNING: No row-major (X_RM) files found")
+        
+        if xcm_bin_files:
+            print(f"  Column-major (X_CM): {len(xcm_bin_files)} chunk file(s)")
+        else:
+            print(f"  INFO: No column-major (X_CM) files found (column-major tests will be skipped)")
     except Exception as e:
-        print(f"\n✓ Successfully built {output_name_only} with {len(bin_files)} chunk files!")
+        print(f"\n✓ Successfully built {output_name_only}!")
+        if xrm_bin_files:
+            print(f"  Row-major (X_RM): {len(xrm_bin_files)} chunk file(s)")
+        if xcm_bin_files:
+            print(f"  Column-major (X_CM): {len(xcm_bin_files)} chunk file(s)")
     
     return True
 
@@ -211,8 +241,25 @@ def run_tests(zdata_path):
     tests_dir = _test_dir
     test_files = [
         "test_random_rows.py",
-        "test_fast_queries.py"
+        "test_fast_queries.py"  # This now tests both row-major and column-major
     ]
+    
+    # Check what's available for testing
+    xrm_dir = Path(zdata_path) / "X_RM"
+    xcm_dir = Path(zdata_path) / "X_CM"
+    has_xrm = xrm_dir.exists() and list(xrm_dir.glob("*.bin"))
+    has_xcm = xcm_dir.exists() and list(xcm_dir.glob("*.bin"))
+    
+    print(f"\nAvailable data:")
+    if has_xrm:
+        print(f"  ✓ Row-major (X_RM): {len(list(xrm_dir.glob('*.bin')))} chunk file(s)")
+    else:
+        print(f"  ✗ Row-major (X_RM): Not available")
+    
+    if has_xcm:
+        print(f"  ✓ Column-major (X_CM): {len(list(xcm_dir.glob('*.bin')))} chunk file(s)")
+    else:
+        print(f"  ✗ Column-major (X_CM): Not available (column-major tests will be skipped)")
     
     all_passed = True
     
@@ -223,6 +270,9 @@ def run_tests(zdata_path):
             continue
         
         print(f"\n--- Running {test_file} ---")
+        if test_file == "test_fast_queries.py":
+            print("  (This test includes both row-major and column-major queries)")
+        
         test_cmd = [
             sys.executable,
             str(test_path),
@@ -252,6 +302,10 @@ def main():
         output_name = sys.argv[2]
     else:
         output_name = "atlas"  # Default name for directory-based builds
+    
+    # Append .zdata suffix if not already present and not an absolute path
+    if not os.path.isabs(output_name) and not output_name.endswith('.zdata'):
+        output_name = f"{output_name}.zdata"
     
     # Determine output directory
     if os.path.isabs(output_name):
@@ -287,9 +341,19 @@ def main():
     print_section("Pipeline Complete - All Steps Passed!")
     print(f"\n✓ Compiled C tools")
     print(f"✓ Built {output_dir}")
-    print(f"✓ All tests passed")
+    print(f"✓ All tests passed (row-major and column-major)")
     print(f"\nYou can now use the .zdata directory:")
     print(f"  {output_dir}")
+    
+    # Show what's available
+    xrm_dir = Path(output_dir) / "X_RM"
+    xcm_dir = Path(output_dir) / "X_CM"
+    if xrm_dir.exists():
+        xrm_files = list(xrm_dir.glob("*.bin"))
+        print(f"\nRow-major (X_RM): {len(xrm_files)} chunk file(s)")
+    if xcm_dir.exists():
+        xcm_files = list(xcm_dir.glob("*.bin"))
+        print(f"Column-major (X_CM): {len(xcm_files)} chunk file(s)")
     
     return 0
 

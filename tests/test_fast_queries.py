@@ -91,8 +91,8 @@ for query_idx in range(num_queries):
     sort_indices = np.argsort(original_rows)
     sorted_rows = original_rows[sort_indices]
     
-    # Perform the query with sorted rows and get CSR matrix directly
-    csr_sorted = reader.read_rows_csr(sorted_rows.tolist())
+    # Perform the query with sorted rows and get CSR matrix directly (from X_RM)
+    csr_sorted = reader.read_rows_rm_csr(sorted_rows.tolist())
     
     # Restore original query order using inverse permutation
     # Reorder CSR matrix rows to match original query order
@@ -193,5 +193,120 @@ print(f"\nThroughput:")
 print(f"  Total rows queried: {total_rows_queried:,}")
 print(f"  Total query time: {total_query_time:.3f} s")
 print(f"  Average rows/second: {avg_rows_per_second:,.0f}")
+
+# Column-major (gene) read tests
+print("\n" + "=" * 60)
+print("Running 20 column-major (gene) read tests (1-20 genes)...")
+print("=" * 60)
+
+# Column-major (gene) read tests using read_cols_cm_csr method
+xcm_dir = os.path.join(zdata_dir, "X_CM")
+if not os.path.exists(xcm_dir):
+    print(f"\nWARNING: X_CM directory not found at {xcm_dir}")
+    print("Column-major tests require X_CM subdirectory with column-major .bin files")
+    print("Skipping column-major tests.")
+else:
+    try:
+        # Test reading 1-20 genes using read_cols_cm_csr method
+        col_query_times = []
+        col_sum_times = []
+        col_total_times = []
+        col_query_lengths = []
+        
+        # In X_CM, rows = genes, so we can read up to n_cols genes
+        max_genes = min(n_cols, 20)  # Limit to available genes or 20, whichever is smaller
+        
+        # Test reading 1-20 genes
+        for test_num in range(1, 21):
+            num_genes = test_num
+            
+            # Generate random gene (column) indices
+            if n_cols < num_genes:
+                # If we don't have enough genes, use all available
+                gene_indices = list(range(n_cols))
+            else:
+                gene_indices = np.random.randint(0, n_cols, size=num_genes).tolist()
+            
+            col_query_lengths.append(len(gene_indices))
+            
+            # Sort gene indices for better chunk access locality
+            sort_indices = np.argsort(gene_indices)
+            sorted_genes = [gene_indices[i] for i in sort_indices]
+            
+            # Time the column query (read genes from X_CM)
+            start_query = time.perf_counter()
+            
+            # Read columns (genes) from X_CM using the new method
+            csr_sorted = reader.read_cols_cm_csr(sorted_genes)
+            
+            # Restore original order
+            inverse_sort = np.argsort(sort_indices)
+            csr_data = csr_sorted[inverse_sort]
+            
+            end_query = time.perf_counter()
+            
+            query_time = end_query - start_query
+            col_query_times.append(query_time)
+            
+            # Time the sum calculation (sum each gene across all cells)
+            start_sum = time.perf_counter()
+            # Sum along columns (cells) for each gene (row in CSR result)
+            gene_sums = np.array(csr_data.sum(axis=1)).flatten()  # Sum along columns for each row
+            end_sum = time.perf_counter()
+            
+            sum_time = end_sum - start_sum
+            col_sum_times.append(sum_time)
+            
+            total_time = query_time + sum_time
+            col_total_times.append(total_time)
+            
+            # Calculate statistics
+            total_nonzero = csr_data.nnz
+            avg_nonzero = total_nonzero / len(gene_indices) if len(gene_indices) > 0 else 0
+            avg_gene_sum = np.mean(gene_sums) if len(gene_sums) > 0 else 0
+            
+            print(f"Gene query {test_num:2d} ({len(gene_indices):2d} genes): "
+                  f"Query: {query_time*1000:.3f} ms, "
+                  f"Sum: {sum_time*1000:.3f} ms, "
+                  f"Total: {total_time*1000:.3f} ms - "
+                  f"Avg gene sum: {avg_gene_sum:.2f}, "
+                  f"Avg non-zero: {avg_nonzero:.1f}/{n_rows}")
+        
+        print("=" * 60)
+        print(f"\nColumn-major (gene) query times:")
+        print(f"  Mean: {np.mean(col_query_times)*1000:.3f} ms")
+        print(f"  Median: {np.median(col_query_times)*1000:.3f} ms")
+        print(f"  Min: {np.min(col_query_times)*1000:.3f} ms")
+        print(f"  Max: {np.max(col_query_times)*1000:.3f} ms")
+        print(f"  Std dev: {np.std(col_query_times)*1000:.3f} ms")
+        
+        print(f"\nColumn-major sum times:")
+        print(f"  Mean: {np.mean(col_sum_times)*1000:.3f} ms")
+        print(f"  Median: {np.median(col_sum_times)*1000:.3f} ms")
+        print(f"  Min: {np.min(col_sum_times)*1000:.3f} ms")
+        print(f"  Max: {np.max(col_sum_times)*1000:.3f} ms")
+        print(f"  Std dev: {np.std(col_sum_times)*1000:.3f} ms")
+        
+        print(f"\nColumn-major total times:")
+        print(f"  Mean: {np.mean(col_total_times)*1000:.3f} ms")
+        print(f"  Median: {np.median(col_total_times)*1000:.3f} ms")
+        print(f"  Min: {np.min(col_total_times)*1000:.3f} ms")
+        print(f"  Max: {np.max(col_total_times)*1000:.3f} ms")
+        print(f"  Std dev: {np.std(col_total_times)*1000:.3f} ms")
+        print(f"  Total: {sum(col_total_times)*1000:.3f} ms")
+        
+        # Calculate throughput for column queries
+        total_genes_queried = sum(col_query_lengths)
+        total_col_query_time = sum(col_query_times)
+        avg_genes_per_second = total_genes_queried / total_col_query_time if total_col_query_time > 0 else 0
+        
+        print(f"\nColumn-major throughput:")
+        print(f"  Total genes queried: {total_genes_queried:,}")
+        print(f"  Total query time: {total_col_query_time:.3f} s")
+        print(f"  Average genes/second: {avg_genes_per_second:,.0f}")
+    except Exception as e:
+        print(f"\nERROR: Failed to run column-major tests: {e}")
+        import traceback
+        traceback.print_exc()
 
 
