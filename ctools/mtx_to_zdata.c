@@ -616,24 +616,27 @@ static int process_chunk_from_csr(
 
 
 int main(int argc, char *argv[]) {
-    if (argc < 3 || argc > 6) {
-        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset]\n", argv[0]);
+    if (argc < 3 || argc > 7) {
+        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset] [subdir]\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 131072\n", argv[0]);
-        fprintf(stderr, "  Output: andrews/X_RM/0.bin, andrews/X_RM/1.bin, ...\n");
-        fprintf(stderr, "  Default: block_rows=16, max_rows=8192, row_offset=0\n");
+        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 0 X_CM\n", argv[0]);
+        fprintf(stderr, "  Output: andrews/X_RM/0.bin, andrews/X_RM/1.bin, ... (or andrews/X_CM/0.bin, ...)\n");
+        fprintf(stderr, "  Default: block_rows=16, max_rows=8192, row_offset=0, subdir=X_RM\n");
         fprintf(stderr, "  row_offset: Add this value to row indices from MTX file (for globally contiguous numbering)\n");
+        fprintf(stderr, "  subdir: Subdirectory name for .bin files (default: X_RM, use X_CM for column-major)\n");
         return 1;
     }
 
     const char *mtx_path = argv[1];
     const char *out_name = argv[2];
     
-    /* Parse optional block_rows, max_rows, and row_offset parameters */
+    /* Parse optional block_rows, max_rows, row_offset, and subdir parameters */
     uint32_t block_rows = DEFAULT_BLOCK_ROWS;
     uint32_t max_rows = DEFAULT_MAX_ROWS;
     long long row_offset = 0;  /* Offset to add to row indices from MTX file */
+    const char *subdir = "X_RM";  /* Default subdirectory name */
     
     if (argc >= 4) {
         block_rows = (uint32_t)atoi(argv[3]);
@@ -657,6 +660,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: row_offset must be >= 0, got %lld\n", row_offset);
             return 1;
         }
+    }
+    
+    if (argc >= 7) {
+        subdir = argv[6];
     }
 
     FILE *f = fopen(mtx_path, "r");
@@ -718,22 +725,24 @@ int main(int argc, char *argv[]) {
         /* Directory already exists, that's okay */
     }
     
-    /* Create X_RM subdirectory for .bin files */
-    char xrm_dir[2048];  /* Increased size to avoid truncation warning */
-    int n = snprintf(xrm_dir, sizeof(xrm_dir), "%s/X_RM", out_dir);
-    if (n < 0 || n >= (int)sizeof(xrm_dir)) {
-        fprintf(stderr, "ERROR: Path too long for X_RM directory\n");
+    /* Create subdirectory for .bin files (X_RM or X_CM) */
+    char chunk_dir[2048];  /* Increased size to avoid truncation warning */
+    int n = snprintf(chunk_dir, sizeof(chunk_dir), "%s/%s", out_dir, subdir);
+    if (n < 0 || n >= (int)sizeof(chunk_dir)) {
+        fprintf(stderr, "ERROR: Path too long for subdirectory\n");
         fclose(f);
         return 1;
     }
-    if (mkdir(xrm_dir, 0755) != 0) {
+    if (mkdir(chunk_dir, 0755) != 0) {
         if (errno != EEXIST) {
-            perror("mkdir X_RM");
+            perror("mkdir subdirectory");
             fclose(f);
             return 1;
         }
         /* Directory already exists, that's okay */
     }
+    printf("Output %s directory: %s\n", subdir, chunk_dir);
+    fflush(stdout);
     
     printf("Output directory: %s\n", out_dir);
     fflush(stdout);  /* Ensure output is flushed immediately */
@@ -758,7 +767,7 @@ int main(int argc, char *argv[]) {
         if (end_row > nrows_ll) end_row = nrows_ll;
 
         char out_path[4096];  /* Increased size to handle long paths and avoid truncation warning */
-        int n = snprintf(out_path, sizeof(out_path), "%s/X_RM/%d.bin", out_dir, chunk_num);
+        int n = snprintf(out_path, sizeof(out_path), "%s/%s/%d.bin", out_dir, subdir, chunk_num);
         if (n < 0 || n >= (int)sizeof(out_path)) {
             fprintf(stderr, "ERROR: Path too long for output file\n");
             free_full_csr(csr);

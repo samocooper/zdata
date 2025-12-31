@@ -24,6 +24,40 @@ def _get_mtx_to_zdata_path():
         )
     return str(bin_path)
 
+def _sort_mtx_files_numerically(mtx_files):
+    """
+    Sort MTX files numerically by extracting the start index from the filename.
+    
+    Handles filenames like:
+    - cols_START_END.mtx (e.g., cols_0_255.mtx, cols_35584_35803.mtx)
+    - rows_START_END.mtx (e.g., rows_0_255.mtx)
+    - Or any pattern with numbers separated by underscores
+    
+    Args:
+        mtx_files: List of Path objects for MTX files
+        
+    Returns:
+        Sorted list of Path objects
+    """
+    def extract_start_index(mtx_path):
+        """Extract the first numeric value from filename for sorting."""
+        name = mtx_path.stem  # Get filename without extension
+        # Try to extract numbers from the filename
+        # Pattern: prefix_START_END or similar
+        parts = name.split('_')
+        for part in parts:
+            if part.isdigit():
+                return int(part)
+        # Fallback: try to find any number in the filename
+        import re
+        numbers = re.findall(r'\d+', name)
+        if numbers:
+            return int(numbers[0])
+        # Last resort: return 0 to keep original order for files without numbers
+        return 0
+    
+    return sorted(mtx_files, key=extract_start_index)
+
 def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max_rows=8192):
     """
     Build a .zdata directory from an MTX file or directory of MTX files.
@@ -50,18 +84,96 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
     
     # Determine if input is a directory or single file
     if input_path.is_dir():
-        # Get all .mtx files in directory, sorted
-        mtx_files = sorted(input_path.glob("*.mtx"))
-        if not mtx_files:
-            raise ValueError(f"No .mtx files found in directory: {mtx_file_or_dir}")
-        print(f"Found {len(mtx_files)} MTX files in directory")
-        return _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows)
+        # Check for rm_mtx_files and cm_mtx_files subdirectories
+        rm_mtx_dir = input_path / "rm_mtx_files"
+        cm_mtx_dir = input_path / "cm_mtx_files"
+        
+        # Process row-major MTX files if they exist
+        zdata_dir = None
+        rm_metadata = None
+        if rm_mtx_dir.exists() and rm_mtx_dir.is_dir():
+            mtx_files = _sort_mtx_files_numerically(list(rm_mtx_dir.glob("*.mtx")))
+            if mtx_files:
+                print(f"Found {len(mtx_files)} row-major MTX files in rm_mtx_files")
+                zdata_dir, rm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=True)
+        
+        # Process column-major MTX files if they exist
+        cm_metadata = None
+        if cm_mtx_dir.exists() and cm_mtx_dir.is_dir():
+            mtx_files = _sort_mtx_files_numerically(list(cm_mtx_dir.glob("*.mtx")))
+            if mtx_files:
+                print(f"\nFound {len(mtx_files)} column-major MTX files in cm_mtx_files")
+                # Use existing zdata_dir if already created, otherwise create new one
+                if zdata_dir is None:
+                    zdata_dir = Path(output_name)
+                    zdata_dir.mkdir(parents=True, exist_ok=True)
+                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_CM", return_metadata=True)
+        
+        # Combine metadata if both exist
+        if rm_metadata is not None and cm_metadata is not None:
+            # Merge metadata: use shape from RM (cells, genes), but include both chunk lists
+            # X_RM shape: [cells, genes]
+            # X_CM shape: [genes, cells] - but we want to use RM shape as the canonical shape
+            combined_metadata = {
+                "version": 1,
+                "format": "zdata",
+                "shape": rm_metadata['shape'],  # [cells, genes] from X_RM
+                "nnz_total": rm_metadata.get('nnz_total', 0) + cm_metadata.get('nnz_total', 0),
+                "num_chunks_rm": rm_metadata['num_chunks'],
+                "num_chunks_cm": cm_metadata['num_chunks'],
+                "total_blocks_rm": rm_metadata['total_blocks'],
+                "total_blocks_cm": cm_metadata['total_blocks'],
+                "blocks_per_chunk": rm_metadata['blocks_per_chunk'],
+                "block_rows": block_rows,
+                "max_rows_per_chunk": max_rows,
+                "chunks_rm": rm_metadata['chunks'],  # Chunk ranges are cell indices (0 to nrows-1)
+                "chunks_cm": cm_metadata['chunks'],  # Chunk ranges are gene indices (0 to ncols-1)
+                "source_files_rm": rm_metadata.get('source_files', []),
+                "source_files_cm": cm_metadata.get('source_files', [])
+            }
+            metadata_file = zdata_dir / "metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(combined_metadata, f, indent=2)
+            print(f"\n✓ Combined metadata written to {metadata_file}")
+        elif rm_metadata is not None:
+            # Only RM metadata - add chunks_rm key for consistency
+            rm_metadata['chunks_rm'] = rm_metadata.pop('chunks')
+            rm_metadata['num_chunks_rm'] = rm_metadata.pop('num_chunks')
+            rm_metadata['total_blocks_rm'] = rm_metadata.pop('total_blocks')
+            metadata_file = zdata_dir / "metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(rm_metadata, f, indent=2)
+        elif cm_metadata is not None:
+            # Only CM metadata - add chunks_cm key for consistency
+            # For CM-only, we need to infer the original shape
+            # X_CM shape is [genes, cells], but we want [cells, genes] for consistency
+            # So we swap: shape = [cm_metadata['shape'][1], cm_metadata['shape'][0]]
+            cm_metadata['chunks_cm'] = cm_metadata.pop('chunks')
+            cm_metadata['num_chunks_cm'] = cm_metadata.pop('num_chunks')
+            cm_metadata['total_blocks_cm'] = cm_metadata.pop('total_blocks')
+            # Swap shape for CM-only: [genes, cells] -> [cells, genes]
+            if 'shape' in cm_metadata:
+                cm_shape = cm_metadata['shape']
+                cm_metadata['shape'] = [cm_shape[1], cm_shape[0]]  # Swap to [cells, genes]
+            metadata_file = zdata_dir / "metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(cm_metadata, f, indent=2)
+        
+        # Fallback: if no subdirectories, look for MTX files directly in the directory
+        if zdata_dir is None:
+            mtx_files = _sort_mtx_files_numerically(list(input_path.glob("*.mtx")))
+            if not mtx_files:
+                raise ValueError(f"No .mtx files found in directory: {mtx_file_or_dir}")
+            print(f"Found {len(mtx_files)} MTX files in directory")
+            return _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM")
+        
+        return zdata_dir
     else:
         # Single file
         return _build_zdata_from_single_file(input_path, output_name, block_rows, max_rows)
 
 
-def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, row_offset=0):
+def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, row_offset=0, subdir="X_RM"):
     """Build zdata from a single MTX file.
     
     Args:
@@ -80,6 +192,11 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
     cmd = [bin_path, str(mtx_path), output_name, str(block_rows), str(max_rows)]
     if row_offset > 0:
         cmd.append(str(row_offset))
+    # Always pass subdir parameter (7th argument) if not default
+    if subdir != "X_RM":
+        if row_offset == 0:
+            cmd.append("0")  # Pass 0 for row_offset if not provided
+        cmd.append(subdir)
     
     # Use Popen to stream output in real-time
     process = subprocess.Popen(
@@ -144,11 +261,11 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
             else:
                 raise ValueError("Could not parse MTX file dimensions")
     
-    # Count chunk files (in X_RM subdirectory)
-    xrm_dir = zdata_dir / "X_RM"
-    if not xrm_dir.exists():
-        xrm_dir.mkdir(parents=True, exist_ok=True)
-    chunk_files = sorted(xrm_dir.glob("*.bin"))
+    # Count chunk files (in subdirectory: X_RM or X_CM)
+    chunk_dir = zdata_dir / subdir
+    if not chunk_dir.exists():
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_files = sorted(chunk_dir.glob("*.bin"))
     num_chunks = len(chunk_files)
     
     # Determine blocks per chunk (each chunk has max_rows rows,
@@ -204,20 +321,30 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
     return zdata_dir
 
 
-def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows):
-    """Build zdata from multiple MTX files, combining them into a single contiguous dataset."""
+def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=False):
+    """
+    Build zdata from multiple MTX files, combining them into a single contiguous dataset.
+    
+    For X_RM: rows = cells, chunk ranges are based on cell indices (0 to nrows-1)
+    For X_CM: rows = genes (transposed), chunk ranges are based on gene indices (0 to ncols-1)
+    """
     zdata_dir = Path(output_name)
     
     # Create output directory if it doesn't exist
     zdata_dir.mkdir(parents=True, exist_ok=True)
     
     # Track cumulative statistics
+    # For X_RM: total_rows tracks cells
+    # For X_CM: total_rows tracks genes (since rows in X_CM = genes)
     total_rows = 0
     total_nnz = 0
     ncols = None
     all_chunk_metadata = []
     total_blocks = 0
     blocks_per_chunk = max_rows // block_rows
+    
+    # Determine if we're processing X_CM (column-major) files
+    is_cm = (subdir == "X_CM")
     
     print(f"\nProcessing {len(mtx_files)} MTX files into single zdata object...")
     print("=" * 70)
@@ -239,13 +366,35 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             else:
                 raise ValueError(f"Could not parse MTX file dimensions: {mtx_file}")
         
-        # Validate column count consistency
-        if ncols is None:
-            ncols = file_cols
-        elif ncols != file_cols:
-            raise ValueError(
-                f"Column count mismatch: expected {ncols}, got {file_cols} in {mtx_file}"
-            )
+        # For X_CM files: rows = genes, columns = cells (transposed)
+        # For X_RM files: rows = cells, columns = genes (normal)
+        if is_cm:
+            # X_CM: file_rows = genes, file_cols = cells
+            # We chunk by rows (genes), so validate gene count consistency
+            # Note: X_CM files are created by fragmenting into 256-gene chunks,
+            # so the last file may have fewer genes if total genes isn't divisible by 256
+            if ncols is None:
+                ncols = file_rows  # Number of genes (rows in X_CM) - use first file as reference
+            elif ncols != file_rows:
+                # Allow the last file to have fewer genes (it's a partial fragment)
+                # Check if this is the last file and if it has fewer genes
+                is_last_file = (mtx_idx == len(mtx_files) - 1)
+                if is_last_file and file_rows < ncols:
+                    # Last file with fewer genes is acceptable
+                    pass
+                else:
+                    raise ValueError(
+                        f"Gene count mismatch in X_CM: expected {ncols}, got {file_rows} in {mtx_file}"
+                    )
+        else:
+            # X_RM: file_rows = cells, file_cols = genes
+            # We chunk by rows (cells), so validate column (gene) count consistency
+            if ncols is None:
+                ncols = file_cols
+            elif ncols != file_cols:
+                raise ValueError(
+                    f"Column count mismatch: expected {ncols}, got {file_cols} in {mtx_file}"
+                )
         
         # Use a temporary output directory for this MTX file
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -254,20 +403,26 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             # Process MTX file with row_offset to make row indices globally contiguous
             # MTX files use 1-based indexing, so total_rows (0-based) becomes the offset
             # The C code will add this offset to row indices from the MTX file
-            _build_zdata_from_single_file(mtx_file, str(temp_output), block_rows, max_rows, row_offset=total_rows)
+            # For X_CM: total_rows tracks genes (rows in X_CM)
+            # For X_RM: total_rows tracks cells (rows in X_RM)
+            _build_zdata_from_single_file(mtx_file, str(temp_output), block_rows, max_rows, row_offset=total_rows, subdir=subdir)
             
-            # Get chunk files from temp directory (they're in X_RM subdirectory)
-            temp_xrm_dir = temp_output / "X_RM"
-            temp_chunk_files = sorted(temp_xrm_dir.glob("*.bin")) if temp_xrm_dir.exists() else []
+            # Get chunk files from temp directory (they're in subdirectory: X_RM or X_CM)
+            temp_chunk_dir = temp_output / subdir
+            temp_chunk_files = sorted(temp_chunk_dir.glob("*.bin")) if temp_chunk_dir.exists() else []
             num_chunks_copied = len(temp_chunk_files)
             
             # Copy and rename chunk files with correct global chunk numbering
             # Chunk numbers are calculated based on global row ranges to ensure sequential numbering
+            # For X_CM: rows = genes, so chunk ranges are gene indices (0 to ncols-1)
+            # For X_RM: rows = cells, so chunk ranges are cell indices (0 to nrows-1)
             chunk_nums_created = []
             for temp_chunk_file in temp_chunk_files:
                 local_chunk_idx = int(temp_chunk_file.stem)
                 
                 # Calculate global row range for this chunk
+                # For X_CM: this is gene index range
+                # For X_RM: this is cell index range
                 chunk_start_row = total_rows + (local_chunk_idx * max_rows)
                 chunk_end_row = min(chunk_start_row + max_rows, total_rows + file_rows)
                 
@@ -275,11 +430,11 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
                 # This matches the calculation used in zdata.py: chunk_num = global_row // max_rows_per_chunk
                 new_chunk_num = chunk_start_row // max_rows
                 
-                # Create X_RM subdirectory if it doesn't exist
-                xrm_dir = zdata_dir / "X_RM"
-                xrm_dir.mkdir(parents=True, exist_ok=True)
+                # Create subdirectory if it doesn't exist (X_RM or X_CM)
+                chunk_dir = zdata_dir / subdir
+                chunk_dir.mkdir(parents=True, exist_ok=True)
                 
-                new_chunk_file = xrm_dir / f"{new_chunk_num}.bin"
+                new_chunk_file = chunk_dir / f"{new_chunk_num}.bin"
                 
                 # Copy the file
                 shutil.copy2(temp_chunk_file, new_chunk_file)
@@ -336,17 +491,24 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
         "chunks": all_chunk_metadata
     }
     
-    # Write metadata
-    metadata_file = zdata_dir / "metadata.json"
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
+    # Write metadata only if not returning it (for combination later)
+    if not return_metadata:
+        metadata_file = zdata_dir / "metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"✓ Metadata written to {metadata_file}")
     
     print("\n" + "=" * 70)
     print(f"✓ Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
-    print(f"✓ Total: {total_rows} rows, {ncols} cols, {total_nnz} nnz")
-    print(f"✓ Metadata written to {metadata_file}")
+    if is_cm:
+        print(f"✓ Total: {total_rows} genes (rows in X_CM), {ncols} cells (cols in X_CM), {total_nnz} nnz")
+    else:
+        print(f"✓ Total: {total_rows} rows, {ncols} cols, {total_nnz} nnz")
     
-    return zdata_dir
+    if return_metadata:
+        return zdata_dir, metadata
+    else:
+        return zdata_dir
 
 if __name__ == "__main__":
     import sys
