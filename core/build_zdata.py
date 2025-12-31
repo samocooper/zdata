@@ -22,7 +22,7 @@ def _get_mtx_to_zdata_path():
         )
     return str(bin_path)
 
-def build_zdata(mtx_file, output_name, zstd_base=None):
+def build_zdata(mtx_file, output_name, zstd_base=None, block_rows=16, max_rows=4096):
     """
     Build a .zdata directory from an MTX file.
     
@@ -30,6 +30,8 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
         mtx_file: Path to the input Matrix Market (.mtx) file
         output_name: Base name for output (e.g., "andrews" -> "andrews.zdata/")
         zstd_base: Optional path to zstd library (for compilation if needed)
+        block_rows: Number of rows per block (default: 16)
+        max_rows: Maximum rows per chunk (default: 4096)
     
     Returns:
         Path to the created .zdata directory
@@ -38,10 +40,17 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
     if not mtx_path.exists():
         raise FileNotFoundError(f"MTX file not found: {mtx_file}")
     
-    # Call the C tool
+    # Validate parameters
+    if block_rows < 1 or block_rows > 256:
+        raise ValueError(f"block_rows must be between 1 and 256, got {block_rows}")
+    if max_rows < 1 or max_rows > 1000000:
+        raise ValueError(f"max_rows must be between 1 and 1000000, got {max_rows}")
+    
+    # Call the C tool with optional parameters
     bin_path = _get_mtx_to_zdata_path()
+    cmd = [bin_path, str(mtx_path), output_name, str(block_rows), str(max_rows)]
     result = subprocess.run(
-        [bin_path, str(mtx_path), output_name],
+        cmd,
         capture_output=True,
         text=True
     )
@@ -94,11 +103,9 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
     chunk_files = sorted(zdata_dir.glob("*.bin"))
     num_chunks = len(chunk_files)
     
-    # Determine blocks per chunk (each chunk has MAX_ROWS_PER_CHUNK rows,
-    # each block has 16 rows, so max 256 blocks per chunk)
-    MAX_ROWS_PER_CHUNK = 4096
-    BLOCK_ROWS = 16
-    blocks_per_chunk = MAX_ROWS_PER_CHUNK // BLOCK_ROWS  # 256
+    # Determine blocks per chunk (each chunk has max_rows rows,
+    # each block has block_rows rows)
+    blocks_per_chunk = max_rows // block_rows
     
     # Calculate total blocks
     total_blocks = 0
@@ -111,16 +118,16 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
             blocks_in_chunk = blocks_per_chunk
         else:
             # Last chunk: calculate based on remaining rows
-            rows_in_last_chunk = nrows - (chunk_num * MAX_ROWS_PER_CHUNK)
-            blocks_in_last_chunk = (rows_in_last_chunk + BLOCK_ROWS - 1) // BLOCK_ROWS
+            rows_in_last_chunk = nrows - (chunk_num * max_rows)
+            blocks_in_last_chunk = (rows_in_last_chunk + block_rows - 1) // block_rows
             blocks_in_chunk = blocks_in_last_chunk
         
         chunk_metadata.append({
             "chunk_num": chunk_num,
             "file": chunk_file.name,
             "blocks": blocks_in_chunk,
-            "start_row": chunk_num * MAX_ROWS_PER_CHUNK,
-            "end_row": min((chunk_num + 1) * MAX_ROWS_PER_CHUNK, nrows)
+            "start_row": chunk_num * max_rows,
+            "end_row": min((chunk_num + 1) * max_rows, nrows)
         })
         total_blocks += blocks_in_chunk
     
@@ -133,8 +140,8 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
         "num_chunks": num_chunks,
         "total_blocks": total_blocks,
         "blocks_per_chunk": blocks_per_chunk,
-        "block_rows": BLOCK_ROWS,
-        "max_rows_per_chunk": MAX_ROWS_PER_CHUNK,
+        "block_rows": block_rows,
+        "max_rows_per_chunk": max_rows,
         "chunks": chunk_metadata
     }
     
@@ -150,9 +157,13 @@ def build_zdata(mtx_file, output_name, zstd_base=None):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <matrix.mtx> <output_name>")
+    if len(sys.argv) < 3 or len(sys.argv) > 5:
+        print(f"Usage: {sys.argv[0]} <matrix.mtx> <output_name> [block_rows] [max_rows]")
+        print(f"  Default: block_rows=16, max_rows=4096")
         sys.exit(1)
     
-    build_zdata(sys.argv[1], sys.argv[2])
+    block_rows = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+    max_rows = int(sys.argv[4]) if len(sys.argv) > 4 else 4096
+    
+    build_zdata(sys.argv[1], sys.argv[2], block_rows=block_rows, max_rows=max_rows)
 

@@ -7,8 +7,8 @@
 #include "zstd.h"
 #include "zstd_seekable.h"
 
-#define BLOCK_ROWS 16
-#define MAX_ROWS   4096
+#define MAX_BLOCK_ROWS 256  /* Maximum supported block_rows */
+#define MAX_ROWS   1000000  /* Maximum supported max_rows */
 
 static uint32_t read_le32(const uint8_t *p) {
     return ((uint32_t)p[0]) |
@@ -26,12 +26,6 @@ static void write_le32(FILE *out, uint32_t v) {
     fwrite(b, 1, 4, out);
 }
 
-static void write_le16(FILE *out, uint16_t v) {
-    uint8_t b[2];
-    b[0] = (uint8_t)(v & 0xFF);
-    b[1] = (uint8_t)((v >> 8) & 0xFF);
-    fwrite(b, 1, 2, out);
-}
 
 typedef struct {
     uint32_t magic, version, start_row, nrows_in_block, ncols, nnz;
@@ -58,8 +52,9 @@ static int parse_block(const uint8_t *buf, size_t sz,
                        BlockHeader *hdr,
                        const uint32_t **indptr,
                        const uint32_t **indices,
-                       const uint16_t **data) {
-    if (sz < 24 + (BLOCK_ROWS + 1) * 4) return 0;
+                       const uint16_t **data,
+                       uint32_t *block_rows_out) {
+    if (sz < 24 + 4) return 0;  /* Minimum header size */
 
     hdr->magic = read_le32(buf + 0);
     hdr->version = read_le32(buf + 4);
@@ -68,13 +63,42 @@ static int parse_block(const uint8_t *buf, size_t sz,
     hdr->ncols = read_le32(buf + 16);
     hdr->nnz = read_le32(buf + 20);
 
-    if (hdr->magic != 0x5253435A || hdr->version != 2 || hdr->nrows_in_block == 0 || hdr->nrows_in_block > BLOCK_ROWS) {
+    if (hdr->magic != 0x5253435A || hdr->version != 2 || hdr->nrows_in_block == 0 || hdr->nrows_in_block > MAX_BLOCK_ROWS) {
         return 0;
     }
 
+    /* Determine block_rows from indptr size: indptr is always block_rows+1 elements */
+    /* We can infer block_rows by checking the size: (sz - 24 - indices - data) / 4 - 1 */
+    /* But simpler: use nrows_in_block as a hint, but indptr is allocated for full block */
+    /* Actually, we need to calculate: remaining bytes after header = sz - 24 */
+    /* indptr_bytes = (block_rows + 1) * 4, so we can solve for block_rows */
+    /* For now, we'll use a heuristic: check common sizes or infer from structure */
+    
+    /* Try to infer block_rows from the data structure */
+    /* The indptr array size is (block_rows + 1) * 4 */
+    /* After indptr comes indices (nnz * 4) and data (nnz * 2) */
+    /* So: sz = 24 + (block_rows+1)*4 + nnz*4 + nnz*2 */
+    /* Solving: (block_rows+1)*4 = sz - 24 - nnz*6 */
+    /* block_rows = (sz - 24 - nnz*6) / 4 - 1 */
+    
+    size_t remaining = sz - 24;
+    size_t data_indices_bytes = (size_t)hdr->nnz * (sizeof(uint32_t) + sizeof(uint16_t));
+    if (remaining < data_indices_bytes) return 0;
+    
+    size_t indptr_bytes = remaining - data_indices_bytes;
+    if (indptr_bytes % 4 != 0 || indptr_bytes < 4) return 0;
+    
+    uint32_t inferred_block_rows = (uint32_t)(indptr_bytes / 4) - 1;
+    if (inferred_block_rows > MAX_BLOCK_ROWS || inferred_block_rows < hdr->nrows_in_block) {
+        return 0;
+    }
+    
+    uint32_t block_rows = inferred_block_rows;
+    if (block_rows_out) *block_rows_out = block_rows;
+
     size_t off = 24;
     *indptr = (const uint32_t*)(buf + off);
-    off += (BLOCK_ROWS + 1) * sizeof(uint32_t);
+    off += (block_rows + 1) * sizeof(uint32_t);
 
     /* Version 2: uint32_t indices, uint16_t data */
     size_t idx_bytes = (size_t)hdr->nnz * sizeof(uint32_t);
@@ -143,6 +167,14 @@ int main(int argc, char *argv[]) {
 
     FILE *fp = fopen(path, "rb");
     if (!fp) { perror("open archive"); return 1; }
+    
+    /* Set input file to fully buffered for better performance (reduces system calls) */
+    setvbuf(fp, NULL, _IOFBF, 65536);  /* 64KB buffer */
+
+    /* Set stdout to fully buffered for better performance (reduces system calls) */
+    if (binary) {
+        setvbuf(stdout, NULL, _IOFBF, 65536);  /* 64KB buffer */
+    }
 
     ZSTD_seekable *zs = ZSTD_seekable_create();
     if (!zs) { fprintf(stderr, "ZSTD_seekable_create failed\n"); fclose(fp); return 1; }
@@ -155,8 +187,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Determine ncols by reading the first referenced block */
-    unsigned first_block = (unsigned)(rows_req[0] / BLOCK_ROWS);
+    /* Determine ncols and block_rows by reading the first referenced block */
+    /* We need to guess block_rows first - try common value of 16 */
+    uint32_t block_rows = 16;
+    unsigned first_block = (unsigned)(rows_req[0] / block_rows);
     uint8_t *frameBuf = NULL;
     size_t frameSz = 0;
 
@@ -171,7 +205,7 @@ int main(int argc, char *argv[]) {
     const uint32_t *indices = NULL;
     const uint16_t *data = NULL;
 
-    if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data)) {
+    if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, &block_rows)) {
         fprintf(stderr, "Failed to parse first block\n");
         free(frameBuf);
         ZSTD_seekable_free(zs);
@@ -192,8 +226,8 @@ int main(int argc, char *argv[]) {
 
     for (int i = 0; i < nreq; i++) {
         uint32_t row = rows_req[i];
-        unsigned block_id = (unsigned)(row / BLOCK_ROWS);
-        uint32_t block_start = block_id * BLOCK_ROWS;
+        unsigned block_id = (unsigned)(row / block_rows);
+        uint32_t block_start = block_id * block_rows;
 
         /* Decompress block only if we haven't seen it yet */
         if (block_id != cached_block) {
@@ -205,7 +239,7 @@ int main(int argc, char *argv[]) {
                 fclose(fp);
                 return 1;
             }
-            if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data)) {
+            if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, NULL)) {
                 fprintf(stderr, "Failed to parse block %u\n", block_id);
                 free(frameBuf);
                 ZSTD_seekable_free(zs);
@@ -239,13 +273,18 @@ int main(int argc, char *argv[]) {
             }
             printf("\n");
         } else {
+            /* Write row header */
             write_le32(stdout, row);
             write_le32(stdout, nnz);
-            for (uint32_t p = p0; p < p1; p++) {
-                write_le32(stdout, indices[p]);
+            /* Write indices array in bulk (much faster than individual writes)
+             * Note: Assumes little-endian system (x86/x64) - data is written in native byte order
+             * which matches what Python's np.frombuffer expects */
+            if (nnz > 0) {
+                fwrite(indices + p0, sizeof(uint32_t), nnz, stdout);
             }
-            for (uint32_t p = p0; p < p1; p++) {
-                write_le16(stdout, data[p]);
+            /* Write data array in bulk (much faster than individual writes) */
+            if (nnz > 0) {
+                fwrite(data + p0, sizeof(uint16_t), nnz, stdout);
             }
         }
     }

@@ -6,8 +6,6 @@ from collections import defaultdict
 from scipy.sparse import csr_matrix
 from pathlib import Path
 
-MAX_ROWS_PER_CHUNK = 4096
-
 # Get the path to the zdata_read executable
 # This assumes the module structure: zdata/core/zdata.py and zdata/ctools/zdata_read
 _MODULE_DIR = Path(__file__).parent  # zdata/core/
@@ -65,13 +63,20 @@ class ZData:
         self.num_chunks = self.metadata['num_chunks']
         self.total_blocks = self.metadata.get('total_blocks', None)
         
+        # Extract block configuration from metadata (with defaults for backward compatibility)
+        self.block_rows = self.metadata.get('block_rows', 16)
+        self.max_rows_per_chunk = self.metadata.get('max_rows_per_chunk', 4096)
+        
         # Build chunk_files dict and chunk info from metadata
         self.chunk_files = {}
         self.chunk_info = {}  # Store chunk metadata for validation
+        self.file_to_chunk = {}  # Reverse mapping: file_path -> chunk_num (for O(1) lookup)
         for chunk_info in self.metadata['chunks']:
             chunk_num = chunk_info['chunk_num']
-            self.chunk_files[chunk_num] = os.path.join(self.dir_path, chunk_info['file'])
+            file_path = os.path.join(self.dir_path, chunk_info['file'])
+            self.chunk_files[chunk_num] = file_path
             self.chunk_info[chunk_num] = chunk_info
+            self.file_to_chunk[file_path] = chunk_num
     
     
     def _read_rows_from_file(self, file_path, local_rows):
@@ -145,8 +150,8 @@ class ZData:
             if global_row >= self.nrows:
                 raise IndexError(f"Row {global_row} is beyond available data (max row: {self.nrows - 1})")
             
-            chunk_num = global_row // MAX_ROWS_PER_CHUNK
-            local_row = global_row % MAX_ROWS_PER_CHUNK
+            chunk_num = global_row // self.max_rows_per_chunk
+            local_row = global_row % self.max_rows_per_chunk
             
             if chunk_num not in self.chunk_files:
                 raise IndexError(f"Row {global_row} is beyond available data (chunk {chunk_num} not found)")
@@ -168,17 +173,11 @@ class ZData:
         all_results = [None] * len(global_rows)
         
         for file_path, row_info_list in rows_by_file.items():
-            # Find which chunk this file belongs to
-            chunk_num = None
-            chunk_info = None
-            for cn, cf in self.chunk_files.items():
-                if cf == file_path:
-                    chunk_num = cn
-                    chunk_info = self.chunk_info[cn]
-                    break
-            
-            if chunk_info is None:
+            # Find which chunk this file belongs to (O(1) lookup using reverse mapping)
+            chunk_num = self.file_to_chunk.get(file_path)
+            if chunk_num is None:
                 raise ValueError(f"Could not find chunk info for file: {file_path}")
+            chunk_info = self.chunk_info[chunk_num]
             
             # Validate local rows are within chunk bounds
             chunk_start = chunk_info['start_row']
