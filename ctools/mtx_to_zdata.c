@@ -10,16 +10,17 @@
 #include "zstd.h"
 #include "zstd_seekable.h"   /* from contrib/seekable_format */
 
-#define BLOCK_ROWS 16
-#define MAX_ROWS   4096
+/* Default values (can be overridden via command line) */
+#define DEFAULT_BLOCK_ROWS 16
+#define DEFAULT_MAX_ROWS   4096
 
-/* Simple block-CSR structure (for 16 rows) */
+/* Simple block-CSR structure (variable number of rows per block) */
 typedef struct {
     uint32_t nnz;         /* total nnz in this block */
-    uint32_t *indptr;     /* length BLOCK_ROWS+1 */
+    uint32_t *indptr;     /* length block_rows+1 */
     uint32_t *indices;    /* length nnz */
     uint16_t *data;       /* length nnz */
-    uint32_t write_pos[BLOCK_ROWS];
+    uint32_t *write_pos;  /* length block_rows (allocated dynamically) */
 } BlockCSR;
 
 static int skip_to_size_line(FILE *f, char *line, size_t line_sz) {
@@ -36,12 +37,8 @@ static void write_le32(uint8_t *dst, uint32_t v) {
     dst[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-static void write_le16(uint8_t *dst, uint16_t v) {
-    dst[0] = (uint8_t)(v & 0xFF);
-    dst[1] = (uint8_t)((v >> 8) & 0xFF);
-}
 
-/* Serialize a 16-row CSR block into a single contiguous blob.
+/* Serialize a CSR block into a single contiguous blob.
    Layout (all little-endian):
      u32 magic ('ZCSR' = 0x5253435A)
      u32 version (2)
@@ -49,7 +46,7 @@ static void write_le16(uint8_t *dst, uint16_t v) {
      u32 nrows_in_block
      u32 ncols
      u32 nnz
-     u32 indptr[17]
+     u32 indptr[nrows_in_block+1]
      u32 indices[nnz]
      u16 data[nnz]
 */
@@ -58,13 +55,14 @@ static uint8_t* serialize_block(
     uint32_t start_row,
     uint32_t nrows_in_block,
     uint32_t ncols,
+    uint32_t block_rows,  /* Maximum rows per block (for indptr size) */
     size_t *out_size
 ) {
     const uint32_t magic = 0x5253435A; /* 'ZCSR' little-endian bytes */
     const uint32_t version = 2;  /* Version 2: uint16_t data, uint32_t indices/indptr */
 
     size_t header_bytes = 6 * 4; /* 6 u32 */
-    size_t indptr_bytes = (BLOCK_ROWS + 1) * sizeof(uint32_t);
+    size_t indptr_bytes = (block_rows + 1) * sizeof(uint32_t);
     size_t indices_bytes = (size_t)b->nnz * sizeof(uint32_t);
     size_t data_bytes = (size_t)b->nnz * sizeof(uint16_t);
 
@@ -80,23 +78,17 @@ static uint8_t* serialize_block(
     write_le32(buf + off, ncols); off += 4;
     write_le32(buf + off, (uint32_t)b->nnz); off += 4;
 
-    /* indptr */
-    for (int i = 0; i < BLOCK_ROWS + 1; i++) {
-        write_le32(buf + off, b->indptr[i]);
-        off += 4;
-    }
+    /* indptr - copy directly (data is already in memory, assumes little-endian) */
+    memcpy(buf + off, b->indptr, indptr_bytes);
+    off += indptr_bytes;
 
-    /* indices */
-    for (uint32_t i = 0; i < b->nnz; i++) {
-        write_le32(buf + off, b->indices[i]);
-        off += 4;
-    }
+    /* indices - copy directly (data is already in memory, assumes little-endian) */
+    memcpy(buf + off, b->indices, indices_bytes);
+    off += indices_bytes;
 
-    /* data */
-    for (uint32_t i = 0; i < b->nnz; i++) {
-        write_le16(buf + off, b->data[i]);
-        off += 2;
-    }
+    /* data - copy directly (data is already in memory, assumes little-endian) */
+    memcpy(buf + off, b->data, data_bytes);
+    off += data_bytes;
 
     *out_size = total;
     return buf;
@@ -202,11 +194,13 @@ static int process_chunk(
     long long start_row_global,
     long long end_row_global,
     const uint32_t *cached_row_counts,  /* Pre-computed counts for all rows */
-    const char *out_path
+    const char *out_path,
+    uint32_t block_rows,
+    uint32_t max_rows
 ) {
     uint32_t chunk_size = (uint32_t)(end_row_global - start_row_global);
     if (chunk_size == 0) return 1;
-    if (chunk_size > MAX_ROWS) chunk_size = MAX_ROWS;
+    if (chunk_size > max_rows) chunk_size = max_rows;
 
     /* Extract row counts for this chunk from cache */
     uint32_t *row_counts = (uint32_t*)malloc(chunk_size * sizeof(uint32_t));
@@ -217,22 +211,25 @@ static int process_chunk(
     }
 
     /* Allocate blocks */
-    uint32_t nblocks = (chunk_size + BLOCK_ROWS - 1) / BLOCK_ROWS;
+    uint32_t nblocks = (chunk_size + block_rows - 1) / block_rows;
     BlockCSR *blocks = (BlockCSR*)calloc(nblocks, sizeof(BlockCSR));
     if (!blocks) { fprintf(stderr, "OOM blocks\n"); free(row_counts); return 0; }
 
     for (uint32_t b = 0; b < nblocks; b++) {
-        blocks[b].indptr = (uint32_t*)malloc((BLOCK_ROWS + 1) * sizeof(uint32_t));
+        blocks[b].indptr = (uint32_t*)malloc((block_rows + 1) * sizeof(uint32_t));
         if (!blocks[b].indptr) { fprintf(stderr, "OOM indptr\n"); return 0; }
 
+        blocks[b].write_pos = (uint32_t*)malloc(block_rows * sizeof(uint32_t));
+        if (!blocks[b].write_pos) { fprintf(stderr, "OOM write_pos\n"); return 0; }
+
         blocks[b].indptr[0] = 0;
-        for (uint32_t r = 0; r < BLOCK_ROWS; r++) {
-            uint32_t local_row = b * BLOCK_ROWS + r;
+        for (uint32_t r = 0; r < block_rows; r++) {
+            uint32_t local_row = b * block_rows + r;
             blocks[b].indptr[r + 1] = blocks[b].indptr[r] + 
                 ((local_row < chunk_size) ? row_counts[local_row] : 0);
         }
 
-        blocks[b].nnz = blocks[b].indptr[BLOCK_ROWS];
+        blocks[b].nnz = blocks[b].indptr[block_rows];
         if (blocks[b].nnz > 0) {
             blocks[b].indices = (uint32_t*)malloc((size_t)blocks[b].nnz * sizeof(uint32_t));
             blocks[b].data    = (uint16_t*)malloc((size_t)blocks[b].nnz * sizeof(uint16_t));
@@ -242,7 +239,7 @@ static int process_chunk(
             }
         }
 
-        for (uint32_t r = 0; r < BLOCK_ROWS; r++) {
+        for (uint32_t r = 0; r < block_rows; r++) {
             blocks[b].write_pos[r] = blocks[b].indptr[r];
         }
     }
@@ -261,8 +258,8 @@ static int process_chunk(
         if (row < start_row_global || row >= end_row_global) continue;
 
         uint32_t local_row = (uint32_t)(row - start_row_global);
-        uint32_t b = local_row / BLOCK_ROWS;
-        uint32_t r = local_row % BLOCK_ROWS;
+        uint32_t b = local_row / block_rows;
+        uint32_t r = local_row % block_rows;
         uint32_t pos = blocks[b].write_pos[r]++;
 
         blocks[b].indices[pos] = (uint32_t)col;
@@ -281,6 +278,9 @@ static int process_chunk(
     /* Write seekable archive: 1 frame per block */
     FILE *out = fopen(out_path, "wb");
     if (!out) { perror("open out"); return 0; }
+    
+    /* Set output file to fully buffered for better performance (reduces system calls) */
+    setvbuf(out, NULL, _IOFBF, 65536);  /* 64KB buffer */
 
     ZSTD_seekable_CStream *zcs = ZSTD_seekable_createCStream();
     if (!zcs) {
@@ -301,12 +301,12 @@ static int process_chunk(
     }
 
     for (uint32_t b = 0; b < nblocks; b++) {
-        uint32_t start_row = (uint32_t)start_row_global + b * BLOCK_ROWS;
+        uint32_t start_row = (uint32_t)start_row_global + b * block_rows;
         uint32_t nrows_in_block = (b == nblocks - 1) ? 
-            (chunk_size - b * BLOCK_ROWS) : BLOCK_ROWS;
+            (chunk_size - b * block_rows) : block_rows;
 
         size_t blob_sz = 0;
-        uint8_t *blob = serialize_block(&blocks[b], start_row, nrows_in_block, ncols, &blob_sz);
+        uint8_t *blob = serialize_block(&blocks[b], start_row, nrows_in_block, ncols, block_rows, &blob_sz);
         if (!blob) {
             fprintf(stderr, "OOM serialize_block\n");
             ZSTD_seekable_freeCStream(zcs);
@@ -348,6 +348,7 @@ static int process_chunk(
         free(blocks[b].indptr);
         free(blocks[b].indices);
         free(blocks[b].data);
+        free(blocks[b].write_pos);
     }
     free(blocks);
     free(row_counts);
@@ -356,18 +357,43 @@ static int process_chunk(
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name>\n", argv[0]);
+    if (argc < 3 || argc > 5) {
+        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows]\n", argv[0]);
         fprintf(stderr, "  Example: %s matrix.mtx andrews\n", argv[0]);
+        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 4096\n", argv[0]);
         fprintf(stderr, "  Output: andrews.zdata/0.bin, andrews.zdata/1.bin, ...\n");
+        fprintf(stderr, "  Default: block_rows=16, max_rows=4096\n");
         return 1;
     }
 
     const char *mtx_path = argv[1];
     const char *out_name = argv[2];
+    
+    /* Parse optional block_rows and max_rows parameters */
+    uint32_t block_rows = DEFAULT_BLOCK_ROWS;
+    uint32_t max_rows = DEFAULT_MAX_ROWS;
+    
+    if (argc >= 4) {
+        block_rows = (uint32_t)atoi(argv[3]);
+        if (block_rows == 0 || block_rows > 256) {
+            fprintf(stderr, "Error: block_rows must be between 1 and 256, got %u\n", block_rows);
+            return 1;
+        }
+    }
+    
+    if (argc >= 5) {
+        max_rows = (uint32_t)atoi(argv[4]);
+        if (max_rows == 0 || max_rows > 1000000) {
+            fprintf(stderr, "Error: max_rows must be between 1 and 1000000, got %u\n", max_rows);
+            return 1;
+        }
+    }
 
     FILE *f = fopen(mtx_path, "r");
     if (!f) { perror("open mtx"); return 1; }
+    
+    /* Set input file to fully buffered for better performance (reduces system calls) */
+    setvbuf(f, NULL, _IOFBF, 65536);  /* 64KB buffer */
 
     char line[4096];
 
@@ -404,7 +430,7 @@ int main(int argc, char *argv[]) {
     long data_start_pos = ftell(f);
 
     printf("Matrix: %lld rows, %lld cols, %lld nnz (global)\n", nrows_ll, ncols_ll, nnz_total_ll);
-    printf("Processing in chunks of %d rows\n", MAX_ROWS);
+    printf("Processing in chunks of %u rows, %u rows per block\n", max_rows, block_rows);
 
     /* Create output directory */
     char out_dir[1024];
@@ -429,10 +455,10 @@ int main(int argc, char *argv[]) {
     }
     printf("Cached row counts complete.\n");
 
-    /* Process file in chunks of MAX_ROWS */
+    /* Process file in chunks of max_rows */
     int chunk_num = 0;  /* Start from 0 instead of 1 */
-    for (long long start_row = 0; start_row < nrows_ll; start_row += MAX_ROWS) {
-        long long end_row = start_row + MAX_ROWS;
+    for (long long start_row = 0; start_row < nrows_ll; start_row += max_rows) {
+        long long end_row = start_row + max_rows;
         if (end_row > nrows_ll) end_row = nrows_ll;
 
         char out_path[4096];  /* Increased size to handle long paths and avoid truncation warning */
@@ -447,7 +473,7 @@ int main(int argc, char *argv[]) {
         printf("\nProcessing chunk %d: rows %lld-%lld -> %s\n",
                chunk_num, start_row, end_row - 1, out_path);
 
-        if (!process_chunk(f, data_start_pos, ncols, start_row, end_row, cached_row_counts, out_path)) {
+        if (!process_chunk(f, data_start_pos, ncols, start_row, end_row, cached_row_counts, out_path, block_rows, max_rows)) {
             fprintf(stderr, "Failed to process chunk %d\n", chunk_num);
             free(cached_row_counts);
             fclose(f);
