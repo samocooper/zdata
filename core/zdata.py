@@ -9,7 +9,7 @@ from pathlib import Path
 MAX_ROWS_PER_CHUNK = 4096
 
 # Get the path to the zdata_read executable
-# This assumes the module structure: zdata/core/read_out.py and zdata/ctools/zdata_read
+# This assumes the module structure: zdata/core/zdata.py and zdata/ctools/zdata_read
 _MODULE_DIR = Path(__file__).parent  # zdata/core/
 _PROJECT_ROOT = _MODULE_DIR.parent   # zdata/
 _ZDATA_READ = _PROJECT_ROOT / "ctools" / "zdata_read"

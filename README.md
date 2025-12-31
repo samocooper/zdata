@@ -105,7 +105,7 @@ data = reader.read_rows(random_rows)
 ```
 zdata/
 ├── core/              # Python core module
-│   ├── read_out.py   # ZData class implementation
+│   ├── zdata.py      # ZData class implementation
 │   └── __init__.py
 ├── ctools/            # C command-line tools
 │   ├── mtx_to_zdata.c    # MTX to zdata converter
