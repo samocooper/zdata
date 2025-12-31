@@ -54,23 +54,19 @@ def run_fast_queries_test(zdata_dir):
     """
     test_script = _test_dir / "test_fast_queries.py"
     
-    # Change to parent directory so test can find the zdata directory
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(_parent_dir)
-        
-        # Extract just the directory name (without .zdata)
-        if zdata_dir.endswith('.zdata'):
-            zdata_name = os.path.basename(zdata_dir).replace('.zdata', '')
-        else:
-            zdata_name = os.path.basename(zdata_dir)
-        
-        result = subprocess.run(
-            [sys.executable, str(test_script), f"{zdata_name}.zdata"],
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minute timeout per test
-        )
+    # Convert to absolute path if it's not already
+    if os.path.isabs(zdata_dir):
+        zdata_path = zdata_dir
+    else:
+        zdata_path = os.path.abspath(zdata_dir)
+    
+    # Pass the full path directly to test_fast_queries.py
+    result = subprocess.run(
+        [sys.executable, str(test_script), zdata_path],
+        capture_output=True,
+        text=True,
+        timeout=600  # 10 minute timeout per test
+    )
         
         if result.returncode != 0:
             print(f"  WARNING: test_fast_queries.py failed with return code {result.returncode}")
@@ -86,8 +82,6 @@ def run_fast_queries_test(zdata_dir):
     except Exception as e:
         print(f"  ERROR: Exception running test: {e}")
         return None
-    finally:
-        os.chdir(original_cwd)
 
 def test_parameter_combination(mtx_file, block_rows, max_rows, output_base_name):
     """
