@@ -3,7 +3,7 @@ import numpy as np
 import os
 import json
 from collections import defaultdict
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, csc_matrix
 from pathlib import Path
 import polars as pl
 import pandas as pd
@@ -192,6 +192,12 @@ class ZData:
             var_dict = var_polars.to_dict(as_series=False)
             self._var_df = pd.DataFrame(var_dict)
             self._var_df.index = pd.RangeIndex(start=0, stop=len(self._var_df))
+            
+            # Build gene name to index mapping for fast lookups
+            if 'gene' in self._var_df.columns:
+                self._gene_to_idx = {gene: idx for idx, gene in enumerate(self._var_df['gene'])}
+            else:
+                self._gene_to_idx = {}
         except Exception as e:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
     
@@ -495,25 +501,52 @@ class ZData:
     
     def __getitem__(self, key):
         """
-        Support slicing syntax to return AnnData object.
+        Support slicing by rows (returns AnnData) or gene names (returns CSC matrix).
         
         Usage:
             sc_atlas[5:10]  # Returns AnnData object with rows 5-9
-            sc_atlas[0:100]  # Returns AnnData object with rows 0-99
+            sc_atlas[['GAPDH', 'PCNA', 'COL1A1']]  # Returns CSC matrix with expression for these genes
         
         Args:
-            key: Slice object (e.g., slice(5, 10))
+            key: Slice object (e.g., slice(5, 10)) or list of gene names
         
         Returns:
-            AnnData object containing:
-            - X: Sparse CSR matrix with expression data (from X_RM/row-major)
-            - obs: pandas DataFrame with cell metadata for selected rows
-            - var: pandas DataFrame with gene metadata (full var object)
+            - For slice: AnnData object with X (CSR), obs, and var
+            - For gene list: CSC matrix of shape (n_cells, n_genes) with expression values
         """
+        # Handle gene name list: return CSC matrix
+        if isinstance(key, list):
+            if len(key) == 0:
+                raise ValueError("Empty gene list provided")
+            if not isinstance(key[0], str):
+                raise TypeError(f"Gene list must contain strings, got {type(key[0])}")
+            
+            if not self._gene_to_idx:
+                raise ValueError("Gene name lookup not available. var.parquet missing 'gene' column.")
+            
+            # Look up gene indices
+            gene_indices = []
+            missing_genes = []
+            for gene_name in key:
+                if gene_name in self._gene_to_idx:
+                    gene_indices.append(self._gene_to_idx[gene_name])
+                else:
+                    missing_genes.append(gene_name)
+            
+            if missing_genes:
+                raise ValueError(f"Genes not found: {missing_genes}")
+            
+            # Read columns (genes) from X_CM and return as CSC matrix
+            # read_cols_cm_csr returns CSR with shape (n_genes, n_cells)
+            # We transpose to get CSC with shape (n_cells, n_genes)
+            csr_result = self.read_cols_cm_csr(gene_indices)
+            return csr_result.T.tocsc()  # Transpose CSR to CSC
+        
+        # Handle slice: return AnnData object
         if not isinstance(key, slice):
             raise TypeError(
-                f"ZData slicing only supports slice objects, got {type(key)}. "
-                f"Use syntax like sc_atlas[5:10]"
+                f"ZData indexing supports slice objects or list of gene names, got {type(key)}. "
+                f"Use syntax like sc_atlas[5:10] or sc_atlas[['GAPDH', 'PCNA']]"
             )
         
         start, stop, step = key.indices(self.nrows)
