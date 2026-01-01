@@ -80,24 +80,38 @@ for query_idx in range(num_queries):
     query_lengths.append(query_size)
     
     # Generate random row indices (original order)
+    # Note: The new indexing system deduplicates indices, so we need to ensure
+    # we track which rows are actually returned after deduplication
     original_rows = np.random.randint(0, n_rows, size=query_size)
     
     # Time the row query (retrieve all rows at once)
     # Includes sorting for better chunk access locality and reordering results
     start_query = time.perf_counter()
     
-    # Sort row indices for better chunk access locality (groups rows from same chunk together)
-    # Store the sort indices to restore original order later
-    sort_indices = np.argsort(original_rows)
-    sorted_rows = original_rows[sort_indices]
+    # The new indexing system normalizes indices (sorts and deduplicates)
+    # So we need to work with the actual normalized indices
+    from zdata.core.index import normalize_row_indices
+    normalized_rows = normalize_row_indices(original_rows, n_rows)
     
-    # Perform the query with sorted rows and get CSR matrix directly (from X_RM)
-    csr_sorted = reader.read_rows_rm_csr(sorted_rows.tolist())
+    # Perform the query with normalized rows and get CSR matrix directly (from X_RM)
+    csr_normalized = reader.read_rows_rm_csr(normalized_rows)
     
-    # Restore original query order using inverse permutation
-    # Reorder CSR matrix rows to match original query order
-    inverse_sort = np.argsort(sort_indices)
-    csr_data = csr_sorted[inverse_sort]
+    # Map original_rows to their positions in normalized_rows
+    # Create a mapping from original row index to position in normalized_rows
+    row_to_pos = {row: pos for pos, row in enumerate(normalized_rows)}
+    
+    # Build index array to reorder csr_normalized to match original_rows order
+    # For each original row, find its position in normalized_rows
+    reorder_indices = []
+    for orig_row in original_rows:
+        if orig_row in row_to_pos:
+            reorder_indices.append(row_to_pos[orig_row])
+        else:
+            # This shouldn't happen if normalization worked correctly
+            raise ValueError(f"Row {orig_row} not found in normalized_rows")
+    
+    # Reorder the CSR matrix to match original query order
+    csr_data = csr_normalized[reorder_indices]
     
     end_query = time.perf_counter()
     
@@ -226,19 +240,38 @@ else:
             
             col_query_lengths.append(len(gene_indices))
             
-            # Sort gene indices for better chunk access locality
-            sort_indices = np.argsort(gene_indices)
-            sorted_genes = [gene_indices[i] for i in sort_indices]
-            
             # Time the column query (read genes from X_CM)
             start_query = time.perf_counter()
             
-            # Read columns (genes) from X_CM using the new method
-            csr_sorted = reader.read_cols_cm_csr(sorted_genes)
+            # The new indexing system normalizes indices (sorts and deduplicates)
+            # So we need to work with the actual normalized indices
+            from zdata.core.index import normalize_column_indices
+            # Get gene names if available for proper normalization
+            gene_names = None
+            if hasattr(reader, '_var_df') and 'gene' in reader._var_df.columns:
+                import pandas as pd
+                gene_names = pd.Index(reader._var_df['gene'])
             
-            # Restore original order
-            inverse_sort = np.argsort(sort_indices)
-            csr_data = csr_sorted[inverse_sort]
+            normalized_genes = normalize_column_indices(gene_indices, n_cols, gene_names)
+            
+            # Read columns (genes) from X_CM using the normalized indices
+            csr_normalized = reader.read_cols_cm_csr(normalized_genes)
+            
+            # Map original gene_indices to their positions in normalized_genes
+            # Create a mapping from original gene index to position in normalized_genes
+            gene_to_pos = {gene: pos for pos, gene in enumerate(normalized_genes)}
+            
+            # Build index array to reorder csr_normalized to match original gene_indices order
+            reorder_indices = []
+            for orig_gene in gene_indices:
+                if orig_gene in gene_to_pos:
+                    reorder_indices.append(gene_to_pos[orig_gene])
+                else:
+                    # This shouldn't happen if normalization worked correctly
+                    raise ValueError(f"Gene index {orig_gene} not found in normalized_genes")
+            
+            # Reorder the CSR matrix to match original query order
+            csr_data = csr_normalized[reorder_indices]
             
             end_query = time.perf_counter()
             
