@@ -1,0 +1,21 @@
+{
+  "column-order": [
+    "soma_joinid",
+    "sample_idx",
+    "barcode",
+    "standard_true_celltype",
+    "authors_celltype",
+    "batch_name",
+    "cells_or_nuclei",
+    "sample_name",
+    "scrnaseq_protocol",
+    "study_name",
+    "tissue_collected",
+    "tissue_site",
+    "nnz",
+    "included_scref_train"
+  ],
+  "_index": "_index",
+  "encoding-type": "dataframe",
+  "encoding-version": "0.2.0"
+}

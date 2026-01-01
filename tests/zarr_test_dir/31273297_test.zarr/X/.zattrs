@@ -1,0 +1,8 @@
+{
+  "shape": [
+    256,
+    36601
+  ],
+  "encoding-type": "csr_matrix",
+  "encoding-version": "0.1.0"
+}

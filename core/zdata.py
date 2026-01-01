@@ -5,6 +5,9 @@ import json
 from collections import defaultdict
 from scipy.sparse import csr_matrix
 from pathlib import Path
+import polars as pl
+import pandas as pd
+import anndata as ad
 
 # Get the path to the zdata_read executable
 # This assumes the module structure: zdata/core/zdata.py and zdata/ctools/zdata_read
@@ -21,6 +24,83 @@ def _get_zdata_read_path():
             f"Please ensure it is built in the ctools directory."
         )
     return str(bin_path)
+
+def _normalize_indices(indices):
+    """Normalize indices to list of ints (handles int or list/array)."""
+    if isinstance(indices, (int, np.integer)):
+        return [int(indices)]
+    return [int(i) for i in indices]
+
+
+class ObsWrapper:
+    """
+    Wrapper for polars obs DataFrame that supports indexing like obs[row_index, :].
+    Returns pandas DataFrames for compatibility with anndata/AnnData.
+    
+    Usage:
+        sc_atlas.obs[5, :]  # Returns pandas DataFrame for row 5
+        sc_atlas.obs[0:10, :]  # Returns pandas DataFrame for rows 0-9
+    """
+    
+    def __init__(self, obs_df):
+        """
+        Initialize the wrapper with a polars DataFrame.
+        
+        Args:
+            obs_df: polars DataFrame containing obs/metadata
+        """
+        self.obs_df = obs_df
+    
+    def __getitem__(self, key):
+        """
+        Support indexing like obs[row_index, :] or obs[slice, :].
+        
+        Args:
+            key: Tuple of (row_index or slice, column_slice)
+                 Currently only supports [row_index, :] or [slice, :]
+        
+        Returns:
+            pandas DataFrame with selected rows
+        """
+        if not isinstance(key, tuple) or len(key) != 2 or key[1] != slice(None):
+            raise ValueError("Obs indexing must be in format [row_index, :] or [slice, :]")
+        
+        row_key = key[0]
+        
+        # Handle row indexing
+        if isinstance(row_key, int):
+            # Single row - get as polars DataFrame then convert to pandas
+            polars_result = self.obs_df.slice(row_key, 1)
+        elif isinstance(row_key, slice):
+            # Slice of rows - get as polars DataFrame then convert to pandas
+            polars_result = self.obs_df[row_key]
+        else:
+            raise ValueError(f"Row index must be int or slice, got {type(row_key)}")
+        
+        data_dict = polars_result.to_dict(as_series=False)
+        pandas_df = pd.DataFrame(data_dict)
+        
+        if "_row_index" in pandas_df.columns:
+            pandas_df = pandas_df.set_index("_row_index")
+            pandas_df.index = pandas_df.index.astype(int)
+        else:
+            pandas_df.index = pd.RangeIndex(start=0, stop=len(pandas_df))
+        
+        return pandas_df
+    
+    def __len__(self):
+        return len(self.obs_df)
+    
+    @property
+    def shape(self):
+        return self.obs_df.shape
+    
+    @property
+    def columns(self):
+        return self.obs_df.columns
+    
+    def __repr__(self):
+        return f"ObsWrapper({self.obs_df.shape[0]} rows, {self.obs_df.shape[1]} columns)"
 
 class ZData:
     """
@@ -89,6 +169,42 @@ class ZData:
             self.chunk_files[chunk_num] = file_path
             self.chunk_info[chunk_num] = chunk_info
             self.file_to_chunk[file_path] = chunk_num
+        
+        obs_file = os.path.join(self.dir_path, "obs.parquet")
+        if not os.path.exists(obs_file):
+            raise FileNotFoundError(
+                f"obs.parquet not found: {obs_file}. "
+                f"Please rebuild the zdata directory using build_zdata()"
+            )
+        var_file = os.path.join(self.dir_path, "var.parquet")
+        if not os.path.exists(var_file):
+            raise FileNotFoundError(
+                f"var.parquet not found: {var_file}. "
+                f"Please rebuild the zdata directory using build_zdata()"
+            )
+        
+        try:
+            self._obs_df = pl.read_parquet(obs_file)
+            self._obs_wrapper = ObsWrapper(self._obs_df)
+            
+            # Cache var DataFrame for __getitem__ access
+            var_polars = pl.read_parquet(var_file)
+            var_dict = var_polars.to_dict(as_series=False)
+            self._var_df = pd.DataFrame(var_dict)
+            self._var_df.index = pd.RangeIndex(start=0, stop=len(self._var_df))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load parquet files: {e}") from e
+    
+    @property
+    def obs(self):
+        """
+        Access obs/metadata DataFrame.
+        
+        Returns:
+            ObsWrapper that supports indexing like obs[row_index, :]
+        
+        """
+        return self._obs_wrapper
     
     
     def _read_rows_from_file(self, file_path, local_rows):
@@ -147,10 +263,7 @@ class ZData:
             List of (global_row_id, cols, vals) tuples in the same order as global_rows
             where cols and vals are numpy arrays
         """
-        if isinstance(global_rows, (int, np.integer)):
-            global_rows = [int(global_rows)]
-        else:
-            global_rows = [int(r) for r in global_rows]
+        global_rows = _normalize_indices(global_rows)
         
         # Group global rows by which chunk file they belong to
         rows_by_file = defaultdict(list)
@@ -162,24 +275,11 @@ class ZData:
             if global_row >= self.nrows:
                 raise IndexError(f"Row {global_row} is beyond available data (max row: {self.nrows - 1})")
             
-            # Calculate chunk number: each chunk contains max_rows_per_chunk rows
-            # This matches how chunks are numbered in build_zdata.py
             chunk_num = global_row // self.max_rows_per_chunk
             local_row = global_row % self.max_rows_per_chunk
             
             if chunk_num not in self.chunk_files:
                 raise IndexError(f"Row {global_row} is beyond available data (chunk {chunk_num} not found)")
-            
-            # Validate that the row is within this chunk's valid range (defensive check)
-            chunk_info = self.chunk_info[chunk_num]
-            chunk_start = chunk_info['start_row']
-            chunk_end = chunk_info['end_row']
-            
-            if global_row < chunk_start or global_row >= chunk_end:
-                raise IndexError(
-                    f"Row {global_row} is out of range for chunk {chunk_num} "
-                    f"(valid range: {chunk_start} to {chunk_end - 1})"
-                )
             
             rows_by_file[self.chunk_files[chunk_num]].append((local_row, idx, global_row))
         
@@ -187,45 +287,18 @@ class ZData:
         all_results = [None] * len(global_rows)
         
         for file_path, row_info_list in rows_by_file.items():
-            # Find which chunk this file belongs to (O(1) lookup using reverse mapping)
-            chunk_num = self.file_to_chunk.get(file_path)
-            if chunk_num is None:
-                raise ValueError(f"Could not find chunk info for file: {file_path}")
-            chunk_info = self.chunk_info[chunk_num]
+            chunk_num = self.file_to_chunk[file_path]  # Guaranteed to exist
             
-            # Validate local rows are within chunk bounds
-            chunk_start = chunk_info['start_row']
-            chunk_end = chunk_info['end_row']
-            max_local_row = chunk_end - chunk_start - 1
-            
-            for local_row, orig_idx, global_row in row_info_list:
-                if local_row > max_local_row:
-                    raise IndexError(
-                        f"Local row {local_row} exceeds chunk {chunk_num} bounds "
-                        f"(max local row: {max_local_row}, global row: {global_row})"
-                    )
-            
-            # Sort by local_row to ensure ordered input to C tool (for better chunk locality)
-            row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])  # Sort by local_row
-            
-            # Extract local rows in sorted order for C tool
+            row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
             local_rows = [info[0] for info in row_info_list_sorted]
             
-            # Read from this file (C tool returns rows in the order requested)
             file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
-            
-            if self.ncols is None:
-                self.ncols = file_ncols
-            elif self.ncols != file_ncols:
+            if self.ncols != file_ncols:
                 raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
             
-            # Map results back to original order using stored indices
-            # file_results are in the same order as local_rows (sorted)
-            # row_info_list_sorted is sorted, so we can zip them directly
             for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
                 if returned_local_row != local_row:
                     raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                # Store in original position (orig_idx) to maintain input order
                 all_results[orig_idx] = (global_row, cols, vals)
         
         return all_results
@@ -270,8 +343,7 @@ class ZData:
     
     def _build_cm_chunk_mapping(self):
         """
-        Build chunk mapping for X_CM (column-major) files.
-        Uses metadata if available, otherwise falls back to scanning directory.
+        Build chunk mapping for X_CM (column-major) files from metadata.
         
         Returns:
             (cm_chunk_files, cm_chunk_info, cm_file_to_chunk) tuple
@@ -280,66 +352,35 @@ class ZData:
         if not os.path.exists(xcm_dir):
             raise FileNotFoundError(f"X_CM directory not found: {xcm_dir}")
         
+        if 'chunks_cm' not in self.metadata:
+            raise ValueError("Metadata missing 'chunks_cm' field (required for column-major access)")
+        
         cm_chunk_files = {}
         cm_chunk_info = {}
         cm_file_to_chunk = {}
         
-        # Try to use metadata chunks_cm if available
-        if 'chunks_cm' in self.metadata:
-            chunks_list = self.metadata['chunks_cm']
-            # Group chunks by file (multiple MTX files may map to same chunk file)
-            chunks_by_file = {}
-            for chunk_info in chunks_list:
-                file_name = chunk_info['file']
-                if file_name not in chunks_by_file:
-                    chunks_by_file[file_name] = []
-                chunks_by_file[file_name].append(chunk_info)
-            
-            # Build mapping: use chunk_num from first entry for each file
-            # With max_rows=256 for column-major files, each file maps to its own chunk
-            # so we can use the full range covering all entries
-            for file_name, file_chunks in chunks_by_file.items():
-                # Use the chunk_num from the first entry for this file
-                chunk_num = file_chunks[0]['chunk_num']
-                file_path = os.path.join(self.dir_path, "X_CM", file_name)
-                cm_chunk_files[chunk_num] = file_path
-                # Use the overall range covering all entries
-                cm_chunk_info[chunk_num] = {
-                    'chunk_num': chunk_num,
-                    'file': file_name,
-                    'start_row': min(c['start_row'] for c in file_chunks),
-                    'end_row': max(c['end_row'] for c in file_chunks)
-                }
-                cm_file_to_chunk[file_path] = chunk_num
-        else:
-            # Fallback: scan directory and sort numerically
-            xcm_path = Path(xcm_dir)
-            cm_bin_files = list(xcm_path.glob("*.bin"))
-            
-            if not cm_bin_files:
-                raise FileNotFoundError(f"No .bin files found in X_CM directory: {xcm_dir}")
-            
-            # Sort numerically by chunk number (extract from filename)
-            def extract_chunk_num(bin_file):
-                try:
-                    return int(bin_file.stem)  # Filename without extension
-                except ValueError:
-                    return 0
-            
-            cm_bin_files = sorted(cm_bin_files, key=extract_chunk_num)
-            
-            # Build chunk mapping for X_CM files
-            for bin_file in cm_bin_files:
-                chunk_num = extract_chunk_num(bin_file)
-                file_path = str(bin_file)
-                cm_chunk_files[chunk_num] = file_path
-                cm_chunk_info[chunk_num] = {
-                    'chunk_num': chunk_num,
-                    'file': bin_file.name,
-                    'start_row': chunk_num * self.max_rows_per_chunk,
-                    'end_row': (chunk_num + 1) * self.max_rows_per_chunk
-                }
-                cm_file_to_chunk[file_path] = chunk_num
+        chunks_list = self.metadata['chunks_cm']
+        # Group chunks by file (multiple MTX files may map to same chunk file)
+        chunks_by_file = {}
+        for chunk_info in chunks_list:
+            file_name = chunk_info['file']
+            if file_name not in chunks_by_file:
+                chunks_by_file[file_name] = []
+            chunks_by_file[file_name].append(chunk_info)
+        
+        # Build mapping: use chunk_num from first entry for each file
+        # With max_rows=256 for column-major files, each file maps to its own chunk
+        for file_name, file_chunks in chunks_by_file.items():
+            chunk_num = file_chunks[0]['chunk_num']
+            file_path = os.path.join(self.dir_path, "X_CM", file_name)
+            cm_chunk_files[chunk_num] = file_path
+            cm_chunk_info[chunk_num] = {
+                'chunk_num': chunk_num,
+                'file': file_name,
+                'start_row': min(c['start_row'] for c in file_chunks),
+                'end_row': max(c['end_row'] for c in file_chunks)
+            }
+            cm_file_to_chunk[file_path] = chunk_num
         
         return cm_chunk_files, cm_chunk_info, cm_file_to_chunk
     
@@ -354,10 +395,7 @@ class ZData:
         Returns:
             List of (global_col_id, rows, vals) tuples where rows are cell indices
         """
-        if isinstance(global_cols, (int, np.integer)):
-            global_cols = [int(global_cols)]
-        else:
-            global_cols = [int(c) for c in global_cols]
+        global_cols = _normalize_indices(global_cols)
         
         # Build X_CM chunk mapping
         cm_chunk_files, cm_chunk_info, cm_file_to_chunk = self._build_cm_chunk_mapping()
@@ -400,142 +438,114 @@ class ZData:
         all_results = [None] * len(global_cols)
         
         for file_path, col_info_list in cols_by_file.items():
-            # Find which chunk this file belongs to
-            chunk_num = cm_file_to_chunk.get(file_path)
-            if chunk_num is None:
-                raise ValueError(f"Could not find chunk info for file: {file_path}")
-            chunk_info = cm_chunk_info[chunk_num]
+            chunk_num = cm_file_to_chunk[file_path]  # Guaranteed to exist
             
-            # Validate local rows are within chunk bounds
-            chunk_start = chunk_info['start_row']
-            chunk_end = chunk_info['end_row']
-            max_local_row = chunk_end - chunk_start - 1
-            
-            for local_row, orig_idx, global_col in col_info_list:
-                if local_row > max_local_row:
-                    raise IndexError(
-                        f"Local row {local_row} exceeds chunk {chunk_num} bounds "
-                        f"(max local row: {max_local_row}, global column: {global_col})"
-                    )
-            
-            # Sort by local_row for better chunk access locality
-            col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])  # Sort by local_row
-            
-            # Extract local rows in sorted order for C tool
+            col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
             local_rows = [info[0] for info in col_info_list_sorted]
             
-            # Read from this file (C tool returns rows in the order requested)
-            # In X_CM, ncols = nrows (original), so we get cells as columns
             file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
             
-            # Map results back to original order
             for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
                 if returned_local_row != local_row:
                     raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                # Store in original position (orig_idx) to maintain input order
-                # rows are cell indices, vals are values
                 all_results[orig_idx] = (global_col, rows, vals)
         
         return all_results
     
     def read_cols_cm_csr(self, global_cols):
-        """
-        Read columns (genes) from X_CM (column-major) files and return as CSR matrix.
-        The returned matrix has shape (len(global_cols), nrows) where each row is a gene
-        and each column is a cell.
-        
-        Args:
-            global_cols: List or array of global column (gene) indices (0-based)
-        
-        Returns:
-            scipy.sparse.csr_matrix of shape (len(global_cols), nrows)
-        """
+        """Read columns (genes) from X_CM files and return as CSR matrix."""
         cols_data = self.read_cols_cm(global_cols)
         
-        # Convert to CSR matrix
-        # In the result, rows = genes, columns = cells
-        ngenes = len(cols_data)
-        
-        row_indices = []
-        col_indices = []
-        values = []
-        
+        row_indices, col_indices, values = [], [], []
         for csr_row_idx, (col_id, rows, vals) in enumerate(cols_data):
             for row, val in zip(rows, vals):
                 row_indices.append(csr_row_idx)
                 col_indices.append(int(row))
                 values.append(float(val))
         
-        # Create CSR matrix: shape is (ngenes, nrows) where nrows is number of cells
-        csr = csr_matrix((values, (row_indices, col_indices)), shape=(ngenes, self.nrows))
-        
-        return csr
+        return csr_matrix((values, (row_indices, col_indices)), shape=(len(cols_data), self.nrows))
     
     def _rows_to_csr(self, rows_data):
-        """
-        Convert rows data into a scipy.sparse.csr_matrix.
-        
-        Args:
-            rows_data: List of (row_id, cols, vals) tuples
-        
-        Returns:
-            scipy.sparse.csr_matrix
-        """
-        nrows = len(rows_data)
-        
-        # Build arrays for CSR construction
-        row_indices = []
-        col_indices = []
-        values = []
-        
+        """Convert rows data into a scipy.sparse.csr_matrix."""
+        row_indices, col_indices, values = [], [], []
         for csr_row_idx, (row_id, cols, vals) in enumerate(rows_data):
             for col, val in zip(cols, vals):
                 row_indices.append(csr_row_idx)
                 col_indices.append(int(col))
-                values.append(float(val))  # Convert uint16 to float for CSR matrix
-        
-        # Create CSR matrix
-        csr = csr_matrix((values, (row_indices, col_indices)), shape=(nrows, self.ncols))
-        
-        return csr
+                values.append(float(val))
+        return csr_matrix((values, (row_indices, col_indices)), shape=(len(rows_data), self.ncols))
     
     @property
     def num_columns(self):
-        """Get the number of columns in the matrix."""
         return self.ncols
     
     @property
     def num_rows(self):
-        """Get the actual number of rows in the dataset."""
         return self.nrows
     
     @property
     def shape(self):
-        """Get the shape of the matrix as (nrows, ncols)."""
         return (self.nrows, self.ncols)
     
     def get_random_rows(self, n, seed=None):
-        """
-        Get n random row indices that are valid for this dataset.
-        
-        Args:
-            n: Number of random rows to generate
-            seed: Optional random seed for reproducibility
-        
-        Returns:
-            List of random global row indices
-        """
+        """Get n random row indices that are valid for this dataset."""
         if seed is not None:
             np.random.seed(seed)
+        return np.random.randint(0, self.nrows, size=n).tolist()
+    
+    def __getitem__(self, key):
+        """
+        Support slicing syntax to return AnnData object.
         
-        # Generate random rows using metadata
-        random_rows = np.random.randint(0, self.nrows, size=n).tolist()
-        return random_rows
-
-# Example usage (commented out - see test script for actual usage)
-if __name__ == "__main__":
-    # Example: Basic usage
-    # reader = ZData("andrews")
-    # rows = reader.read_rows([300, 5096, 9000])
-    # csr = reader.read_rows_csr([300, 5096, 9000])
-    pass
+        Usage:
+            sc_atlas[5:10]  # Returns AnnData object with rows 5-9
+            sc_atlas[0:100]  # Returns AnnData object with rows 0-99
+        
+        Args:
+            key: Slice object (e.g., slice(5, 10))
+        
+        Returns:
+            AnnData object containing:
+            - X: Sparse CSR matrix with expression data (from X_RM/row-major)
+            - obs: pandas DataFrame with cell metadata for selected rows
+            - var: pandas DataFrame with gene metadata (full var object)
+        """
+        if not isinstance(key, slice):
+            raise TypeError(
+                f"ZData slicing only supports slice objects, got {type(key)}. "
+                f"Use syntax like sc_atlas[5:10]"
+            )
+        
+        start, stop, step = key.indices(self.nrows)
+        if step != 1:
+            raise ValueError(f"Step slicing not yet supported. Use step=1")
+        
+        row_indices = list(range(start, stop))
+        if not row_indices:
+            raise ValueError(f"Empty slice: no rows selected")
+        
+        X_csr = self.read_rows_csr(row_indices)
+        
+        obs_slice = self.obs[start:stop, :]
+        obs_df = obs_slice.copy()
+        obs_df.index = pd.RangeIndex(start=0, stop=len(obs_df))
+        
+        var_df = self._var_df.copy()
+        
+        import warnings
+        with warnings.catch_warnings():
+            # Suppress ImplicitModificationWarning from anndata during AnnData construction
+            # We've ensured explicit integer indices, but AnnData still triggers this warning internally
+            try:
+                from anndata._warnings import ImplicitModificationWarning as AnnDataWarning
+                warnings.filterwarnings("ignore", category=AnnDataWarning)
+            except ImportError:
+                warnings.filterwarnings("ignore", message=".*Transforming to str index.*")
+            
+            adata = ad.AnnData(
+                X=X_csr,
+                obs=obs_df,
+                var=var_df
+            )
+        
+        return adata
