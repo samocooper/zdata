@@ -178,11 +178,13 @@ def build_zdata_directory(zarr_dir, output_name, output_dir):
         
         # Use build_zdata_from_zarr to build complete zdata object
         # Pass the full directory name (e.g., "atlas.zdata")
+        # Note: block_rows and max_rows match zdata.settings defaults
+        # but are explicitly set here for reproducibility
         zdata_dir = build_zdata_from_zarr(
             zarr_dir,
             output_name_only,
-            block_rows=16,
-            max_rows=8192,
+            block_rows=16,  # Matches zdata.settings.block_rows default
+            max_rows=8192,  # Matches zdata.settings.max_rows_per_chunk default
             obs_join_strategy="outer"
         )
         
