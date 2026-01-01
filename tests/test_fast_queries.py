@@ -154,9 +154,6 @@ def format_size(size_bytes):
 # zdata_dir might be a full path or relative path
 if os.path.isdir(zdata_dir):
     disk_size = get_dir_size(zdata_dir)
-elif os.path.isdir(zdata_dir + '.zdata'):
-    # Try with .zdata suffix (backward compatibility)
-    disk_size = get_dir_size(zdata_dir + '.zdata')
 else:
     disk_size = 0
 

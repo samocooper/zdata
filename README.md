@@ -107,6 +107,11 @@ zdata/
 ├── core/              # Python core module
 │   ├── zdata.py      # ZData class implementation
 │   └── __init__.py
+├── build/             # Build and preprocessing utilities
+│   ├── build_x.py     # Build zdata from MTX files
+│   ├── align_mtx.py   # Align zarr files to standard gene list
+│   ├── check_directory.py  # Check zarr directory structure
+│   └── concat_obs.py  # Concatenate obs/metadata from zarr files
 ├── ctools/            # C command-line tools
 │   ├── mtx_to_zdata.c    # MTX to zdata converter
 │   ├── zdata_read.c      # Row reader

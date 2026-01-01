@@ -17,7 +17,7 @@ _project_root = _test_dir.parent  # This is /home/ubuntu/zdata_work/zdata
 _parent_dir = _project_root.parent  # This is /home/ubuntu/zdata_work
 sys.path.insert(0, str(_parent_dir))
 
-from zdata.core.build_zdata import build_zdata
+from zdata.build.build_x import build_zdata
 import shutil
 
 # Configuration

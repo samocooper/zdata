@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Align columns (genes) in zarr files to a standard gene list and output as MTX format.
-Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each).
+Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each by default).
 Outputs multiple MTX files named by row range (e.g., rows_0_131071.mtx) and a manifest file.
 These files can be converted to zdata format using mtx_to_zdata.
 """
@@ -27,12 +27,15 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
     Only keeps CSR matrix in memory, frees zarr resources immediately.
     
     Returns:
-        csr_matrix: Aligned CSR matrix, or None if error
+        csr_matrix: Aligned CSR matrix
         n_rows: Number of rows processed
+    
+    Raises:
+        RuntimeError: If processing fails
     """
+    zarr_group = zarr.open(zarr_path, mode='r')
+    
     try:
-        zarr_group = zarr.open(zarr_path, mode='r')
-        
         # Get dimensions
         n_cols = zarr_group["var"]["gene"].shape[0]
         n_rows = zarr_group["obs"]["barcode"].shape[0]
@@ -87,27 +90,26 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
         X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
                                        shape=(n_rows, n_new_cols)).tocsr()
         
-        # Close zarr file to free memory
-        del zarr_group
+        # Free memory
         del X_csr
         del X_csc
         
         return X_chunk_reordered, n_rows
         
     except Exception as e:
-        print(f"  ERROR processing {zarr_path}: {e}")
-        return None, 0
+        raise RuntimeError(f"Failed to process zarr file {zarr_path}: {e}") from e
 
-def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=None):
+def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=None, chunk_size=131072):
     """
     Process a directory of zarr files, align columns to standard gene list, and write as MTX files.
-    Concatenates multiple zarr files into single MTX files (max 131072 rows each).
+    Concatenates multiple zarr files into single MTX files (max chunk_size rows each).
     
     Args:
         zarr_dir: Directory containing .zarr files to process
         gene_list_path: Path to file containing standard gene list (one per line)
         output_dir: Directory where output MTX files will be written
         tmp_dir: Optional temporary directory for intermediate files
+        chunk_size: Maximum number of rows per MTX file (default: 131072)
     
     Returns:
         Path to manifest file
@@ -131,23 +133,8 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     
     print(f"Found {len(zarr_files)} zarr file(s) to process")
     
-    # Build gene mapping from first zarr file (all should have same genes)
-    print(f"\nReading gene mapping from first zarr file: {zarr_files[0].name}")
-    first_zarr = zarr.open(str(zarr_files[0]), mode='r')
-    gene_array = first_zarr['var']['gene']
-    gene_values = gene_array[:].tolist()
-    del first_zarr
-    
-    # Create mapping: old_col_idx -> new_col_idx
-    gene_to_old_idx = {gene: idx for idx, gene in enumerate(gene_values)}
-    old_to_new_idx = {}
-    matched_genes = 0
-    for new_idx, gene in enumerate(gene_list):
-        if gene in gene_to_old_idx:
-            old_to_new_idx[gene_to_old_idx[gene]] = new_idx
-            matched_genes += 1
-    
-    print(f"Matched {matched_genes} genes from standard list to zarr files")
+    # Note: We'll build gene mapping per zarr file since gene orders may differ between files
+    # This ensures correct alignment even if zarr files have different gene orders
     
     # Ensure output directory exists
     if not os.path.exists(output_dir):
@@ -161,7 +148,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         print(f"Created MTX output directory: {mtx_output_dir}")
     
     # Process zarr files and accumulate rows
-    chunk_size = 131072
     print(f"\nProcessing zarr files and creating MTX files (max {chunk_size} rows per file)")
     
     output_files = []
@@ -175,12 +161,29 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     for zarr_idx, zarr_path in enumerate(zarr_files):
         print(f"\n[{zarr_idx + 1}/{len(zarr_files)}] Processing: {zarr_path.name}")
         
-        # Process this zarr file
+        # Build gene mapping for THIS zarr file (gene order may differ between files)
+        # This ensures correct alignment even if zarr files have different gene orders
+        zarr_group = zarr.open(str(zarr_path), mode='r')
+        if 'var' not in zarr_group or 'gene' not in zarr_group['var']:
+            raise ValueError(f"Zarr file {zarr_path.name} is missing required 'var/gene' array. All zarr files must have this structure.")
+        
+        zarr_genes = zarr_group['var']['gene'][:].tolist()
+        # zarr Group objects don't need explicit closing - they're automatically managed
+        
+        # Create mapping: old_col_idx -> new_col_idx for THIS zarr file
+        # Map each gene name to its position in the aligned gene list
+        gene_to_old_idx = {gene: idx for idx, gene in enumerate(zarr_genes)}
+        old_to_new_idx = {}
+        for new_idx, gene in enumerate(gene_list):
+            if gene in gene_to_old_idx:
+                old_col_idx = gene_to_old_idx[gene]
+                old_to_new_idx[old_col_idx] = new_idx
+        
+        # Process this zarr file with its specific mapping
         X_aligned, n_rows = process_zarr_file(str(zarr_path), gene_list_path, old_to_new_idx, n_new_cols)
         
         if X_aligned is None:
-            print(f"  Skipping {zarr_path.name} due to error")
-            continue
+            raise RuntimeError(f"Failed to process zarr file {zarr_path.name}. This file must be processed successfully - skipping is not allowed.")
         
         print(f"  Processed {n_rows} rows from {zarr_path.name}")
         
@@ -306,7 +309,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     manifest = {
         'gene_list_file': str(gene_list_path),
         'n_genes': n_new_cols,
-        'matched_genes': matched_genes,
         'zarr_files_processed': [str(f) for f in zarr_files],
         'zarr_files_order': [f.name for f in zarr_files],
         'mtx_files': manifest_data,
@@ -471,7 +473,7 @@ def main():
     """Main function with command-line interface."""
     parser = argparse.ArgumentParser(
         description='Align zarr file(s) columns to standard gene list and output as MTX format. '
-                    'Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each).'
+                    'Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each by default).'
     )
     parser.add_argument(
         'zarr_input',
@@ -494,6 +496,12 @@ def main():
         type=str,
         default=None,
         help='Optional temporary directory for intermediate files'
+    )
+    parser.add_argument(
+        '--chunk-size',
+        type=int,
+        default=131072,
+        help='Maximum number of rows per MTX file (default: 131072)'
     )
     
     args = parser.parse_args()
@@ -519,7 +527,8 @@ def main():
                 str(zarr_input_path),
                 gene_list_path,
                 args.output_dir,
-                args.tmp_dir
+                args.tmp_dir,
+                args.chunk_size
             )
         elif str(zarr_input_path).endswith('.zarr'):
             # Single zarr file - treat parent directory as input (will only find this one file)
@@ -528,7 +537,8 @@ def main():
                 str(zarr_dir),
                 gene_list_path,
                 args.output_dir,
-                args.tmp_dir
+                args.tmp_dir,
+                args.chunk_size
             )
         else:
             print(f"ERROR: Input must be a directory containing .zarr files or a .zarr file/directory")

@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 # Get the path to the mtx_to_zdata executable
-_MODULE_DIR = Path(__file__).parent  # zdata/core/
+_MODULE_DIR = Path(__file__).parent  # zdata/build/
 _PROJECT_ROOT = _MODULE_DIR.parent   # zdata/
 _MTX_TO_ZDATA = _PROJECT_ROOT / "ctools" / "mtx_to_zdata"
 
@@ -189,25 +189,23 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
             cmd.append("0")  # Pass 0 for row_offset if not provided
         cmd.append(subdir)
     
-    # Use Popen to stream output in real-time
+    # Use Popen to capture output (suppress verbose C tool output)
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,  # Merge stderr into stdout
         text=True,
-        bufsize=1,  # Line buffered
         universal_newlines=True
     )
     
-    # Collect output lines while streaming
+    # Collect output lines (don't print - suppress verbose output)
     stdout_lines = []
-    for line in process.stdout:
-        print(line, end='', flush=True)  # Print immediately
-        stdout_lines.append(line)
+    stdout_text, _ = process.communicate()
+    if stdout_text:
+        stdout_lines = stdout_text.split('\n')
     
     # Wait for process to complete
-    returncode = process.wait()
-    stdout_text = ''.join(stdout_lines)
+    returncode = process.returncode
     
     if returncode != 0:
         raise RuntimeError(
@@ -308,8 +306,9 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"✓ Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
-    print(f"✓ Metadata written to {metadata_file}")
+    # Suppress verbose output - only print if there's an issue
+    # print(f"✓ Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
+    # print(f"✓ Metadata written to {metadata_file}")
     
     return zdata_dir
 
@@ -339,11 +338,14 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
     # Determine if we're processing X_CM (column-major) files
     is_cm = (subdir == "X_CM")
     
-    print(f"\nProcessing {len(mtx_files)} MTX files into single zdata object...")
-    print("=" * 70)
+    # Reduced verbosity - only show progress for every 10 files or at milestones
+    if len(mtx_files) > 1:
+        print(f"Processing {len(mtx_files)} MTX files...", end='', flush=True)
     
     for mtx_idx, mtx_file in enumerate(mtx_files):
-        print(f"\nProcessing file {mtx_idx + 1}/{len(mtx_files)}: {mtx_file.name}")
+        # Only print progress every 10 files or at start/end
+        if len(mtx_files) > 1 and (mtx_idx == 0 or (mtx_idx + 1) % 10 == 0 or mtx_idx == len(mtx_files) - 1):
+            print(f" {mtx_idx + 1}/{len(mtx_files)}", end='', flush=True)
         
         # Read dimensions from this MTX file
         with open(mtx_file, 'r') as f:
@@ -460,9 +462,10 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             total_rows += file_rows
             total_nnz += file_nnz
             
-            print(f"  ✓ Processed {file_rows} rows, {file_nnz} nnz")
-            if chunk_nums_created:
-                print(f"  ✓ Copied {num_chunks_copied} chunks (chunks {min(chunk_nums_created)}-{max(chunk_nums_created)})")
+            # Suppress per-file verbose output
+            # print(f"  ✓ Processed {file_rows} rows, {file_nnz} nnz")
+            # if chunk_nums_created:
+            #     print(f"  ✓ Copied {num_chunks_copied} chunks (chunks {min(chunk_nums_created)}-{max(chunk_nums_created)})")
     
     # Sort chunks by chunk_num to ensure metadata is in order
     all_chunk_metadata.sort(key=lambda c: c['chunk_num'])
@@ -490,14 +493,13 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
         metadata_file = zdata_dir / "metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
-        print(f"✓ Metadata written to {metadata_file}")
+        # Suppress verbose output
+        # print(f"✓ Metadata written to {metadata_file}")
     
-    print("\n" + "=" * 70)
-    print(f"✓ Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
-    if is_cm:
-        print(f"✓ Total: {total_rows} genes (rows in X_CM), {ncols} cells (cols in X_CM), {total_nnz} nnz")
-    else:
-        print(f"✓ Total: {total_rows} rows, {ncols} cols, {total_nnz} nnz")
+    # Reduced verbosity - single summary line
+    if len(mtx_files) > 1:
+        print()  # Newline after progress indicator
+    print(f"✓ {num_chunks} chunks, {total_rows} rows, {ncols} cols")
     
     if return_metadata:
         return zdata_dir, metadata
