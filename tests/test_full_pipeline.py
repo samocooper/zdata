@@ -705,7 +705,47 @@ def run_tests(zdata_path, zarr_dir=None):
                 print(f"  ✗ Column read failed: {e}")
                 all_passed = False
         
-        # Test 6: Check metadata file
+        # Test 6: Gene name list query (returns CSC matrix)
+        if has_xcm:
+            print(f"  Testing gene name list query...")
+            try:
+                # Test with genes that should exist (from our test genes)
+                test_genes = ['GAPDH', 'TUBB', 'ACTA1', 'PCNA', 'CCND1', 'TP53']
+                # Filter to only genes that exist in var
+                available_genes = []
+                if hasattr(reader, '_var_df') and 'gene' in reader._var_df.columns:
+                    var_genes = set(reader._var_df['gene'].tolist())
+                    available_genes = [g for g in test_genes if g in var_genes]
+                
+                if available_genes:
+                    # Query by gene names
+                    csc_result = reader[available_genes]
+                    
+                    # Verify it's a CSC matrix
+                    from scipy.sparse import csc_matrix
+                    if not isinstance(csc_result, csc_matrix):
+                        print(f"  ✗ Expected CSC matrix, got {type(csc_result)}")
+                        all_passed = False
+                    else:
+                        # Verify shape: (n_cells, n_genes)
+                        expected_shape = (reader.num_rows, len(available_genes))
+                        if csc_result.shape == expected_shape:
+                            print(f"  ✓ Gene name query successful")
+                            print(f"    CSC matrix shape: {csc_result.shape} (expected {expected_shape})")
+                            print(f"    Non-zero values: {csc_result.nnz}")
+                            print(f"    Genes queried: {available_genes}")
+                        else:
+                            print(f"  ✗ CSC shape mismatch: got {csc_result.shape}, expected {expected_shape}")
+                            all_passed = False
+                else:
+                    print(f"  ⚠ Skipping gene name test: test genes not found in var.parquet")
+            except Exception as e:
+                print(f"  ✗ Gene name query failed: {e}")
+                import traceback
+                traceback.print_exc()
+                all_passed = False
+        
+        # Test 7: Check metadata file
         metadata_file = Path(zdata_path) / "metadata.json"
         if metadata_file.exists():
             print(f"  ✓ Metadata file exists")
@@ -713,14 +753,14 @@ def run_tests(zdata_path, zarr_dir=None):
             print(f"  ✗ Metadata file missing")
             all_passed = False
         
-        # Test 7: Check obs file (if it should exist)
+        # Test 8: Check obs file (if it should exist)
         obs_file = Path(zdata_path) / "obs.parquet"
         if obs_file.exists():
             print(f"  ✓ Obs/metadata parquet file exists")
         else:
             print(f"  ⚠ Obs/metadata parquet file not found (optional)")
         
-        # Test 8: Data integrity spot checks
+        # Test 9: Data integrity spot checks
         if zarr_dir and has_xrm:
             print(f"\n--- Testing data integrity (spot checks) ---")
             # Get gene list path (try to find it)
