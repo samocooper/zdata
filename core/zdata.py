@@ -57,34 +57,30 @@ class ZData:
         with open(metadata_file, 'r') as f:
             self.metadata = json.load(f)
         
-        # Extract metadata
+        # Extract metadata (new format only)
         self.nrows = self.metadata['shape'][0]
         self.ncols = self.metadata['shape'][1]
         self.nnz_total = self.metadata.get('nnz_total', None)
-        self.num_chunks = self.metadata['num_chunks']
-        self.total_blocks = self.metadata.get('total_blocks', None)
+        # Use RM chunks for row-major operations (required)
+        if 'num_chunks_rm' not in self.metadata:
+            raise ValueError("Metadata missing 'num_chunks_rm' field (new format required)")
+        self.num_chunks = self.metadata['num_chunks_rm']
+        self.total_blocks = self.metadata.get('total_blocks_rm', None)
         
-        # Extract block configuration from metadata (with defaults for backward compatibility)
+        # Extract block configuration from metadata
         self.block_rows = self.metadata.get('block_rows', 16)
         self.max_rows_per_chunk = self.metadata.get('max_rows_per_chunk', 8192)
         
-        # Build chunk_files dict and chunk info from metadata
-        # Support both old format (chunks) and new format (chunks_rm, chunks_cm)
+        # Build chunk_files dict and chunk info from metadata (new format only)
         self.chunk_files = {}
         self.chunk_info = {}  # Store chunk metadata for validation
         self.file_to_chunk = {}  # Reverse mapping: file_path -> chunk_num (for O(1) lookup)
         
-        # Check for new format with separate RM and CM chunks
-        if 'chunks_rm' in self.metadata:
-            # New format: separate chunks for X_RM
-            chunks_list = self.metadata['chunks_rm']
-            subdir = "X_RM"
-        elif 'chunks' in self.metadata:
-            # Old format: single chunks list (assume X_RM)
-            chunks_list = self.metadata['chunks']
-            subdir = "X_RM"
-        else:
-            raise ValueError("Metadata missing 'chunks' or 'chunks_rm' field")
+        # Use new format with separate RM and CM chunks (required)
+        if 'chunks_rm' not in self.metadata:
+            raise ValueError("Metadata missing 'chunks_rm' field (new format required)")
+        chunks_list = self.metadata['chunks_rm']
+        subdir = "X_RM"
         
         for chunk_info in chunks_list:
             chunk_num = chunk_info['chunk_num']
@@ -275,6 +271,7 @@ class ZData:
     def _build_cm_chunk_mapping(self):
         """
         Build chunk mapping for X_CM (column-major) files.
+        Uses metadata if available, otherwise falls back to scanning directory.
         
         Returns:
             (cm_chunk_files, cm_chunk_info, cm_file_to_chunk) tuple
@@ -283,28 +280,66 @@ class ZData:
         if not os.path.exists(xcm_dir):
             raise FileNotFoundError(f"X_CM directory not found: {xcm_dir}")
         
-        xcm_path = Path(xcm_dir)
-        cm_bin_files = sorted(xcm_path.glob("*.bin"))
-        
-        if not cm_bin_files:
-            raise FileNotFoundError(f"No .bin files found in X_CM directory: {xcm_dir}")
-        
         cm_chunk_files = {}
         cm_chunk_info = {}
         cm_file_to_chunk = {}
         
-        # Build chunk mapping for X_CM files
-        for chunk_idx, bin_file in enumerate(cm_bin_files):
-            chunk_num = chunk_idx
-            file_path = str(bin_file)
-            cm_chunk_files[chunk_num] = file_path
-            cm_chunk_info[chunk_num] = {
-                'chunk_num': chunk_num,
-                'file': bin_file.name,
-                'start_row': chunk_num * self.max_rows_per_chunk,
-                'end_row': (chunk_num + 1) * self.max_rows_per_chunk
-            }
-            cm_file_to_chunk[file_path] = chunk_num
+        # Try to use metadata chunks_cm if available
+        if 'chunks_cm' in self.metadata:
+            chunks_list = self.metadata['chunks_cm']
+            # Group chunks by file (multiple MTX files may map to same chunk file)
+            chunks_by_file = {}
+            for chunk_info in chunks_list:
+                file_name = chunk_info['file']
+                if file_name not in chunks_by_file:
+                    chunks_by_file[file_name] = []
+                chunks_by_file[file_name].append(chunk_info)
+            
+            # Build mapping: use chunk_num from first entry for each file
+            # With max_rows=256 for column-major files, each file maps to its own chunk
+            # so we can use the full range covering all entries
+            for file_name, file_chunks in chunks_by_file.items():
+                # Use the chunk_num from the first entry for this file
+                chunk_num = file_chunks[0]['chunk_num']
+                file_path = os.path.join(self.dir_path, "X_CM", file_name)
+                cm_chunk_files[chunk_num] = file_path
+                # Use the overall range covering all entries
+                cm_chunk_info[chunk_num] = {
+                    'chunk_num': chunk_num,
+                    'file': file_name,
+                    'start_row': min(c['start_row'] for c in file_chunks),
+                    'end_row': max(c['end_row'] for c in file_chunks)
+                }
+                cm_file_to_chunk[file_path] = chunk_num
+        else:
+            # Fallback: scan directory and sort numerically
+            xcm_path = Path(xcm_dir)
+            cm_bin_files = list(xcm_path.glob("*.bin"))
+            
+            if not cm_bin_files:
+                raise FileNotFoundError(f"No .bin files found in X_CM directory: {xcm_dir}")
+            
+            # Sort numerically by chunk number (extract from filename)
+            def extract_chunk_num(bin_file):
+                try:
+                    return int(bin_file.stem)  # Filename without extension
+                except ValueError:
+                    return 0
+            
+            cm_bin_files = sorted(cm_bin_files, key=extract_chunk_num)
+            
+            # Build chunk mapping for X_CM files
+            for bin_file in cm_bin_files:
+                chunk_num = extract_chunk_num(bin_file)
+                file_path = str(bin_file)
+                cm_chunk_files[chunk_num] = file_path
+                cm_chunk_info[chunk_num] = {
+                    'chunk_num': chunk_num,
+                    'file': bin_file.name,
+                    'start_row': chunk_num * self.max_rows_per_chunk,
+                    'end_row': (chunk_num + 1) * self.max_rows_per_chunk
+                }
+                cm_file_to_chunk[file_path] = chunk_num
         
         return cm_chunk_files, cm_chunk_info, cm_file_to_chunk
     
@@ -341,24 +376,23 @@ class ZData:
             if global_col >= cm_nrows:
                 raise IndexError(f"Column {global_col} is beyond available data (max column: {cm_nrows - 1})")
             
-            # Calculate chunk number: each chunk contains max_rows_per_chunk rows (genes)
-            chunk_num = global_col // self.max_rows_per_chunk
-            local_row = global_col % self.max_rows_per_chunk  # Local row in X_CM (which is a gene)
+            # Find which chunk contains this gene by checking chunk ranges
+            # With max_rows=256 for column-major files, each 256-gene MTX file maps to its own chunk
+            chunk_num = None
+            local_row = None
+            for cnum, chunk_info in cm_chunk_info.items():
+                chunk_start = chunk_info['start_row']  # Start of the chunk file
+                chunk_end = chunk_info['end_row']      # End of the chunk file
+                
+                # Check if gene is within this chunk's range
+                if chunk_start <= global_col < chunk_end:
+                    chunk_num = cnum
+                    # Calculate local row: offset from the start of the chunk file
+                    local_row = global_col - chunk_start
+                    break
             
-            if chunk_num not in cm_chunk_files:
-                raise IndexError(f"Column {global_col} is beyond available data (chunk {chunk_num} not found)")
-            
-            # Validate that the column is within this chunk's valid range
-            # Note: chunk_info['start_row'] and 'end_row' are gene indices (0 to ncols-1)
-            chunk_info = cm_chunk_info[chunk_num]
-            chunk_start = chunk_info['start_row']  # Gene index start
-            chunk_end = chunk_info['end_row']      # Gene index end
-            
-            if global_col < chunk_start or global_col >= chunk_end:
-                raise IndexError(
-                    f"Column {global_col} is out of range for chunk {chunk_num} "
-                    f"(valid range: {chunk_start} to {chunk_end - 1})"
-                )
+            if chunk_num is None:
+                raise IndexError(f"Column {global_col} is beyond available data (no chunk found containing this gene)")
             
             cols_by_file[cm_chunk_files[chunk_num]].append((local_row, idx, global_col))
         
