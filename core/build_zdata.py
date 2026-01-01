@@ -107,7 +107,8 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
                 if zdata_dir is None:
                     zdata_dir = Path(output_name)
                     zdata_dir.mkdir(parents=True, exist_ok=True)
-                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_CM", return_metadata=True)
+                # Use max_rows=256 for column-major files to match the 256-gene fragment size
+                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows=256, subdir="X_CM", return_metadata=True)
         
         # Combine metadata if both exist
         if rm_metadata is not None and cm_metadata is not None:
@@ -119,15 +120,15 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
                 "format": "zdata",
                 "shape": rm_metadata['shape'],  # [cells, genes] from X_RM
                 "nnz_total": rm_metadata.get('nnz_total', 0) + cm_metadata.get('nnz_total', 0),
-                "num_chunks_rm": rm_metadata['num_chunks'],
-                "num_chunks_cm": cm_metadata['num_chunks'],
-                "total_blocks_rm": rm_metadata['total_blocks'],
-                "total_blocks_cm": cm_metadata['total_blocks'],
+                "num_chunks_rm": rm_metadata['num_chunks_rm'],
+                "num_chunks_cm": cm_metadata['num_chunks_cm'],
+                "total_blocks_rm": rm_metadata['total_blocks_rm'],
+                "total_blocks_cm": cm_metadata['total_blocks_cm'],
                 "blocks_per_chunk": rm_metadata['blocks_per_chunk'],
                 "block_rows": block_rows,
                 "max_rows_per_chunk": max_rows,
-                "chunks_rm": rm_metadata['chunks'],  # Chunk ranges are cell indices (0 to nrows-1)
-                "chunks_cm": cm_metadata['chunks'],  # Chunk ranges are gene indices (0 to ncols-1)
+                "chunks_rm": rm_metadata['chunks_rm'],  # Chunk ranges are cell indices (0 to nrows-1)
+                "chunks_cm": cm_metadata['chunks_cm'],  # Chunk ranges are gene indices (0 to ncols-1)
                 "source_files_rm": rm_metadata.get('source_files', []),
                 "source_files_cm": cm_metadata.get('source_files', [])
             }
@@ -136,22 +137,12 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
                 json.dump(combined_metadata, f, indent=2)
             print(f"\n✓ Combined metadata written to {metadata_file}")
         elif rm_metadata is not None:
-            # Only RM metadata - add chunks_rm key for consistency
-            rm_metadata['chunks_rm'] = rm_metadata.pop('chunks')
-            rm_metadata['num_chunks_rm'] = rm_metadata.pop('num_chunks')
-            rm_metadata['total_blocks_rm'] = rm_metadata.pop('total_blocks')
+            # Only RM metadata - already in new format
             metadata_file = zdata_dir / "metadata.json"
             with open(metadata_file, 'w') as f:
                 json.dump(rm_metadata, f, indent=2)
         elif cm_metadata is not None:
-            # Only CM metadata - add chunks_cm key for consistency
-            # For CM-only, we need to infer the original shape
-            # X_CM shape is [genes, cells], but we want [cells, genes] for consistency
-            # So we swap: shape = [cm_metadata['shape'][1], cm_metadata['shape'][0]]
-            cm_metadata['chunks_cm'] = cm_metadata.pop('chunks')
-            cm_metadata['num_chunks_cm'] = cm_metadata.pop('num_chunks')
-            cm_metadata['total_blocks_cm'] = cm_metadata.pop('total_blocks')
-            # Swap shape for CM-only: [genes, cells] -> [cells, genes]
+            # Only CM metadata - swap shape for CM-only: [genes, cells] -> [cells, genes]
             if 'shape' in cm_metadata:
                 cm_shape = cm_metadata['shape']
                 cm_metadata['shape'] = [cm_shape[1], cm_shape[0]]  # Swap to [cells, genes]
@@ -296,18 +287,20 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
         })
         total_blocks += blocks_in_chunk
     
-    # Create metadata dictionary
+    # Create metadata dictionary (always use new format with _rm or _cm suffix)
+    # Determine suffix based on subdir
+    suffix = "_rm" if subdir == "X_RM" else "_cm"
     metadata = {
         "version": 1,
         "format": "zdata",
         "shape": [nrows, ncols],
         "nnz_total": nnz_total,
-        "num_chunks": num_chunks,
-        "total_blocks": total_blocks,
+        f"num_chunks{suffix}": num_chunks,
+        f"total_blocks{suffix}": total_blocks,
         "blocks_per_chunk": blocks_per_chunk,
         "block_rows": block_rows,
         "max_rows_per_chunk": max_rows,
-        "chunks": chunk_metadata
+        f"chunks{suffix}": chunk_metadata
     }
     
     # Write metadata to JSON file in zdata directory
@@ -474,21 +467,22 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
     # Sort chunks by chunk_num to ensure metadata is in order
     all_chunk_metadata.sort(key=lambda c: c['chunk_num'])
     
-    # Create final metadata
+    # Create final metadata (always use new format with _rm or _cm suffix)
     num_chunks = len(all_chunk_metadata)
+    suffix = "_rm" if subdir == "X_RM" else "_cm"
     metadata = {
         "version": 1,
         "format": "zdata",
         "shape": [total_rows, ncols],
         "nnz_total": total_nnz,
-        "num_chunks": num_chunks,
-        "total_blocks": total_blocks,
+        f"num_chunks{suffix}": num_chunks,
+        f"total_blocks{suffix}": total_blocks,
         "blocks_per_chunk": blocks_per_chunk,
         "block_rows": block_rows,
         "max_rows_per_chunk": max_rows,
         "source_files": [f.name for f in mtx_files],
         "num_source_files": len(mtx_files),
-        "chunks": all_chunk_metadata
+        f"chunks{suffix}": all_chunk_metadata
     }
     
     # Write metadata only if not returning it (for combination later)

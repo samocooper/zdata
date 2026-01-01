@@ -33,6 +33,7 @@ def test_random_rows(dir_name="andrews", n_rows=10, seed=42):
     try:
         # Initialize reader
         print("Initializing reader...")
+        # dir_name can be a full path or just a name
         reader = ZData(dir_name)
         print(f"✓ Reader initialized successfully")
         print(f"  - Number of columns: {reader.num_columns}")
@@ -114,20 +115,9 @@ if __name__ == "__main__":
         zdata_path = os.path.abspath(zdata_path)
         
         if os.path.exists(zdata_path) and os.path.isdir(zdata_path):
-            # Full path to .zdata directory provided
-            if zdata_path.endswith('.zdata'):
-                # Extract directory name and parent directory
-                parent_dir = os.path.dirname(zdata_path)
-                dir_name = os.path.basename(zdata_path).replace('.zdata', '')
-                # Change to parent directory so ZData can find the .zdata directory
-                original_cwd = os.getcwd()
-                os.chdir(parent_dir)
-            else:
-                # Directory without .zdata extension - assume it's the .zdata directory itself
-                parent_dir = os.path.dirname(zdata_path)
-                dir_name = os.path.basename(zdata_path)
-                original_cwd = os.getcwd()
-                os.chdir(parent_dir)
+            # Full path to .zdata directory provided - use it directly
+            dir_name = zdata_path
+            original_cwd = None
         else:
             # Just a directory name provided (relative path) or path doesn't exist yet
             # Remove .zdata suffix if present, ZData will add it
@@ -147,8 +137,9 @@ if __name__ == "__main__":
     try:
         success = test_random_rows(dir_name, n_rows, seed)
         sys.exit(0 if success else 1)
-    finally:
-        # Restore original working directory if we changed it
-        if original_cwd is not None:
-            os.chdir(original_cwd)
+    except Exception as e:
+        print(f"✗ Error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
