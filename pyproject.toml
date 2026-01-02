@@ -29,7 +29,15 @@ test = [
     "pytest-xdist>=3.0.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["zdata*"]
+# [project.urls]
+# Homepage = "https://github.com/yourusername/zdata"  # Add project homepage
+# Documentation = "https://zdata.readthedocs.io"  # Add documentation URL
+# Repository = "https://github.com/yourusername/zdata"  # Add repository URL
+# Issues = "https://github.com/yourusername/zdata/issues"  # Add issues URL
+
+[tool.setuptools]
+packages = ["zdata", "zdata.core", "zdata.build", "zdata.files"]
+
+[tool.setuptools.package-data]
+zdata = ["ctools/*.c", "ctools/mtx_to_zdata*", "ctools/zdata_read*", "files/2ks10c_genes.txt"]
 

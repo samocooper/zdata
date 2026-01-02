@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import subprocess
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -40,20 +41,6 @@ def _get_zdata_read_path() -> str:
             f"Please ensure it is built in the ctools directory."
         )
     return str(bin_path)
-
-
-def _normalize_indices(
-    indices: int | np.integer | Sequence[int] | NDArray[np.integer],
-) -> list[int]:
-    """
-    Normalize indices to list of ints (handles int or list/array).
-    
-    This is a simple wrapper for backward compatibility.
-    For new code, use normalize_row_indices() or normalize_column_indices().
-    """
-    if isinstance(indices, (int, np.integer)):
-        return [int(indices)]
-    return [int(i) for i in indices]
 
 
 class ObsWrapper:
@@ -212,8 +199,6 @@ class ZData:
         RuntimeError
             If parquet files cannot be loaded.
         """
-        self.dir_name: str | Path = dir_name
-        # Use dir_name directly as path (no .zdata suffix appended)
         self.dir_path: str | Path = dir_name
         
         if not os.path.exists(self.dir_path):
@@ -222,7 +207,6 @@ class ZData:
         if not os.path.isdir(self.dir_path):
             raise ValueError(f"Path is not a directory: {self.dir_path}")
         
-        # Load metadata (required)
         metadata_file = os.path.join(self.dir_path, "metadata.json")
         if not os.path.exists(metadata_file):
             raise FileNotFoundError(
@@ -233,29 +217,23 @@ class ZData:
         with open(metadata_file, 'r') as f:
             self.metadata: dict[str, Any] = json.load(f)
         
-        # Extract metadata (new format only)
         self.nrows: int = self.metadata['shape'][0]
         self.ncols: int = self.metadata['shape'][1]
         self.nnz_total: int | None = self.metadata.get('nnz_total', None)
-        # Use RM chunks for row-major operations (required)
         if 'num_chunks_rm' not in self.metadata:
             raise ValueError("Metadata missing 'num_chunks_rm' field (new format required)")
         self.num_chunks: int = self.metadata['num_chunks_rm']
         self.total_blocks: int | None = self.metadata.get('total_blocks_rm', None)
         
-        # Extract block configuration from metadata
-        # Use settings defaults if not in metadata
         self.block_rows: int = self.metadata.get('block_rows', settings.block_rows)
         self.max_rows_per_chunk: int = self.metadata.get(
             'max_rows_per_chunk', settings.max_rows_per_chunk
         )
         
-        # Build chunk_files dict and chunk info from metadata (new format only)
         self.chunk_files: dict[int, str] = {}
-        self.chunk_info: dict[int, dict[str, Any]] = {}  # Store chunk metadata for validation
-        self.file_to_chunk: dict[str, int] = {}  # Reverse mapping: file_path -> chunk_num (for O(1) lookup)
+        self.chunk_info: dict[int, dict[str, Any]] = {}
+        self.file_to_chunk: dict[str, int] = {}
         
-        # Use new format with separate RM and CM chunks (required)
         if 'chunks_rm' not in self.metadata:
             raise ValueError("Metadata missing 'chunks_rm' field (new format required)")
         chunks_list = self.metadata['chunks_rm']
@@ -263,7 +241,6 @@ class ZData:
         
         for chunk_info in chunks_list:
             chunk_num = chunk_info['chunk_num']
-            # .bin files are stored in subdirectory (X_RM or X_CM)
             file_path = os.path.join(self.dir_path, subdir, chunk_info['file'])
             self.chunk_files[chunk_num] = file_path
             self.chunk_info[chunk_num] = chunk_info
@@ -291,12 +268,6 @@ class ZData:
             var_dict = var_polars.to_dict(as_series=False)
             self._var_df: pd.DataFrame = pd.DataFrame(var_dict)
             self._var_df.index = pd.RangeIndex(start=0, stop=len(self._var_df))
-            
-            # Build gene name to index mapping for fast lookups
-            if 'gene' in self._var_df.columns:
-                self._gene_to_idx: dict[str, int] = {gene: idx for idx, gene in enumerate(self._var_df['gene'])}
-            else:
-                self._gene_to_idx: dict[str, int] = {}
         except Exception as e:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
     
@@ -311,6 +282,71 @@ class ZData:
         """
         return self._obs_wrapper
     
+    def _check_memory_requirements(
+        self,
+        row_indices: list[int] | None = None,
+        column_indices: list[int] | None = None,
+    ) -> None:
+        """\
+        Check memory requirements for a query and raise/warn if needed.
+        
+        This is an internal helper method that performs memory estimation
+        and validation for row or column queries.
+        
+        Parameters
+        ----------
+        row_indices
+            Optional list of row indices to check.
+        column_indices
+            Optional list of column indices to check.
+        
+        Raises
+        ------
+        MemoryError
+            If estimated memory exceeds 80% of available memory and
+            override_memory_check is False.
+        UserWarning
+            If estimated memory exceeds 80% of available memory and
+            override_memory_check is True, or if memory estimation fails.
+        """
+        try:
+            memory_estimate = self.estimate_memory_requirements(
+                row_indices=row_indices, column_indices=column_indices
+            )
+            estimated_memory_bytes = memory_estimate['estimated_memory_mb'] * 1024 * 1024
+            available_memory_bytes = get_available_memory_bytes()
+            memory_threshold = 0.8 * available_memory_bytes
+            
+            if estimated_memory_bytes > memory_threshold:
+                error_message = (
+                    f"Query would require {memory_estimate['estimated_memory_gb']:.2f} GB of memory, "
+                    f"which exceeds 80% of available memory ({available_memory_bytes / (1024**3):.2f} GB). "
+                    f"Available: {available_memory_bytes / (1024**3):.2f} GB, "
+                    f"Threshold (80%): {memory_threshold / (1024**3):.2f} GB, "
+                    f"Estimated: {estimated_memory_bytes / (1024**3):.2f} GB. "
+                    f"Please reduce the query size or free up memory."
+                )
+                
+                if settings.override_memory_check:
+                    warnings.warn(
+                        f"{error_message} "
+                        f"Proceeding anyway because override_memory_check=True. "
+                        f"This may cause the system to run out of memory.",
+                        UserWarning
+                    )
+                else:
+                    raise MemoryError(
+                        f"{error_message} "
+                        f"Set zdata.settings.override_memory_check = True to override this check."
+                    )
+        except ValueError as e:
+            # If nnz values are missing, we can't estimate memory accurately
+            # In this case, we'll skip the check but warn the user
+            warnings.warn(
+                f"Cannot estimate memory requirements: {e}. "
+                f"Proceeding with query, but it may fail if insufficient memory is available.",
+                UserWarning
+            )
     
     def _read_rows_from_file(
         self, 
@@ -421,52 +457,9 @@ class ZData:
         >>> for row_id, cols, vals in rows:
         ...     print(f"Row {row_id}: {len(cols)} non-zero values")
         """
-        # Normalize indices using the new indexing system
         global_rows = normalize_row_indices(global_rows, self.nrows)
-        
-        # Check memory requirements before querying
-        try:
-            memory_estimate = self.estimate_memory_requirements(row_indices=global_rows)
-            estimated_memory_bytes = memory_estimate['estimated_memory_mb'] * 1024 * 1024
-            available_memory_bytes = get_available_memory_bytes()
-            memory_threshold = 0.8 * available_memory_bytes
-            
-            if estimated_memory_bytes > memory_threshold:
-                error_message = (
-                    f"Query would require {memory_estimate['estimated_memory_gb']:.2f} GB of memory, "
-                    f"which exceeds 80% of available memory ({available_memory_bytes / (1024**3):.2f} GB). "
-                    f"Available: {available_memory_bytes / (1024**3):.2f} GB, "
-                    f"Threshold (80%): {memory_threshold / (1024**3):.2f} GB, "
-                    f"Estimated: {estimated_memory_bytes / (1024**3):.2f} GB. "
-                    f"Please reduce the query size or free up memory."
-                )
-                
-                if settings.override_memory_check:
-                    import warnings
-                    warnings.warn(
-                        f"{error_message} "
-                        f"Proceeding anyway because override_memory_check=True. "
-                        f"This may cause the system to run out of memory.",
-                        UserWarning
-                    )
-                else:
-                    raise MemoryError(
-                        f"{error_message} "
-                        f"Set zdata.settings.override_memory_check = True to override this check."
-                    )
-        except ValueError as e:
-            # If nnz values are missing, we can't estimate memory accurately
-            # In this case, we'll skip the check but warn the user
-            import warnings
-            warnings.warn(
-                f"Cannot estimate memory requirements: {e}. "
-                f"Proceeding with query, but it may fail if insufficient memory is available.",
-                UserWarning
-            )
-        
-        # Warn on large queries if enabled
+        self._check_memory_requirements(row_indices=global_rows)
         if settings.warn_on_large_queries and len(global_rows) > settings.large_query_threshold:
-            import warnings
             warnings.warn(
                 f"Querying {len(global_rows)} rows, which exceeds the threshold "
                 f"of {settings.large_query_threshold}. This may be slow. "
@@ -475,16 +468,9 @@ class ZData:
                 UserWarning
             )
         
-        # Group global rows by which chunk file they belong to
         rows_by_file = defaultdict(list)
         
         for idx, global_row in enumerate(global_rows):
-            if global_row < 0:
-                raise ValueError(f"Row index must be non-negative, got {global_row}")
-            
-            if global_row >= self.nrows:
-                raise IndexError(f"Row {global_row} is beyond available data (max row: {self.nrows - 1})")
-            
             chunk_num = global_row // self.max_rows_per_chunk
             local_row = global_row % self.max_rows_per_chunk
             
@@ -493,11 +479,10 @@ class ZData:
             
             rows_by_file[self.chunk_files[chunk_num]].append((local_row, idx, global_row))
         
-        # Read from each file and collect results
         all_results = [None] * len(global_rows)
         
         for file_path, row_info_list in rows_by_file.items():
-            chunk_num = self.file_to_chunk[file_path]  # Guaranteed to exist
+            chunk_num = self.file_to_chunk[file_path]
             
             row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
             local_rows = [info[0] for info in row_info_list_sorted]
@@ -538,7 +523,6 @@ class ZData:
         See Also
         --------
         read_rows : Read rows as raw tuples
-        read_rows_rm_csr : Alias for this method
         
         Examples
         --------
@@ -550,58 +534,6 @@ class ZData:
         """
         rows_data = self.read_rows(global_rows)
         return self._rows_to_csr(rows_data)
-    
-    def read_rows_rm(
-        self, 
-        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
-    ) -> list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]:
-        """\
-        Read rows from X_RM (row-major) files.
-        
-        This is an alias for read_rows() for clarity. Both methods read from
-        the row-major chunk files.
-        
-        Parameters
-        ----------
-        global_rows
-            Row index or indices. See read_rows() for supported types.
-        
-        Returns
-        -------
-        list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]
-            List of (global_row_id, cols, vals) tuples. See read_rows() for details.
-        
-        See Also
-        --------
-        read_rows : Same functionality, this is an alias
-        """
-        return self.read_rows(global_rows)
-    
-    def read_rows_rm_csr(
-        self, 
-        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
-    ) -> csr_matrix:
-        """\
-        Read rows from X_RM (row-major) files and return as CSR matrix.
-        
-        This is an alias for read_rows_csr() for clarity. Both methods read from
-        the row-major chunk files and return CSR matrices.
-        
-        Parameters
-        ----------
-        global_rows
-            Row index or indices. See read_rows() for supported types.
-        
-        Returns
-        -------
-        csr_matrix
-            Compressed Sparse Row matrix. See read_rows_csr() for details.
-        
-        See Also
-        --------
-        read_rows_csr : Same functionality, this is an alias
-        """
-        return self.read_rows_csr(global_rows)
     
     def _build_cm_chunk_mapping(
         self
@@ -725,86 +657,30 @@ class ZData:
         >>> for col_id, rows, vals in cols:
         ...     print(f"Gene {col_id}: {len(rows)} non-zero cells")
         """
-        # Get gene names if available
         gene_names = None
         if hasattr(self, '_var_df') and 'gene' in self._var_df.columns:
             gene_names = pd.Index(self._var_df['gene'])
         
-        # Normalize indices using the new indexing system
         global_cols = normalize_column_indices(global_cols, self.ncols, gene_names)
         
         if not global_cols:
             raise ValueError("Empty selection: no columns selected")
         
-        # Check memory requirements before querying
-        try:
-            memory_estimate = self.estimate_memory_requirements(column_indices=global_cols)
-            estimated_memory_bytes = memory_estimate['estimated_memory_mb'] * 1024 * 1024
-            available_memory_bytes = get_available_memory_bytes()
-            memory_threshold = 0.8 * available_memory_bytes
-            
-            if estimated_memory_bytes > memory_threshold:
-                error_message = (
-                    f"Query would require {memory_estimate['estimated_memory_gb']:.2f} GB of memory, "
-                    f"which exceeds 80% of available memory ({available_memory_bytes / (1024**3):.2f} GB). "
-                    f"Available: {available_memory_bytes / (1024**3):.2f} GB, "
-                    f"Threshold (80%): {memory_threshold / (1024**3):.2f} GB, "
-                    f"Estimated: {estimated_memory_bytes / (1024**3):.2f} GB. "
-                    f"Please reduce the query size or free up memory."
-                )
-                
-                if settings.override_memory_check:
-                    import warnings
-                    warnings.warn(
-                        f"{error_message} "
-                        f"Proceeding anyway because override_memory_check=True. "
-                        f"This may cause the system to run out of memory.",
-                        UserWarning
-                    )
-                else:
-                    raise MemoryError(
-                        f"{error_message} "
-                        f"Set zdata.settings.override_memory_check = True to override this check."
-                    )
-        except ValueError as e:
-            # If nnz values are missing, we can't estimate memory accurately
-            # In this case, we'll skip the check but warn the user
-            import warnings
-            warnings.warn(
-                f"Cannot estimate memory requirements: {e}. "
-                f"Proceeding with query, but it may fail if insufficient memory is available.",
-                UserWarning
-            )
-        
-        # Build X_CM chunk mapping
+        self._check_memory_requirements(column_indices=global_cols)
         cm_chunk_files, cm_chunk_info, cm_file_to_chunk = self._build_cm_chunk_mapping()
         
-        # In X_CM, rows = genes, so we treat column indices as row indices
-        # The number of rows in X_CM equals the number of columns in the original matrix
-        cm_nrows = self.ncols  # Number of genes (rows in X_CM)
-        
-        # Group columns (genes) by which chunk file they belong to
         cols_by_file = defaultdict(list)
         
         for idx, global_col in enumerate(global_cols):
-            if global_col < 0:
-                raise ValueError(f"Column index must be non-negative, got {global_col}")
-            
-            if global_col >= cm_nrows:
-                raise IndexError(f"Column {global_col} is beyond available data (max column: {cm_nrows - 1})")
-            
             # Find which chunk contains this gene by checking chunk ranges
-            # With max_rows=256 for column-major files, each 256-gene MTX file maps to its own chunk
             chunk_num = None
             local_row = None
             for cnum, chunk_info in cm_chunk_info.items():
-                chunk_start = chunk_info['start_row']  # Start of the chunk file
-                chunk_end = chunk_info['end_row']      # End of the chunk file
+                chunk_start = chunk_info['start_row']
+                chunk_end = chunk_info['end_row']
                 
-                # Check if gene is within this chunk's range
                 if chunk_start <= global_col < chunk_end:
                     chunk_num = cnum
-                    # Calculate local row: offset from the start of the chunk file
                     local_row = global_col - chunk_start
                     break
             
@@ -813,11 +689,10 @@ class ZData:
             
             cols_by_file[cm_chunk_files[chunk_num]].append((local_row, idx, global_col))
         
-        # Read from each file and collect results
         all_results = [None] * len(global_cols)
         
         for file_path, col_info_list in cols_by_file.items():
-            chunk_num = cm_file_to_chunk[file_path]  # Guaranteed to exist
+            chunk_num = cm_file_to_chunk[file_path]
             
             col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
             local_rows = [info[0] for info in col_info_list_sorted]
@@ -1017,66 +892,54 @@ class ZData:
         >>> estimate = zdata.estimate_memory_requirements(column_indices=[0, 10, 20])
         >>> print(f"Estimated memory: {estimate['estimated_memory_gb']:.2f} GB")
         """
-        import numpy as np
-        
         has_row_nnz = False
         has_column_nnz = False
         estimated_nnz = 0
         
-        # Estimate based on row query
         if row_indices is not None:
             if not (hasattr(self, '_obs_df') and 'nnz' in self._obs_df.columns):
                 raise ValueError("Row nnz values are required but not found in obs DataFrame. Please rebuild zdata with nnz tracking enabled.")
             
             has_row_nnz = True
-            # Get nnz values for requested rows
             obs_nnz = self._obs_df.select(['nnz']).to_numpy().flatten()
             if len(obs_nnz) == 0:
                 raise ValueError("obs DataFrame has no nnz values. Please rebuild zdata with nnz tracking enabled.")
             
-            # Sum nnz for requested rows
             valid_indices = [i for i in row_indices if 0 <= i < len(obs_nnz)]
             if not valid_indices:
                 raise ValueError(f"All row indices are out of bounds. Valid range: [0, {len(obs_nnz)})")
             
             estimated_nnz = int(np.sum(obs_nnz[valid_indices]))
         
-        # Estimate based on column query
         elif column_indices is not None:
             if not (hasattr(self, '_var_df') and 'nnz' in self._var_df.columns):
                 raise ValueError("Column nnz values are required but not found in var DataFrame. Please rebuild zdata with nnz tracking enabled.")
             
             has_column_nnz = True
-            # Get nnz values for requested columns
             var_nnz = self._var_df['nnz'].values
             if len(var_nnz) == 0:
                 raise ValueError("var DataFrame has no nnz values. Please rebuild zdata with nnz tracking enabled.")
             
-            # Sum nnz for requested columns
             valid_indices = [i for i in column_indices if 0 <= i < len(var_nnz)]
             if not valid_indices:
                 raise ValueError(f"All column indices are out of bounds. Valid range: [0, {len(var_nnz)})")
             
             estimated_nnz = int(np.sum(var_nnz[valid_indices]))
         
-        # Estimate for full dataset if no indices provided
         else:
             if self.nnz_total is not None:
                 estimated_nnz = self.nnz_total
             else:
                 raise ValueError("Total nnz is not available. Please rebuild zdata with nnz tracking enabled.")
         
-        # Calculate memory requirements (assuming float64 for values, int32 for indices)
         # CSR format: data (float64), indices (int32), indptr (int32)
-        # Rough estimate: nnz * (8 bytes + 4 bytes) + (nrows+1) * 4 bytes
         bytes_per_nnz = 12  # 8 bytes (float64) + 4 bytes (int32 index)
         estimated_bytes = estimated_nnz * bytes_per_nnz
         
-        # Add overhead for indptr (for row queries) or similar structures
         if row_indices is not None:
-            estimated_bytes += (len(row_indices) + 1) * 4  # indptr overhead
+            estimated_bytes += (len(row_indices) + 1) * 4
         elif column_indices is not None:
-            estimated_bytes += (len(column_indices) + 1) * 4  # indptr overhead for transposed
+            estimated_bytes += (len(column_indices) + 1) * 4
         
         estimated_memory_mb = estimated_bytes / (1024 * 1024)
         estimated_memory_gb = estimated_memory_mb / 1024
@@ -1088,9 +951,6 @@ class ZData:
             'has_row_nnz': has_row_nnz,
             'has_column_nnz': has_column_nnz,
         }
-        if seed is not None:
-            np.random.seed(seed)
-        return np.random.randint(0, self.nrows, size=n).tolist()
     
     @overload
     def __getitem__(self, key: slice) -> ad.AnnData: ...
@@ -1180,10 +1040,6 @@ class ZData:
         >>> matrix = zdata[['GAPDH', 'PCNA', 'COL1A1']]  # Multiple genes
         >>> matrix = zdata['GAPDH':'PCNA']  # Gene range
         """
-        # Determine if this is a row query or column query
-        # Strategy: if key is a string or list of strings, it's a column query
-        # Otherwise, it's a row query
-        
         is_column_query = False
         
         if isinstance(key, str):
@@ -1191,45 +1047,42 @@ class ZData:
         elif isinstance(key, list) and len(key) > 0 and isinstance(key[0], str):
             is_column_query = True
         elif isinstance(key, slice):
-            # For slices, check if start/stop are strings (gene names)
             if (isinstance(key.start, str) or isinstance(key.stop, str)):
                 is_column_query = True
         
         if is_column_query:
-            # Column-major query: return CSC matrix
-            # Use read_cols_cm which handles all column indexing patterns
             csr_result = self.read_cols_cm_csr(key)
-            return csr_result.T.tocsc()  # Transpose CSR to CSC
+            return csr_result.T.tocsc()
         
-        # Row-major query: return AnnData object
-        # Normalize row indices
         row_indices = normalize_row_indices(key, self.nrows)
         
         if not row_indices:
             raise ValueError("Empty selection: no rows selected")
         
-        # Read rows and create AnnData
         X_csr = self.read_rows_csr(row_indices)
         
-        # Get obs data for selected rows
-        # Note: row_indices are already sorted and deduplicated
-        obs_dfs = []
-        for idx in row_indices:
-            obs_slice = self.obs[idx:idx+1, :]
-            obs_dfs.append(obs_slice)
-        
-        if obs_dfs:
-            obs_df = pd.concat(obs_dfs, ignore_index=True)
+        # Get obs data for selected rows (already sorted and deduplicated)
+        if len(row_indices) == 1:
+            obs_df = self.obs[row_indices[0]:row_indices[0]+1, :]
+        elif row_indices:
+            # Use slice if indices are consecutive, otherwise get individually
+            is_consecutive = (
+                len(row_indices) == row_indices[-1] - row_indices[0] + 1
+                and all(row_indices[i] == row_indices[0] + i for i in range(len(row_indices)))
+            )
+            if is_consecutive:
+                obs_df = self.obs[row_indices[0]:row_indices[-1]+1, :]
+            else:
+                obs_dfs = [self.obs[idx:idx+1, :] for idx in row_indices]
+                obs_df = pd.concat(obs_dfs, ignore_index=True)
         else:
-            obs_df = self.obs[0:0, :].copy()  # Empty DataFrame with correct columns
+            obs_df = self.obs[0:0, :].copy()
         
         obs_df.index = pd.RangeIndex(start=0, stop=len(obs_df))
         
         var_df = self._var_df.copy()
         
-        import warnings
         with warnings.catch_warnings():
-            # Suppress ImplicitModificationWarning from anndata during AnnData construction
             try:
                 from anndata._warnings import ImplicitModificationWarning as AnnDataWarning
                 warnings.filterwarnings("ignore", category=AnnDataWarning)

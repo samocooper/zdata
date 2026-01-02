@@ -14,7 +14,7 @@ import sys
 import os
 import argparse
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 
 def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:

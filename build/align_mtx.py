@@ -15,11 +15,42 @@ import os
 import json
 import argparse
 from pathlib import Path
-import tempfile
 import shutil
 
 # Default gene list path (relative to zdata package)
+# This file is required and must be included in the package distribution
 _DEFAULT_GENE_LIST = Path(__file__).parent.parent / "files" / "2ks10c_genes.txt"
+
+def get_default_gene_list_path() -> Path:
+    """Get the path to the default gene list file.
+    
+    This function handles both development and installed package scenarios.
+    The file must be included in the package distribution.
+    
+    Returns:
+        Path to the default gene list file
+        
+    Raises:
+        FileNotFoundError: If the default gene list file is not found
+    """
+    gene_list_path = _DEFAULT_GENE_LIST
+    
+    # If file doesn't exist at expected location, try to find it
+    if not gene_list_path.exists():
+        # Try alternative locations (for installed packages)
+        import zdata
+        package_dir = Path(zdata.__file__).parent
+        alternative_path = package_dir / "files" / "2ks10c_genes.txt"
+        if alternative_path.exists():
+            return alternative_path
+    
+    if not gene_list_path.exists():
+        raise FileNotFoundError(
+            f"Default gene list file not found at {gene_list_path}. "
+            f"This file (files/2ks10c_genes.txt) is required and must be included in the package distribution."
+        )
+    
+    return gene_list_path
 
 def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
     """
@@ -36,38 +67,29 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
     zarr_group = zarr.open(zarr_path, mode='r')
     
     try:
-        # Get dimensions
         n_cols = zarr_group["var"]["gene"].shape[0]
         n_rows = zarr_group["obs"]["barcode"].shape[0]
         
         X = zarr_group['X']
-        
-        # Load entire zarr file as CSR (memory efficient for sparse data)
         indptr = X["indptr"][:]
         data = X["data"][:]
         indices = X["indices"][:]
         
-        # Rebase indptr to start at zero
         if len(indptr) > 0:
             start = indptr[0]
             indptr = indptr - start
         
         X_csr = csr_matrix((data, indices, indptr), shape=(n_rows, n_cols))
-        
-        # Convert to CSC for column reordering
         X_csc = X_csr.tocsc()
         
-        # Get CSC arrays
         old_data = X_csc.data
         old_indices = X_csc.indices
         old_indptr = X_csc.indptr
         n_old_cols = X_csc.shape[1]
         
-        # Initialize column storage
         new_col_data = [[] for _ in range(n_new_cols)]
         new_col_indices = [[] for _ in range(n_new_cols)]
         
-        # Iterate through old columns and map to new positions
         for old_col in range(n_old_cols):
             if old_col in old_to_new_idx:
                 new_col = old_to_new_idx[old_col]
@@ -76,7 +98,6 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
                 new_col_data[new_col].extend(old_data[col_start:col_end])
                 new_col_indices[new_col].extend(old_indices[col_start:col_end])
         
-        # Build new CSC arrays
         new_data = []
         new_indices = []
         new_indptr = [0]
@@ -86,13 +107,10 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
             new_indices.extend(new_col_indices[new_col])
             new_indptr.append(len(new_data))
         
-        # Create new CSC matrix and convert to CSR
         X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
                                        shape=(n_rows, n_new_cols)).tocsr()
         
-        # Free memory
-        del X_csr
-        del X_csc
+        del X_csr, X_csc
         
         return X_chunk_reordered, n_rows
         
@@ -114,7 +132,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     Returns:
         Path to manifest file
     """
-    # Read standard gene list
     with open(gene_list_path, 'r') as f:
         gene_list = [line.strip() for line in f if line.strip()]
     
@@ -124,7 +141,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     print(f"Standard gene list contains {len(gene_list)} genes")
     n_new_cols = len(gene_list)
     
-    # Find all zarr files in directory (alphabetical order)
     zarr_dir_path = Path(zarr_dir)
     zarr_files = sorted([f for f in zarr_dir_path.glob("*.zarr") if f.is_dir()])
     
@@ -133,27 +149,19 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     
     print(f"Found {len(zarr_files)} zarr file(s) to process")
     
-    # Note: We'll build gene mapping per zarr file since gene orders may differ between files
-    # This ensures correct alignment even if zarr files have different gene orders
-    
-    # Ensure output directory exists
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
         print(f"Created output directory: {output_dir}")
     
-    # Create rm_mtx_files subdirectory for MTX files
     mtx_output_dir = os.path.join(output_dir, "rm_mtx_files")
     if not os.path.exists(mtx_output_dir):
         os.makedirs(mtx_output_dir, exist_ok=True)
         print(f"Created MTX output directory: {mtx_output_dir}")
     
-    # Process zarr files and accumulate rows
     print(f"\nProcessing zarr files and creating MTX files (max {chunk_size} rows per file)")
     
     output_files = []
     manifest_data = []
-    
-    # Initialize column nnz accumulator (will accumulate across all MTX files)
     column_nnz_accumulator = np.zeros(n_new_cols, dtype=np.uint32)
     
     current_chunk_rows = []
@@ -164,17 +172,12 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     for zarr_idx, zarr_path in enumerate(zarr_files):
         print(f"\n[{zarr_idx + 1}/{len(zarr_files)}] Processing: {zarr_path.name}")
         
-        # Build gene mapping for THIS zarr file (gene order may differ between files)
-        # This ensures correct alignment even if zarr files have different gene orders
         zarr_group = zarr.open(str(zarr_path), mode='r')
         if 'var' not in zarr_group or 'gene' not in zarr_group['var']:
             raise ValueError(f"Zarr file {zarr_path.name} is missing required 'var/gene' array. All zarr files must have this structure.")
         
         zarr_genes = zarr_group['var']['gene'][:].tolist()
-        # zarr Group objects don't need explicit closing - they're automatically managed
         
-        # Create mapping: old_col_idx -> new_col_idx for THIS zarr file
-        # Map each gene name to its position in the aligned gene list
         gene_to_old_idx = {gene: idx for idx, gene in enumerate(zarr_genes)}
         old_to_new_idx = {}
         for new_idx, gene in enumerate(gene_list):
@@ -182,7 +185,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                 old_col_idx = gene_to_old_idx[gene]
                 old_to_new_idx[old_col_idx] = new_idx
         
-        # Process this zarr file with its specific mapping
         X_aligned, n_rows = process_zarr_file(str(zarr_path), gene_list_path, old_to_new_idx, n_new_cols)
         
         if X_aligned is None:
@@ -190,7 +192,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         
         print(f"  Processed {n_rows} rows from {zarr_path.name}")
         
-        # Add to current chunk
         current_chunk_rows.append(X_aligned)
         current_chunk_zarrs.append({
             'zarr_file': zarr_path.name,
@@ -201,44 +202,31 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         
         total_rows_in_chunk = sum(m.shape[0] for m in current_chunk_rows)
         
-        # If we've reached or exceeded chunk size, write MTX file
         if total_rows_in_chunk >= chunk_size:
-            # Concatenate matrices
             print(f"  Concatenating {len(current_chunk_rows)} matrices ({total_rows_in_chunk} total rows)")
             combined_matrix = vstack(current_chunk_rows, format='csr')
             
-            # Determine which zarr files contributed to this chunk (before potential split)
-            zarr_files_for_manifest = current_chunk_zarrs.copy()
-            
-            # Determine which zarr files contributed to the written portion
             rows_written = 0
             zarr_files_written = []
             remainder_zarr_info = None
             
-            # Trim to exactly chunk_size if needed
             if combined_matrix.shape[0] > chunk_size:
-                # Split: write full chunk, keep remainder
                 matrix_to_write = combined_matrix[:chunk_size]
                 remainder = combined_matrix[chunk_size:]
                 
-                # Calculate which zarr files contributed to written portion and remainder
                 for zarr_info in current_chunk_zarrs:
                     zarr_rows = zarr_info['rows_in_chunk']
                     if rows_written + zarr_rows <= chunk_size:
-                        # Entire zarr file is in written portion
                         zarr_files_written.append(zarr_info.copy())
                         rows_written += zarr_rows
                     else:
-                        # This zarr file is split
                         rows_from_this_zarr_in_written = chunk_size - rows_written
                         remainder_rows = zarr_rows - rows_from_this_zarr_in_written
                         
-                        # Add partial zarr info to written portion
                         partial_info = zarr_info.copy()
                         partial_info['rows_in_chunk'] = rows_from_this_zarr_in_written
                         zarr_files_written.append(partial_info)
                         
-                        # Create remainder info
                         remainder_zarr_info = {
                             'zarr_file': zarr_info['zarr_file'],
                             'zarr_path': zarr_info['zarr_path'],
@@ -247,7 +235,6 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                         }
                         break
                 
-                # Update tracking for remainder
                 current_chunk_rows = [remainder]
                 current_chunk_zarrs = [remainder_zarr_info] if remainder_zarr_info else []
             else:
@@ -256,16 +243,10 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                 current_chunk_rows = []
                 current_chunk_zarrs = []
             
-            # Calculate row nnz (number of non-zeros per row) from CSR indptr
-            # indptr[i+1] - indptr[i] gives nnz for row i
             row_nnz = np.diff(matrix_to_write.indptr).astype(np.uint32)
-            
-            # Calculate column nnz directly from CSR matrix (no transposition needed)
-            # Use getnnz(axis=0) which efficiently counts non-zeros per column
             column_nnz_chunk = matrix_to_write.getnnz(axis=0).astype(np.uint32)
             column_nnz_accumulator += column_nnz_chunk
             
-            # Write MTX file
             row_end = current_row_start + matrix_to_write.shape[0] - 1
             chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
             output_files.append(chunk_output_path)
@@ -274,11 +255,9 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             mmwrite(chunk_output_path, matrix_to_write)
             print(f"  ✓ {matrix_to_write.shape[0]} rows × {n_new_cols} cols, {matrix_to_write.nnz} non-zeros")
             
-            # Write row nnz to temporary file (will be merged into obs.parquet later)
             row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
             np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
             
-            # Record in manifest
             manifest_data.append({
                 'mtx_file': os.path.basename(chunk_output_path),
                 'mtx_path': chunk_output_path,
@@ -291,9 +270,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             current_row_start = row_end + 1
             mtx_file_idx += 1
             
-            # Free memory
-            del combined_matrix
-            del matrix_to_write
+            del combined_matrix, matrix_to_write
     
     # Write final chunk if there are remaining rows
     if current_chunk_rows:
@@ -521,8 +498,8 @@ def main():
     parser.add_argument(
         '--gene-list',
         type=str,
-        default=str(_DEFAULT_GENE_LIST),
-        help=f'Path to file containing standard gene list (one gene per line). Default: {_DEFAULT_GENE_LIST}'
+        default=None,
+        help='Path to file containing standard gene list (one gene per line). Default: uses package default (files/2ks10c_genes.txt)'
     )
     parser.add_argument(
         '--tmp-dir',
@@ -545,11 +522,22 @@ def main():
         print(f"ERROR: Zarr file/directory not found: {args.zarr_input}")
         sys.exit(1)
     
-    gene_list_path = args.gene_list
+    # Use default gene list if not provided
+    if args.gene_list is None:
+        try:
+            gene_list_path = str(get_default_gene_list_path())
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+    else:
+        gene_list_path = args.gene_list
+    
     if not os.path.exists(gene_list_path):
         print(f"ERROR: Gene list file not found: {gene_list_path}")
-        print(f"  Expected default location: {_DEFAULT_GENE_LIST}")
-        print(f"  You can specify a different file with --gene-list")
+        if args.gene_list is None:
+            print(f"  This is the default gene list file that should be included in the package.")
+        else:
+            print(f"  You can specify a different file with --gene-list")
         sys.exit(1)
     
     try:

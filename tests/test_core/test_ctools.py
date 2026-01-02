@@ -18,12 +18,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import sys
+from pathlib import Path
+
 # Add parent directory to path for imports
 _test_dir = Path(__file__).parent.parent
 _project_root = _test_dir.parent
 _parent_dir = _project_root.parent
-import sys
-
 sys.path.insert(0, str(_parent_dir))
 
 from zdata.core import ZData
@@ -31,9 +32,9 @@ from zdata.core import ZData
 
 @pytest.fixture(scope="session")
 def zstd_base() -> Path | None:
-    """Get ZSTD base directory from environment or default."""
-    zstd_path = os.environ.get("ZSTD_BASE", "/home/ubuntu/zstd")
-    if os.path.exists(zstd_path):
+    """Get ZSTD base directory from environment."""
+    zstd_path = os.environ.get("ZSTD_BASE")
+    if zstd_path and os.path.exists(zstd_path):
         return Path(zstd_path)
     return None
 

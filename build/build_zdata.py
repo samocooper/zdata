@@ -15,7 +15,6 @@ import sys
 import os
 import argparse
 import tempfile
-import shutil
 from pathlib import Path
 
 # Import functions from other build scripts
@@ -82,8 +81,8 @@ def build_zdata_from_zarr(
     
     # Use default gene list if not provided
     if gene_list_path is None:
-        from zdata.build.align_mtx import _DEFAULT_GENE_LIST
-        gene_list_path = str(_DEFAULT_GENE_LIST)
+        from zdata.build.align_mtx import get_default_gene_list_path
+        gene_list_path = str(get_default_gene_list_path())
     
     if not os.path.exists(gene_list_path):
         raise FileNotFoundError(f"Gene list file not found: {gene_list_path}")
