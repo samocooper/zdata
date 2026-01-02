@@ -28,6 +28,13 @@ This approach provides excellent compression ratios while maintaining fast rando
 
 The easiest way to create a zdata object is from a directory of zarr files or h5ad files:
 
+First check that the directory of zarr files / h5ad files is correct:
+
+```bash
+python -m zdata.build_zzdata.check_directory <path to directory>
+```
+Next build the zdata object
+
 ```python
 from zdata import build_zdata_from_zarr
 
