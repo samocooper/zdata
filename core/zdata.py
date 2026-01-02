@@ -16,6 +16,7 @@ from scipy.sparse import csc_matrix, csr_matrix
 
 from .._settings import settings
 from .index import normalize_column_indices, normalize_row_indices
+from .utils import get_available_memory_bytes
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,6 +41,7 @@ def _get_zdata_read_path() -> str:
         )
     return str(bin_path)
 
+
 def _normalize_indices(
     indices: int | np.integer | Sequence[int] | NDArray[np.integer],
 ) -> list[int]:
@@ -55,34 +57,50 @@ def _normalize_indices(
 
 
 class ObsWrapper:
-    """
+    """\
     Wrapper for polars obs DataFrame that supports indexing like obs[row_index, :].
-    Returns pandas DataFrames for compatibility with anndata/AnnData.
     
-    Usage:
-        sc_atlas.obs[5, :]  # Returns pandas DataFrame for row 5
-        sc_atlas.obs[0:10, :]  # Returns pandas DataFrame for rows 0-9
+    Returns pandas DataFrames for compatibility with anndata/AnnData.
+    This wrapper allows the obs attribute to be indexed like a 2D array while
+    maintaining compatibility with anndata's expected pandas DataFrame interface.
+    
+    Examples
+    --------
+    >>> zdata = ZData("dataset")
+    >>> zdata.obs[5, :]  # Returns pandas DataFrame for row 5
+    >>> zdata.obs[0:10, :]  # Returns pandas DataFrame for rows 0-9
     """
     
     def __init__(self, obs_df: PolarsDataFrame) -> None:
-        """
+        """\
         Initialize the wrapper with a polars DataFrame.
         
-        Args:
-            obs_df: polars DataFrame containing obs/metadata
+        Parameters
+        ----------
+        obs_df
+            Polars DataFrame containing observation metadata.
         """
         self.obs_df: PolarsDataFrame = obs_df
     
     def __getitem__(self, key: tuple[int | slice, slice]) -> pd.DataFrame:
-        """
+        """\
         Support indexing like obs[row_index, :] or obs[slice, :].
         
-        Args:
-            key: Tuple of (row_index or slice, column_slice)
-                 Currently only supports [row_index, :] or [slice, :]
+        Parameters
+        ----------
+        key
+            Tuple of (row_index or slice, column_slice).
+            Currently only supports [row_index, :] or [slice, :].
         
-        Returns:
-            pandas DataFrame with selected rows
+        Returns
+        -------
+        pd.DataFrame
+            Pandas DataFrame with selected rows, indexed by row position.
+        
+        Raises
+        ------
+        ValueError
+            If key format is not supported (must be [row_index, :] or [slice, :]).
         """
         if not isinstance(key, tuple) or len(key) != 2 or key[1] != slice(None):
             raise ValueError("Obs indexing must be in format [row_index, :] or [slice, :]")
@@ -125,18 +143,74 @@ class ObsWrapper:
         return f"ObsWrapper({self.obs_df.shape[0]} rows, {self.obs_df.shape[1]} columns)"
 
 class ZData:
-    """
+    """\
     Efficient reader for zdata directory structure containing .bin files.
     
-    Provides methods to read random sets of rows from the compressed sparse matrix data.
+    ZData provides methods to read random sets of rows or columns from compressed
+    sparse matrix data stored in a disk-based format. The data is organized in
+    chunked files with row-major (X_RM) and column-major (X_CM) orientations for
+    efficient access patterns.
+    
+    The zdata format uses seekable zstd compression to enable random access
+    without full decompression, making it ideal for querying subsets of large
+    single-cell RNA-seq datasets.
+    
+    Parameters
+    ----------
+    dir_name
+        Name or path of the zdata directory. Can be a relative or absolute path.
+        The directory must contain:
+        - metadata.json: Dataset metadata including shape and chunk information
+        - obs.parquet: Observation (cell) metadata
+        - var.parquet: Variable (gene) metadata
+        - X_RM/: Row-major chunk files (.bin)
+        - X_CM/: Column-major chunk files (.bin, optional)
+    
+    Attributes
+    ----------
+    nrows : int
+        Number of rows (cells) in the dataset.
+    ncols : int
+        Number of columns (genes) in the dataset.
+    shape : tuple[int, int]
+        Shape of the dataset (nrows, ncols).
+    obs : ObsWrapper
+        Observation metadata wrapper supporting indexing.
+    
+    Examples
+    --------
+    >>> zdata = ZData("atlas.zdata")
+    >>> print(f"Dataset shape: {zdata.shape}")
+    >>> # Read specific rows
+    >>> rows = zdata.read_rows([0, 100, 200])
+    >>> # Read rows as CSR matrix
+    >>> csr = zdata.read_rows_csr([0, 100, 200])
+    >>> # Index by rows (returns AnnData)
+    >>> adata = zdata[0:100]
+    >>> # Index by gene names (returns CSC matrix)
+    >>> matrix = zdata[['GAPDH', 'PCNA', 'COL1A1']]
     """
     
     def __init__(self, dir_name: str | Path) -> None:
-        """
+        """\
         Initialize the reader for a zdata directory.
         
-        Args:
-            dir_name: Name or path of the zdata directory (e.g., "andrews" or "/path/to/andrews")
+        Parameters
+        ----------
+        dir_name
+            Name or path of the zdata directory.
+            Can be a relative path (e.g., "atlas.zdata") or absolute path
+            (e.g., "/path/to/atlas.zdata").
+        
+        Raises
+        ------
+        FileNotFoundError
+            If the directory or required files (metadata.json, obs.parquet, var.parquet)
+            are not found.
+        ValueError
+            If the path is not a directory or metadata is missing required fields.
+        RuntimeError
+            If parquet files cannot be loaded.
         """
         self.dir_name: str | Path = dir_name
         # Use dir_name directly as path (no .zdata suffix appended)
@@ -289,27 +363,106 @@ class ZData:
     
     def read_rows(
         self, 
-        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer]
+        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
     ) -> list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]:
-        """
+        """\
         Read rows using global indices that span across multiple .bin files.
         
-        Supports:
-        - Integer indices (including negative)
-        - Slices (e.g., slice(0, 100))
-        - Lists/arrays of integers
-        - Boolean arrays (length must match nrows)
+        This method reads rows from the row-major (X_RM) chunk files. Indices are
+        automatically normalized (sorted and deduplicated) for efficient chunk access.
         
-        Args:
-            global_rows: Row index or indices (0-based, relative to full MTX file).
-                        Can be int, slice, list[int], numpy array (int or bool).
+        Parameters
+        ----------
+        global_rows
+            Row index or indices (0-based, relative to full dataset).
+            Supported types:
+            - int: Single row index (supports negative indices, e.g., -1 for last row)
+            - slice: Row slice (e.g., slice(0, 100) or 0:100)
+            - list[int]: List of row indices
+            - numpy.ndarray[int]: Array of row indices
+            - numpy.ndarray[bool]: Boolean mask (length must match nrows)
         
-        Returns:
-            List of (global_row_id, cols, vals) tuples in the same order as global_rows
-            where cols and vals are numpy arrays
+        Returns
+        -------
+        list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]
+            List of (global_row_id, cols, vals) tuples in normalized order.
+            Each tuple contains:
+            - global_row_id: The global row index
+            - cols: numpy array of column indices (uint32)
+            - vals: numpy array of values (uint16)
+            Note: Results are in sorted order, not the original query order.
+            Use read_rows_csr() if you need to preserve order or work with matrices.
+        
+        Raises
+        ------
+        IndexError
+            If any row index is out of bounds [0, nrows).
+        ValueError
+            If boolean mask length doesn't match nrows.
+        MemoryError
+            If estimated memory requirements exceed 80% of available system memory.
+        UserWarning
+            If query size exceeds large_query_threshold (see zdata.settings).
+            If nnz values are missing and memory estimation cannot be performed.
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Read single row
+        >>> rows = zdata.read_rows(5)
+        >>> # Read multiple rows
+        >>> rows = zdata.read_rows([0, 100, 200])
+        >>> # Read slice
+        >>> rows = zdata.read_rows(slice(0, 100))
+        >>> # Read with boolean mask
+        >>> mask = np.array([True] * 1000 + [False] * (zdata.nrows - 1000))
+        >>> rows = zdata.read_rows(mask)
+        >>> # Access row data
+        >>> for row_id, cols, vals in rows:
+        ...     print(f"Row {row_id}: {len(cols)} non-zero values")
         """
         # Normalize indices using the new indexing system
         global_rows = normalize_row_indices(global_rows, self.nrows)
+        
+        # Check memory requirements before querying
+        try:
+            memory_estimate = self.estimate_memory_requirements(row_indices=global_rows)
+            estimated_memory_bytes = memory_estimate['estimated_memory_mb'] * 1024 * 1024
+            available_memory_bytes = get_available_memory_bytes()
+            memory_threshold = 0.8 * available_memory_bytes
+            
+            if estimated_memory_bytes > memory_threshold:
+                error_message = (
+                    f"Query would require {memory_estimate['estimated_memory_gb']:.2f} GB of memory, "
+                    f"which exceeds 80% of available memory ({available_memory_bytes / (1024**3):.2f} GB). "
+                    f"Available: {available_memory_bytes / (1024**3):.2f} GB, "
+                    f"Threshold (80%): {memory_threshold / (1024**3):.2f} GB, "
+                    f"Estimated: {estimated_memory_bytes / (1024**3):.2f} GB. "
+                    f"Please reduce the query size or free up memory."
+                )
+                
+                if settings.override_memory_check:
+                    import warnings
+                    warnings.warn(
+                        f"{error_message} "
+                        f"Proceeding anyway because override_memory_check=True. "
+                        f"This may cause the system to run out of memory.",
+                        UserWarning
+                    )
+                else:
+                    raise MemoryError(
+                        f"{error_message} "
+                        f"Set zdata.settings.override_memory_check = True to override this check."
+                    )
+        except ValueError as e:
+            # If nnz values are missing, we can't estimate memory accurately
+            # In this case, we'll skip the check but warn the user
+            import warnings
+            warnings.warn(
+                f"Cannot estimate memory requirements: {e}. "
+                f"Proceeding with query, but it may fail if insufficient memory is available.",
+                UserWarning
+            )
         
         # Warn on large queries if enabled
         if settings.warn_on_large_queries and len(global_rows) > settings.large_query_threshold:
@@ -362,16 +515,38 @@ class ZData:
     
     def read_rows_csr(
         self, 
-        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer]
+        global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
     ) -> csr_matrix:
-        """
+        """\
         Read rows and return as a scipy.sparse.csr_matrix.
         
-        Args:
-            global_rows: List or array of global row indices (0-based)
+        This is a convenience method that calls read_rows() and converts the result
+        to a CSR matrix. The matrix rows are in normalized (sorted) order.
         
-        Returns:
-            scipy.sparse.csr_matrix of shape (len(global_rows), ncols)
+        Parameters
+        ----------
+        global_rows
+            Row index or indices. See read_rows() for supported types.
+        
+        Returns
+        -------
+        csr_matrix
+            Compressed Sparse Row matrix of shape (n_selected_rows, ncols).
+            Rows are in sorted order (not original query order).
+            Dtype is float64.
+        
+        See Also
+        --------
+        read_rows : Read rows as raw tuples
+        read_rows_rm_csr : Alias for this method
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Read rows as CSR matrix
+        >>> csr = zdata.read_rows_csr([0, 100, 200])
+        >>> print(f"Matrix shape: {csr.shape}")
+        >>> print(f"Non-zero elements: {csr.nnz}")
         """
         rows_data = self.read_rows(global_rows)
         return self._rows_to_csr(rows_data)
@@ -380,15 +555,25 @@ class ZData:
         self, 
         global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
     ) -> list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]:
-        """
+        """\
         Read rows from X_RM (row-major) files.
-        This is an alias for read_rows() for clarity.
         
-        Args:
-            global_rows: List or array of global row indices (0-based)
+        This is an alias for read_rows() for clarity. Both methods read from
+        the row-major chunk files.
         
-        Returns:
-            List of (global_row_id, cols, vals) tuples
+        Parameters
+        ----------
+        global_rows
+            Row index or indices. See read_rows() for supported types.
+        
+        Returns
+        -------
+        list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]
+            List of (global_row_id, cols, vals) tuples. See read_rows() for details.
+        
+        See Also
+        --------
+        read_rows : Same functionality, this is an alias
         """
         return self.read_rows(global_rows)
     
@@ -396,25 +581,51 @@ class ZData:
         self, 
         global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
     ) -> csr_matrix:
-        """
+        """\
         Read rows from X_RM (row-major) files and return as CSR matrix.
         
-        Args:
-            global_rows: List or array of global row indices (0-based)
+        This is an alias for read_rows_csr() for clarity. Both methods read from
+        the row-major chunk files and return CSR matrices.
         
-        Returns:
-            scipy.sparse.csr_matrix of shape (len(global_rows), ncols)
+        Parameters
+        ----------
+        global_rows
+            Row index or indices. See read_rows() for supported types.
+        
+        Returns
+        -------
+        csr_matrix
+            Compressed Sparse Row matrix. See read_rows_csr() for details.
+        
+        See Also
+        --------
+        read_rows_csr : Same functionality, this is an alias
         """
         return self.read_rows_csr(global_rows)
     
     def _build_cm_chunk_mapping(
         self
     ) -> tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int]]:
-        """
+        """\
         Build chunk mapping for X_CM (column-major) files from metadata.
         
-        Returns:
-            (cm_chunk_files, cm_chunk_info, cm_file_to_chunk) tuple
+        This is an internal method that constructs the mapping between column
+        indices and chunk files for column-major access.
+        
+        Returns
+        -------
+        tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int]]
+            Tuple containing:
+            - cm_chunk_files: Mapping from chunk number to file path
+            - cm_chunk_info: Mapping from chunk number to chunk metadata
+            - cm_file_to_chunk: Reverse mapping from file path to chunk number
+        
+        Raises
+        ------
+        FileNotFoundError
+            If X_CM directory doesn't exist.
+        ValueError
+            If metadata is missing required 'chunks_cm' field.
         """
         xcm_dir = os.path.join(self.dir_path, "X_CM")
         if not os.path.exists(xcm_dir):
@@ -456,23 +667,63 @@ class ZData:
         self, 
         global_cols: int | np.integer | Sequence[int] | Sequence[str] | NDArray[np.integer] | NDArray[np.bool_] | slice | str
     ) -> list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]:
-        """
+        """\
         Read columns (genes) from X_CM (column-major) files.
-        In X_CM files, rows represent genes (columns in original matrix).
         
-        Supports:
-        - Integer indices (including negative)
-        - Gene names (strings) - requires gene names to be loaded
-        - Slices (e.g., slice(0, 100) or slice('GAPDH', 'PCNA'))
-        - Lists/arrays of integers or gene names
-        - Boolean arrays (length must match ncols)
+        This method reads genes from the column-major (X_CM) chunk files. In X_CM
+        files, rows represent genes (columns in the original matrix). Indices are
+        automatically normalized (sorted and deduplicated) for efficient chunk access.
         
-        Args:
-            global_cols: Column (gene) index or indices (0-based).
-                        Can be int, str, slice, list[int|str], numpy array (int or bool).
+        Parameters
+        ----------
+        global_cols
+            Column (gene) index or indices (0-based).
+            Supported types:
+            - int: Single column index (supports negative indices)
+            - str: Single gene name (requires gene names in var.parquet)
+            - slice: Column slice (supports integer or string bounds)
+            - list[int]: List of column indices
+            - list[str]: List of gene names
+            - numpy.ndarray[int]: Array of column indices
+            - numpy.ndarray[bool]: Boolean mask (length must match ncols)
         
-        Returns:
-            List of (global_col_id, rows, vals) tuples where rows are cell indices
+        Returns
+        -------
+        list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]
+            List of (global_col_id, rows, vals) tuples in normalized order.
+            Each tuple contains:
+            - global_col_id: The global column (gene) index
+            - rows: numpy array of row (cell) indices (uint32)
+            - vals: numpy array of values (uint16)
+            Note: Results are in sorted order, not the original query order.
+        
+        Raises
+        ------
+        IndexError
+            If any column index is out of bounds or gene name not found.
+        ValueError
+            If boolean mask length doesn't match ncols or gene names not available.
+        MemoryError
+            If estimated memory requirements exceed 80% of available system memory.
+        FileNotFoundError
+            If X_CM directory doesn't exist.
+        UserWarning
+            If nnz values are missing and memory estimation cannot be performed.
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Read by gene name
+        >>> cols = zdata.read_cols_cm('GAPDH')
+        >>> # Read multiple genes
+        >>> cols = zdata.read_cols_cm(['GAPDH', 'PCNA', 'COL1A1'])
+        >>> # Read by index
+        >>> cols = zdata.read_cols_cm([0, 100, 200])
+        >>> # Read slice of gene names
+        >>> cols = zdata.read_cols_cm(slice('GAPDH', 'PCNA'))
+        >>> # Access column data
+        >>> for col_id, rows, vals in cols:
+        ...     print(f"Gene {col_id}: {len(rows)} non-zero cells")
         """
         # Get gene names if available
         gene_names = None
@@ -481,6 +732,49 @@ class ZData:
         
         # Normalize indices using the new indexing system
         global_cols = normalize_column_indices(global_cols, self.ncols, gene_names)
+        
+        if not global_cols:
+            raise ValueError("Empty selection: no columns selected")
+        
+        # Check memory requirements before querying
+        try:
+            memory_estimate = self.estimate_memory_requirements(column_indices=global_cols)
+            estimated_memory_bytes = memory_estimate['estimated_memory_mb'] * 1024 * 1024
+            available_memory_bytes = get_available_memory_bytes()
+            memory_threshold = 0.8 * available_memory_bytes
+            
+            if estimated_memory_bytes > memory_threshold:
+                error_message = (
+                    f"Query would require {memory_estimate['estimated_memory_gb']:.2f} GB of memory, "
+                    f"which exceeds 80% of available memory ({available_memory_bytes / (1024**3):.2f} GB). "
+                    f"Available: {available_memory_bytes / (1024**3):.2f} GB, "
+                    f"Threshold (80%): {memory_threshold / (1024**3):.2f} GB, "
+                    f"Estimated: {estimated_memory_bytes / (1024**3):.2f} GB. "
+                    f"Please reduce the query size or free up memory."
+                )
+                
+                if settings.override_memory_check:
+                    import warnings
+                    warnings.warn(
+                        f"{error_message} "
+                        f"Proceeding anyway because override_memory_check=True. "
+                        f"This may cause the system to run out of memory.",
+                        UserWarning
+                    )
+                else:
+                    raise MemoryError(
+                        f"{error_message} "
+                        f"Set zdata.settings.override_memory_check = True to override this check."
+                    )
+        except ValueError as e:
+            # If nnz values are missing, we can't estimate memory accurately
+            # In this case, we'll skip the check but warn the user
+            import warnings
+            warnings.warn(
+                f"Cannot estimate memory requirements: {e}. "
+                f"Proceeding with query, but it may fail if insufficient memory is available.",
+                UserWarning
+            )
         
         # Build X_CM chunk mapping
         cm_chunk_files, cm_chunk_info, cm_file_to_chunk = self._build_cm_chunk_mapping()
@@ -541,7 +835,39 @@ class ZData:
         self, 
         global_cols: int | np.integer | Sequence[int] | Sequence[str] | NDArray[np.integer] | NDArray[np.bool_] | slice | str
     ) -> csr_matrix:
-        """Read columns (genes) from X_CM files and return as CSR matrix."""
+        """\
+        Read columns (genes) from X_CM files and return as CSR matrix.
+        
+        This is a convenience method that calls read_cols_cm() and converts the result
+        to a CSR matrix. The matrix rows correspond to genes (columns in original matrix).
+        
+        Parameters
+        ----------
+        global_cols
+            Column (gene) index or indices. See read_cols_cm() for supported types.
+        
+        Returns
+        -------
+        csr_matrix
+            Compressed Sparse Row matrix of shape (n_selected_genes, nrows).
+            Rows correspond to genes, columns to cells.
+            Rows are in sorted order (not original query order).
+            Dtype is float64.
+            Note: To get (n_cells, n_genes) shape, transpose the result.
+        
+        See Also
+        --------
+        read_cols_cm : Read columns as raw tuples
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Read genes as CSR matrix
+        >>> csr = zdata.read_cols_cm_csr(['GAPDH', 'PCNA'])
+        >>> print(f"Matrix shape: {csr.shape}")  # (2, n_cells)
+        >>> # Transpose to get (n_cells, n_genes) shape
+        >>> csc = csr.T.tocsc()
+        """
         cols_data = self.read_cols_cm(global_cols)
         
         row_indices: list[int] = []
@@ -559,7 +885,23 @@ class ZData:
         self, 
         rows_data: list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]
     ) -> csr_matrix:
-        """Convert rows data into a scipy.sparse.csr_matrix."""
+        """\
+        Convert rows data into a scipy.sparse.csr_matrix.
+        
+        This is an internal method that converts the raw row data format
+        (list of tuples) into a CSR matrix.
+        
+        Parameters
+        ----------
+        rows_data
+            List of (row_id, cols, vals) tuples from read_rows().
+        
+        Returns
+        -------
+        csr_matrix
+            Compressed Sparse Row matrix of shape (len(rows_data), ncols).
+            Dtype is float64.
+        """
         row_indices: list[int] = []
         col_indices: list[int] = []
         values: list[float] = []
@@ -572,18 +914,180 @@ class ZData:
     
     @property
     def num_columns(self) -> int:
+        """\
+        Number of columns (genes) in the dataset.
+        
+        Returns
+        -------
+        int
+            Number of columns.
+        """
         return self.ncols
     
     @property
     def num_rows(self) -> int:
+        """\
+        Number of rows (cells) in the dataset.
+        
+        Returns
+        -------
+        int
+            Number of rows.
+        """
         return self.nrows
     
     @property
     def shape(self) -> tuple[int, int]:
+        """\
+        Shape of the dataset.
+        
+        Returns
+        -------
+        tuple[int, int]
+            Shape as (nrows, ncols).
+        """
         return (self.nrows, self.ncols)
     
     def get_random_rows(self, n: int, seed: int | None = None) -> list[int]:
-        """Get n random row indices that are valid for this dataset."""
+        """\
+        Get n random row indices that are valid for this dataset.
+        
+        Parameters
+        ----------
+        n
+            Number of random row indices to generate.
+        seed
+            Random seed for reproducibility. If None, uses current random state.
+        
+        Returns
+        -------
+        list[int]
+            List of n random row indices in range [0, nrows).
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> random_rows = zdata.get_random_rows(10, seed=42)
+        >>> data = zdata.read_rows(random_rows)
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        return np.random.choice(self.nrows, size=min(n, self.nrows), replace=False).tolist()
+    
+    def estimate_memory_requirements(
+        self,
+        row_indices: list[int] | None = None,
+        column_indices: list[int] | None = None,
+    ) -> dict[str, float]:
+        """\
+        Estimate memory requirements for a query based on nnz values.
+        
+        Requires 'nnz' columns in obs (for rows) and var (for columns) DataFrames.
+        These are calculated during zdata build and stored in the parquet files.
+        
+        Parameters
+        ----------
+        row_indices
+            Optional list of row indices to query. If None, estimates for all rows.
+        column_indices
+            Optional list of column indices to query. If None, estimates for all columns.
+        
+        Returns
+        -------
+        dict[str, float]
+            Dictionary with memory estimates:
+            - 'estimated_nnz': Estimated number of non-zero values
+            - 'estimated_memory_mb': Estimated memory in MB (assuming float64)
+            - 'estimated_memory_gb': Estimated memory in GB
+            - 'has_row_nnz': Whether row nnz values are available (always True if row query)
+            - 'has_column_nnz': Whether column nnz values are available (always True if column query)
+        
+        Raises
+        ------
+        ValueError
+            If nnz columns are missing from obs or var DataFrames, or if indices are invalid.
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Estimate for specific rows
+        >>> estimate = zdata.estimate_memory_requirements(row_indices=[0, 100, 200])
+        >>> print(f"Estimated memory: {estimate['estimated_memory_mb']:.2f} MB")
+        >>> # Estimate for specific genes
+        >>> estimate = zdata.estimate_memory_requirements(column_indices=[0, 10, 20])
+        >>> print(f"Estimated memory: {estimate['estimated_memory_gb']:.2f} GB")
+        """
+        import numpy as np
+        
+        has_row_nnz = False
+        has_column_nnz = False
+        estimated_nnz = 0
+        
+        # Estimate based on row query
+        if row_indices is not None:
+            if not (hasattr(self, '_obs_df') and 'nnz' in self._obs_df.columns):
+                raise ValueError("Row nnz values are required but not found in obs DataFrame. Please rebuild zdata with nnz tracking enabled.")
+            
+            has_row_nnz = True
+            # Get nnz values for requested rows
+            obs_nnz = self._obs_df.select(['nnz']).to_numpy().flatten()
+            if len(obs_nnz) == 0:
+                raise ValueError("obs DataFrame has no nnz values. Please rebuild zdata with nnz tracking enabled.")
+            
+            # Sum nnz for requested rows
+            valid_indices = [i for i in row_indices if 0 <= i < len(obs_nnz)]
+            if not valid_indices:
+                raise ValueError(f"All row indices are out of bounds. Valid range: [0, {len(obs_nnz)})")
+            
+            estimated_nnz = int(np.sum(obs_nnz[valid_indices]))
+        
+        # Estimate based on column query
+        elif column_indices is not None:
+            if not (hasattr(self, '_var_df') and 'nnz' in self._var_df.columns):
+                raise ValueError("Column nnz values are required but not found in var DataFrame. Please rebuild zdata with nnz tracking enabled.")
+            
+            has_column_nnz = True
+            # Get nnz values for requested columns
+            var_nnz = self._var_df['nnz'].values
+            if len(var_nnz) == 0:
+                raise ValueError("var DataFrame has no nnz values. Please rebuild zdata with nnz tracking enabled.")
+            
+            # Sum nnz for requested columns
+            valid_indices = [i for i in column_indices if 0 <= i < len(var_nnz)]
+            if not valid_indices:
+                raise ValueError(f"All column indices are out of bounds. Valid range: [0, {len(var_nnz)})")
+            
+            estimated_nnz = int(np.sum(var_nnz[valid_indices]))
+        
+        # Estimate for full dataset if no indices provided
+        else:
+            if self.nnz_total is not None:
+                estimated_nnz = self.nnz_total
+            else:
+                raise ValueError("Total nnz is not available. Please rebuild zdata with nnz tracking enabled.")
+        
+        # Calculate memory requirements (assuming float64 for values, int32 for indices)
+        # CSR format: data (float64), indices (int32), indptr (int32)
+        # Rough estimate: nnz * (8 bytes + 4 bytes) + (nrows+1) * 4 bytes
+        bytes_per_nnz = 12  # 8 bytes (float64) + 4 bytes (int32 index)
+        estimated_bytes = estimated_nnz * bytes_per_nnz
+        
+        # Add overhead for indptr (for row queries) or similar structures
+        if row_indices is not None:
+            estimated_bytes += (len(row_indices) + 1) * 4  # indptr overhead
+        elif column_indices is not None:
+            estimated_bytes += (len(column_indices) + 1) * 4  # indptr overhead for transposed
+        
+        estimated_memory_mb = estimated_bytes / (1024 * 1024)
+        estimated_memory_gb = estimated_memory_mb / 1024
+        
+        return {
+            'estimated_nnz': estimated_nnz,
+            'estimated_memory_mb': estimated_memory_mb,
+            'estimated_memory_gb': estimated_memory_gb,
+            'has_row_nnz': has_row_nnz,
+            'has_column_nnz': has_column_nnz,
+        }
         if seed is not None:
             np.random.seed(seed)
         return np.random.randint(0, self.nrows, size=n).tolist()
@@ -613,31 +1117,68 @@ class ZData:
         self, 
         key: slice | int | list[int] | list[str] | str | NDArray[np.integer] | NDArray[np.bool_]
     ) -> ad.AnnData | csc_matrix:
-        """
+        """\
         Support indexing by rows (returns AnnData) or columns/genes (returns CSC matrix).
         
-        Row-major queries (returns AnnData):
-        - Integer: zdata[5] -> AnnData with single row
-        - Slice: zdata[5:10] -> AnnData with rows 5-9
-        - List of integers: zdata[[0, 5, 10]] -> AnnData with specified rows
-        - Boolean array: zdata[mask] -> AnnData with rows where mask is True
-        - Negative indices: zdata[-1] -> Last row
+        This method provides convenient indexing syntax for querying rows or columns.
+        The method automatically determines whether the query is row-major or column-major
+        based on the key type.
         
-        Column-major queries (returns CSC matrix):
-        - Gene name: zdata['GAPDH'] -> CSC matrix with single gene
-        - List of gene names: zdata[['GAPDH', 'PCNA']] -> CSC matrix with specified genes
-        - Slice of gene names: zdata['GAPDH':'PCNA'] -> CSC matrix with genes in range
-        - Integer column index: zdata[0] when used as column query (not recommended)
+        Parameters
+        ----------
+        key
+            Row or column index/indices. The type determines the query mode:
+            
+            **Row-major queries** (returns AnnData):
+            - int: Single row index (e.g., zdata[5])
+            - slice: Row slice (e.g., zdata[5:10])
+            - list[int]: List of row indices (e.g., zdata[[0, 5, 10]])
+            - numpy.ndarray[int]: Array of row indices
+            - numpy.ndarray[bool]: Boolean mask (e.g., zdata[mask])
+            
+            **Column-major queries** (returns CSC matrix):
+            - str: Single gene name (e.g., zdata['GAPDH'])
+            - list[str]: List of gene names (e.g., zdata[['GAPDH', 'PCNA']])
+            - slice with string bounds: Gene name slice (e.g., zdata['GAPDH':'PCNA'])
         
-        Note: zdata uses disk-based storage, so arbitrary 2D indexing is not supported.
-        You can either query rows OR columns, not both simultaneously.
+        Returns
+        -------
+        AnnData or csc_matrix
+            - For row queries: AnnData object with:
+              - X: CSR matrix of shape (n_selected_rows, ncols)
+              - obs: Observation metadata for selected rows
+              - var: Variable metadata (all genes)
+            - For column queries: CSC matrix of shape (n_cells, n_selected_genes)
+              with expression values for selected genes
         
-        Args:
-            key: Row index/indices or column (gene) index/indices
+        Raises
+        ------
+        IndexError
+            If indices are out of bounds or gene names not found.
+        ValueError
+            If boolean mask length doesn't match or empty selection.
+        TypeError
+            If key type is not supported.
         
-        Returns:
-            - For row queries: AnnData object with X (CSR), obs, and var
-            - For column queries: CSC matrix of shape (n_cells, n_genes) with expression values
+        Notes
+        -----
+        - zdata uses disk-based storage, so arbitrary 2D indexing is not supported.
+          You can either query rows OR columns, not both simultaneously.
+        - Row queries preserve the original query order (unlike read_rows() which sorts).
+        - Column queries return results in sorted order.
+        - Negative indices are supported for row queries (e.g., zdata[-1] for last row).
+        
+        Examples
+        --------
+        >>> zdata = ZData("dataset")
+        >>> # Row queries (return AnnData)
+        >>> adata = zdata[5:10]  # Rows 5-9
+        >>> adata = zdata[[0, 100, 200]]  # Specific rows
+        >>> adata = zdata[-1]  # Last row
+        >>> # Column queries (return CSC matrix)
+        >>> matrix = zdata['GAPDH']  # Single gene
+        >>> matrix = zdata[['GAPDH', 'PCNA', 'COL1A1']]  # Multiple genes
+        >>> matrix = zdata['GAPDH':'PCNA']  # Gene range
         """
         # Determine if this is a row query or column query
         # Strategy: if key is a string or list of strings, it's a column query

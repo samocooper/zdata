@@ -153,6 +153,9 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     output_files = []
     manifest_data = []
     
+    # Initialize column nnz accumulator (will accumulate across all MTX files)
+    column_nnz_accumulator = np.zeros(n_new_cols, dtype=np.uint32)
+    
     current_chunk_rows = []
     current_chunk_zarrs = []  # Track which zarr files contributed to current chunk
     current_row_start = 0
@@ -253,6 +256,15 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                 current_chunk_rows = []
                 current_chunk_zarrs = []
             
+            # Calculate row nnz (number of non-zeros per row) from CSR indptr
+            # indptr[i+1] - indptr[i] gives nnz for row i
+            row_nnz = np.diff(matrix_to_write.indptr).astype(np.uint32)
+            
+            # Calculate column nnz directly from CSR matrix (no transposition needed)
+            # Use getnnz(axis=0) which efficiently counts non-zeros per column
+            column_nnz_chunk = matrix_to_write.getnnz(axis=0).astype(np.uint32)
+            column_nnz_accumulator += column_nnz_chunk
+            
             # Write MTX file
             row_end = current_row_start + matrix_to_write.shape[0] - 1
             chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
@@ -261,6 +273,10 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
             mmwrite(chunk_output_path, matrix_to_write)
             print(f"  ✓ {matrix_to_write.shape[0]} rows × {n_new_cols} cols, {matrix_to_write.nnz} non-zeros")
+            
+            # Write row nnz to temporary file (will be merged into obs.parquet later)
+            row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
+            np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
             
             # Record in manifest
             manifest_data.append({
@@ -288,9 +304,20 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
         output_files.append(chunk_output_path)
         
+        # Calculate row nnz (number of non-zeros per row) from CSR indptr
+        row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
+        
+        # Calculate column nnz directly from CSR matrix (no transposition needed)
+        column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
+        column_nnz_accumulator += column_nnz_chunk
+        
         print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
         mmwrite(chunk_output_path, combined_matrix)
         print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
+        
+        # Write row nnz to temporary file (will be merged into obs.parquet later)
+        row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
+        np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
         
         # Record in manifest
         manifest_data.append({
@@ -304,6 +331,11 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         
         del combined_matrix
     
+    # Write column nnz to file (accumulated across all MTX files)
+    column_nnz_path = os.path.join(output_dir, "column_nnz.txt")
+    np.savetxt(column_nnz_path, column_nnz_accumulator, fmt='%u', delimiter='\n')
+    print(f"  ✓ Column nnz saved to {os.path.basename(column_nnz_path)}")
+    
     # Write manifest file
     manifest_path = os.path.join(output_dir, "manifest.json")
     manifest = {
@@ -313,7 +345,8 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         'zarr_files_order': [f.name for f in zarr_files],
         'mtx_files': manifest_data,
         'total_mtx_files': len(output_files),
-        'chunk_size': chunk_size
+        'chunk_size': chunk_size,
+        'column_nnz_file': 'column_nnz.txt'
     }
     
     with open(manifest_path, 'w') as f:

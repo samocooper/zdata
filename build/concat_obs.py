@@ -225,7 +225,8 @@ def concat_obs_from_zarr_directory(
     join_strategy: str = "outer",
     join_on: Optional[List[str]] = None,
     output_filename: str = "obs.parquet",
-    zarr_files_filter: Optional[set] = None
+    zarr_files_filter: Optional[set] = None,
+    row_nnz_files: Optional[List[str]] = None
 ):
     """
     Read obs data from all zarr files in a directory, join them, and save to parquet.
@@ -236,6 +237,9 @@ def concat_obs_from_zarr_directory(
         join_strategy: One of "inner", "outer", or "columns"
         join_on: If join_strategy is "columns", list of column names to join on
         output_filename: Name of output parquet file
+        zarr_files_filter: Optional set of zarr file names to process (filters available files)
+        row_nnz_files: Optional list of text files containing row nnz values (one per line)
+                      These will be merged into the obs DataFrame as an 'nnz' column
     
     Returns:
         Path to created parquet file
@@ -291,6 +295,33 @@ def concat_obs_from_zarr_directory(
     combined_df = concat_obs_dataframes(dataframes, join_strategy, join_on)
     
     print(f"  ✓ Combined DataFrame: {combined_df.height} rows × {len(combined_df.columns)} columns")
+    
+    # Add row nnz (number of non-zeros per row/cell) - required
+    if not row_nnz_files:
+        raise ValueError(
+            "row_nnz_files must be provided. Row nnz values are required for obs DataFrame."
+        )
+    
+    print(f"\nLoading row nnz values from {len(row_nnz_files)} file(s)...")
+    all_row_nnz = []
+    for nnz_file in sorted(row_nnz_files):
+        if not os.path.exists(nnz_file):
+            raise FileNotFoundError(f"Row nnz file not found: {nnz_file}")
+        
+        nnz_values = np.loadtxt(nnz_file, dtype=np.uint32)
+        all_row_nnz.extend(nnz_values.tolist())
+        print(f"  ✓ Loaded {len(nnz_values)} nnz values from {os.path.basename(nnz_file)}")
+    
+    if len(all_row_nnz) != combined_df.height:
+        raise ValueError(
+            f"Row nnz count ({len(all_row_nnz)}) doesn't match obs rows ({combined_df.height}). "
+            f"This indicates a mismatch in the alignment process."
+        )
+    
+    combined_df = combined_df.with_columns([
+        pl.Series("nnz", all_row_nnz, dtype=pl.UInt32)
+    ])
+    print(f"  ✓ Added nnz column to obs DataFrame ({len(all_row_nnz)} values)")
     
     # Add explicit integer index column to prevent pandas from inferring string index
     # This ensures clean conversion to pandas without ImplicitModificationWarning
@@ -351,6 +382,13 @@ def main():
         default='obs.parquet',
         help='Name of output parquet file. Default: obs.parquet'
     )
+    parser.add_argument(
+        '--row-nnz-files',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Optional list of row nnz text files to merge into obs DataFrame'
+    )
     
     args = parser.parse_args()
     
@@ -375,7 +413,8 @@ def main():
             args.output_dir,
             args.join_strategy,
             args.join_on,
-            args.output_filename
+            args.output_filename,
+            row_nnz_files=args.row_nnz_files
         )
         print(f"\n✓ Concatenation complete!")
         print(f"  Output file: {output_path}")
