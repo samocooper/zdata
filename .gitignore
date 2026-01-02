@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.zdata_env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Compiled C binaries (excluded from git, but may be included in distribution)
+# Note: Pre-compiled binaries can be included in the package distribution
+# but should not be committed to git
+ctools/mtx_to_zdata
+ctools/zdata_read
+
+# Important: files/2ks10c_genes.txt should NEVER be deleted or ignored
+# This is the default gene list used for alignment
+
+# Distribution
+*.tar.gz
+*.whl
+
+# OS
+.DS_Store
+Thumbs.db
+

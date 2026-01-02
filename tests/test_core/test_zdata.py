@@ -49,7 +49,6 @@ class TestReadRows:
 
     def test_read_single_row(self, zdata_instance: ZData):
         """Test reading a single row."""
-        # Use first available row
         test_row = min(0, zdata_instance.nrows - 1)
         rows = zdata_instance.read_rows(test_row)
         assert len(rows) == 1
@@ -60,7 +59,6 @@ class TestReadRows:
 
     def test_read_multiple_rows(self, zdata_instance: ZData, sample_row_indices: list[int]):
         """Test reading multiple rows."""
-        # Filter indices to valid range
         valid_indices = [i for i in sample_row_indices if i < zdata_instance.nrows]
         if not valid_indices:
             pytest.skip("No valid row indices for this dataset")
@@ -70,7 +68,6 @@ class TestReadRows:
 
     def test_read_rows_with_slice(self, zdata_instance: ZData):
         """Test reading rows with a slice."""
-        # Use smaller slice for faster testing
         n_rows = min(5, zdata_instance.nrows)
         rows = zdata_instance.read_rows(slice(0, n_rows))
         assert len(rows) == n_rows
@@ -86,7 +83,6 @@ class TestReadRows:
         self, zdata_instance: ZData, sample_boolean_mask: np.ndarray
     ):
         """Test reading rows with boolean mask."""
-        # Adjust mask size to match dataset
         if len(sample_boolean_mask) > zdata_instance.nrows:
             mask = sample_boolean_mask[: zdata_instance.nrows]
         else:
@@ -104,9 +100,7 @@ class TestReadRows:
 
     def test_read_rows_csr(self, zdata_instance: ZData):
         """Test reading rows as CSR matrix."""
-        # Use smaller set of indices for faster testing
         indices = [0, min(5, zdata_instance.nrows - 1)]
-        # Filter to valid range
         valid_indices = [i for i in indices if i < zdata_instance.nrows]
         if not valid_indices:
             pytest.skip("No valid row indices for this dataset")
@@ -122,9 +116,7 @@ class TestReadColumns:
 
     def test_read_cols_by_index(self, zdata_instance: ZData):
         """Test reading columns by integer index."""
-        # Use smaller set of indices for faster testing
         indices = [0, min(5, zdata_instance.ncols - 1)]
-        # Filter to valid range
         valid_indices = [i for i in indices if i < zdata_instance.ncols]
         if not valid_indices:
             pytest.skip("No valid column indices for this dataset")
@@ -134,20 +126,16 @@ class TestReadColumns:
 
     def test_read_cols_by_gene_name(self, zdata_instance: ZData):
         """Test reading columns by gene name."""
-        # Check if gene names are available
         if not hasattr(zdata_instance, "_var_df") or "gene" not in zdata_instance._var_df.columns:
             pytest.skip("Gene names not available in var.parquet")
 
-        # Get first few gene names
         gene_names = zdata_instance._var_df["gene"].head(3).tolist()
         cols = zdata_instance.read_cols_cm(gene_names)
         assert len(cols) == len(gene_names)
 
     def test_read_cols_cm_csr(self, zdata_instance: ZData):
         """Test reading columns as CSR matrix."""
-        # Use smaller set of indices for faster testing
         indices = [0, min(5, zdata_instance.ncols - 1)]
-        # Filter to valid range
         valid_indices = [i for i in indices if i < zdata_instance.ncols]
         if not valid_indices:
             pytest.skip("No valid column indices for this dataset")
@@ -169,7 +157,6 @@ class TestIndexing:
 
     def test_index_row_slice(self, zdata_instance: ZData):
         """Test indexing with row slice."""
-        # Use smaller slice for faster testing
         n_rows = min(5, zdata_instance.nrows)
         adata = zdata_instance[0:n_rows]
         assert adata.shape[0] == n_rows
@@ -177,7 +164,6 @@ class TestIndexing:
 
     def test_index_row_list(self, zdata_instance: ZData):
         """Test indexing with list of row indices."""
-        # Use smaller set of indices for faster testing
         indices = [0, min(5, zdata_instance.nrows - 1)]
         valid_indices = [i for i in indices if i < zdata_instance.nrows]
         if not valid_indices:
@@ -188,11 +174,9 @@ class TestIndexing:
 
     def test_index_by_gene_names(self, zdata_instance: ZData):
         """Test indexing by gene names."""
-        # Check if gene names are available
         if not hasattr(zdata_instance, "_var_df") or "gene" not in zdata_instance._var_df.columns:
             pytest.skip("Gene names not available in var.parquet")
 
-        # Get first few gene names
         gene_names = zdata_instance._var_df["gene"].head(3).tolist()
         matrix = zdata_instance[gene_names]
         assert isinstance(matrix, csc_matrix)
@@ -200,7 +184,6 @@ class TestIndexing:
 
     def test_index_by_single_gene_name(self, zdata_instance: ZData):
         """Test indexing by single gene name."""
-        # Check if gene names are available
         if not hasattr(zdata_instance, "_var_df") or "gene" not in zdata_instance._var_df.columns:
             pytest.skip("Gene names not available in var.parquet")
 
@@ -211,7 +194,6 @@ class TestIndexing:
 
     def test_get_random_rows(self, zdata_instance: ZData):
         """Test get_random_rows method."""
-        # Use smaller number for faster testing
         n_rows = min(5, zdata_instance.nrows)
         random_rows = zdata_instance.get_random_rows(n_rows, seed=42)
         assert len(random_rows) == n_rows

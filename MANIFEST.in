@@ -1,0 +1,30 @@
+# Include C source files
+include ctools/*.c
+
+# Include README and LICENSE
+include README.md
+include LICENSE
+
+# Include default gene list (required for alignment)
+include files/2ks10c_genes.txt
+
+# Include package data
+recursive-include core *.py
+recursive-include build *.py
+recursive-include ctools *.c
+
+# Include pre-compiled binaries if they exist (for fallback)
+# Platform-specific binaries
+include ctools/mtx_to_zdata
+include ctools/mtx_to_zdata.exe
+include ctools/zdata_read
+include ctools/zdata_read.exe
+
+# Exclude compiled binaries from git (but include in distribution)
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude *.so
+global-exclude *.dylib
+global-exclude *.dll
+

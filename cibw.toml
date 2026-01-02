@@ -1,0 +1,43 @@
+# cibuildwheel configuration for building wheels on multiple platforms
+
+[build]
+# Build wheels for all platforms
+# This will build for: Linux (manylinux), macOS (universal2), Windows
+# You can restrict to specific platforms if needed
+before-all = "pip install -U pip setuptools wheel"
+
+# For Linux builds in Docker, build ZSTD inside the container
+[build.linux]
+before-build = """
+  # Build ZSTD from source inside Docker container
+  if [ -z "$ZSTD_BASE" ] || [ ! -d "$ZSTD_BASE" ]; then
+    echo "Building ZSTD from source..."
+    git clone --depth 1 https://github.com/facebook/zstd.git /tmp/zstd || true
+    cd /tmp/zstd
+    make -j$(nproc)
+    export ZSTD_BASE=/tmp/zstd
+  fi
+  echo "ZSTD_BASE=$ZSTD_BASE"
+"""
+
+# For macOS builds
+[build.macos]
+# ZSTD_BASE should be set by CI workflow
+
+# For Windows builds
+[build.windows]
+# ZSTD_BASE should be set by CI workflow
+
+# Build options
+[build.options]
+# Build options for all platforms
+build-verbosity = 1
+
+# Test command (optional - runs after wheel is built)
+[test]
+# Skip tests during wheel building - run separately
+command = ""
+
+# Test requirements (optional)
+requires = []
+

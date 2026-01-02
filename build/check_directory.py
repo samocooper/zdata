@@ -1,129 +1,155 @@
+#!/usr/bin/env python3
+"""
+Check zarr directory structure and gene/obs consistency.
+
+This utility script checks:
+- Common genes across datasets
+- Obs column structure and consistency
+- Generates CSV report of obs columns
+"""
+
 import os
+import sys
 import zarr
 import csv
+import argparse
+from pathlib import Path
 
-#### VAR CHECKS ####
 
-# Identify the number of common genes across datasets    
-# Flag any datasets where either no genes are detected,  
-# or the number of common genes is below 10,000          
-
-zarr_dir = '/home/ubuntu/zarr_work/zarr_datasets'
-zarr_files = [f for f in os.listdir(zarr_dir) if os.path.isdir(os.path.join(zarr_dir, f)) and f.endswith('.zarr')]
-
-common_genes = set()
-for i, zarr_file in enumerate(zarr_files):
-    zarr_path = os.path.join(zarr_dir, zarr_file)
+def check_zarr_directory(zarr_dir: str):
+    """
+    Check zarr directory structure and gene/obs consistency.
     
-    # Open zarr group in read-only mode for memory efficiency
-    zarr_group = zarr.open(zarr_path, mode='r')
+    Args:
+        zarr_dir: Path to directory containing .zarr files
+    """
+    zarr_dir_path = Path(zarr_dir)
+    if not zarr_dir_path.exists():
+        raise FileNotFoundError(f"Zarr directory not found: {zarr_dir}")
     
-    # Access the var/gene array directly - zarr only loads data when accessed
-    if 'var' in zarr_group and 'gene' in zarr_group['var']:
-        gene_array = zarr_group['var']['gene']
-        # Read the gene names - zarr arrays are lazy, only loads when indexed
-        gene_values = gene_array[:]  # This reads the full array, but it's just gene names (small)        
-        outstring = f"Checking {zarr_file} - Number of genes: {len(gene_values)}"
+    if not zarr_dir_path.is_dir():
+        raise ValueError(f"Path is not a directory: {zarr_dir}")
+    
+    zarr_files = sorted([f for f in zarr_dir_path.iterdir() if f.is_dir() and f.name.endswith('.zarr')])
+    
+    if not zarr_files:
+        print(f"No .zarr files found in {zarr_dir}")
+        return
+    
+    # Check common genes
+    print("=" * 60)
+    print("VAR/GENE CHECKS")
+    print("=" * 60)
+    
+    common_genes = set()
+    for i, zarr_file in enumerate(zarr_files):
+        zarr_path = str(zarr_file)
+        zarr_group = zarr.open(zarr_path, mode='r')
         
-        gene_set = set(gene_values.tolist())
-        if len(common_genes.intersection(gene_set)) < 10000 and i > 0:
-            outstring += f" - Warning number of common genes appears low: {len(common_genes.intersection(gene_set))}"
-        
-        print(outstring)
-        common_genes.update(gene_set)
-    else:
-        # List available keys in var if gene is not found
-        if 'var' in zarr_group:
-            var_keys = list(zarr_group['var'].keys())
-            print(f"  WARNING: 'gene' column not found in {zarr_file}. Available var keys: {var_keys}")
+        if 'var' in zarr_group and 'gene' in zarr_group['var']:
+            gene_array = zarr_group['var']['gene']
+            gene_values = gene_array[:]
+            outstring = f"Checking {zarr_file.name} - Number of genes: {len(gene_values)}"
+            
+            gene_set = set(gene_values.tolist())
+            if len(common_genes.intersection(gene_set)) < 10000 and i > 0:
+                outstring += f" - Warning: number of common genes appears low: {len(common_genes.intersection(gene_set))}"
+            
+            print(outstring)
+            common_genes.update(gene_set)
         else:
-            print(f"  WARNING: 'var' group not found in {zarr_file}")
-
-print(f"Total number of common genes: {len(common_genes)}")
-
-#### OBS CHECKS ####
-
-# Identify the number of common observations across datasets
-# Check that 'barcode' column exists in every dataset
-# Create dictionary of column names for each dataset
-# Generate summary and CSV report
-
-print("\n" + "="*60)
-print("OBS STRUCTURE CHECKS")
-print("="*60)
-
-# Dictionary to store column names for each dataset
-obs_columns_dict = {}
-missing_barcode_datasets = []
-
-# First pass: collect all column names for each dataset
-for zarr_file in zarr_files:
-    zarr_path = os.path.join(zarr_dir, zarr_file)
+            if 'var' in zarr_group:
+                var_keys = list(zarr_group['var'].keys())
+                print(f"  WARNING: 'gene' column not found in {zarr_file.name}. Available var keys: {var_keys}")
+            else:
+                print(f"  WARNING: 'var' group not found in {zarr_file.name}")
     
-    # Open zarr group in read-only mode for memory efficiency
-    zarr_group = zarr.open(zarr_path, mode='r')
+    print(f"\nTotal number of common genes: {len(common_genes)}")
     
-    # Access the obs group
-    if 'obs' in zarr_group:
-        # Get all keys in obs (these are the column names)
-        # In zarr, column names are the top-level keys under obs
-        # They can be either Arrays (simple data) or Groups (categorical data with categories/codes)
-        obs_keys = list(zarr_group['obs'].keys())
-        # Filter out _index as it's metadata, not a data column
-        obs_columns = [key for key in obs_keys if key != '_index']
-        obs_columns_dict[zarr_file] = set(obs_columns)
+    # Check obs structure
+    print("\n" + "=" * 60)
+    print("OBS STRUCTURE CHECKS")
+    print("=" * 60)
+    
+    obs_columns_dict = {}
+    missing_barcode_datasets = []
+    
+    for zarr_file in zarr_files:
+        zarr_path = str(zarr_file)
+        zarr_group = zarr.open(zarr_path, mode='r')
         
-        # Check for barcode column
-        if 'barcode' not in obs_columns:
-            missing_barcode_datasets.append(zarr_file)
+        if 'obs' in zarr_group:
+            obs_keys = list(zarr_group['obs'].keys())
+            obs_columns = [key for key in obs_keys if key != '_index']
+            obs_columns_dict[zarr_file.name] = set(obs_columns)
+            
+            if 'barcode' not in obs_columns:
+                missing_barcode_datasets.append(zarr_file.name)
+        else:
+            obs_columns_dict[zarr_file.name] = set()
+            missing_barcode_datasets.append(zarr_file.name)
+    
+    if missing_barcode_datasets:
+        print(f"\nWARNING: 'barcode' column missing in {len(missing_barcode_datasets)} dataset(s):")
+        for dataset in missing_barcode_datasets:
+            print(f"  - {dataset}")
     else:
-        obs_columns_dict[zarr_file] = set()
-        missing_barcode_datasets.append(zarr_file)
-
-# Check barcode presence
-if missing_barcode_datasets:
-    print(f"\nWARNING: 'barcode' column missing in {len(missing_barcode_datasets)} dataset(s):")
-    for dataset in missing_barcode_datasets:
-        print(f"  - {dataset}")
-else:
-    print("\n✓ 'barcode' column found in all datasets")
-
-# Find common columns across all datasets
-if obs_columns_dict:
-    # Start with columns from first dataset
-    common_columns = obs_columns_dict[list(obs_columns_dict.keys())[0]].copy()
+        print("\n✓ 'barcode' column found in all datasets")
     
-    # Intersect with all other datasets
-    for dataset, columns in obs_columns_dict.items():
-        common_columns = common_columns.intersection(columns)
-    
-    # Sort for consistent output
-    common_columns = sorted(list(common_columns))
-    
-    # Print summary to terminal
-    print(f"\nSummary of OBS columns:")
-    print(f"  Total datasets: {len(obs_columns_dict)}")
-    print(f"  Common columns (present in all datasets): {len(common_columns)}")
-    print(f"  Common column names: {', '.join(common_columns)}")
-    
-    # Generate CSV report
-    csv_path = os.path.join(zarr_dir, 'obs_report.csv')
-    with open(csv_path, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        # Write header
-        writer.writerow(['dataset_name', 'common_columns', 'unique_columns'])
+    if obs_columns_dict:
+        common_columns = obs_columns_dict[list(obs_columns_dict.keys())[0]].copy()
         
-        # Write data for each dataset
-        for zarr_file in sorted(obs_columns_dict.keys()):
-            dataset_columns = obs_columns_dict[zarr_file]
-            unique_columns = sorted(list(dataset_columns - set(common_columns)))
+        for dataset, columns in obs_columns_dict.items():
+            common_columns = common_columns.intersection(columns)
+        
+        common_columns = sorted(list(common_columns))
+        
+        print(f"\nSummary of OBS columns:")
+        print(f"  Total datasets: {len(obs_columns_dict)}")
+        print(f"  Common columns (present in all datasets): {len(common_columns)}")
+        print(f"  Common column names: {', '.join(common_columns)}")
+        
+        csv_path = zarr_dir_path / 'obs_report.csv'
+        with open(csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['dataset_name', 'common_columns', 'unique_columns'])
             
-            # Convert lists to string representations
-            common_str = ', '.join(common_columns) if common_columns else ''
-            unique_str = ', '.join(unique_columns) if unique_columns else ''
-            
-            writer.writerow([zarr_file, common_str, unique_str])
+            for zarr_file_name in sorted(obs_columns_dict.keys()):
+                dataset_columns = obs_columns_dict[zarr_file_name]
+                unique_columns = sorted(list(dataset_columns - set(common_columns)))
+                
+                common_str = ', '.join(common_columns) if common_columns else ''
+                unique_str = ', '.join(unique_columns) if unique_columns else ''
+                
+                writer.writerow([zarr_file_name, common_str, unique_str])
+        
+        print(f"\n✓ CSV report saved to: {csv_path}")
+    else:
+        print("\nWARNING: No datasets found with 'obs' structure")
+
+
+def main():
+    """Main function with command-line interface."""
+    parser = argparse.ArgumentParser(
+        description='Check zarr directory structure and gene/obs consistency.'
+    )
+    parser.add_argument(
+        'zarr_dir',
+        type=str,
+        help='Directory containing .zarr files to check'
+    )
     
-    print(f"\n✓ CSV report saved to: {csv_path}")
-else:
-    print("\nWARNING: No datasets found with 'obs' structure")
+    args = parser.parse_args()
+    
+    try:
+        check_zarr_directory(args.zarr_dir)
+        return 0
+    except Exception as e:
+        print(f"\n✗ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
