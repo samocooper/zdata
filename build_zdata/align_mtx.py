@@ -97,18 +97,14 @@ def _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols):
     """
     n_rows, n_old_cols = X_csc.shape
     
+    # Use views to access data efficiently (no copying overhead)
+    # Extract the data we need and release all references before returning
+    nnz = X_csc.nnz
     old_data = X_csc.data
     old_indices = X_csc.indices
     old_indptr = X_csc.indptr
     
-    # Pre-allocate numpy arrays for efficiency (avoid Python list overhead)
-    # Estimate size: use nnz as upper bound
-    nnz = len(old_data)
-    new_data = np.empty(nnz, dtype=old_data.dtype)
-    new_indices = np.empty(nnz, dtype=old_indices.dtype)
-    new_indptr = np.zeros(n_new_cols + 1, dtype=np.int64)
-    
-    # Count non-zeros per new column first (for indptr)
+    # Step 1: Count non-zeros per new column from old_indptr (no data copying yet)
     col_counts = np.zeros(n_new_cols, dtype=np.int64)
     for old_col in range(n_old_cols):
         if old_col in old_to_new_idx:
@@ -117,34 +113,55 @@ def _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols):
             col_end = old_indptr[old_col + 1]
             col_counts[new_col] += (col_end - col_start)
     
-    # Build indptr from counts
+    # Step 2: Build new_indptr from counts (vectorized)
+    new_indptr = np.zeros(n_new_cols + 1, dtype=np.int64)
     new_indptr[1:] = np.cumsum(col_counts)
+    total_nnz = new_indptr[-1]
     
-    # Track current position in each new column
+    # Step 3: Pre-allocate new arrays
+    new_data = np.empty(total_nnz, dtype=old_data.dtype)
+    new_indices = np.empty(total_nnz, dtype=old_indices.dtype)
+    
+    # Step 4: Track current position in each new column
     col_positions = np.zeros(n_new_cols, dtype=np.int64)
     
-    # Fill data and indices arrays
+    # Step 5: Directly copy data from old positions to new positions using indptr mapping
     for old_col in range(n_old_cols):
         if old_col in old_to_new_idx:
             new_col = old_to_new_idx[old_col]
-            col_start = old_indptr[old_col]
-            col_end = old_indptr[old_col + 1]
-            col_len = col_end - col_start
+            old_start = old_indptr[old_col]
+            old_end = old_indptr[old_col + 1]
+            col_len = old_end - old_start
             
             if col_len > 0:
-                pos = new_indptr[new_col] + col_positions[new_col]
-                new_data[pos:pos + col_len] = old_data[col_start:col_end]
-                new_indices[pos:pos + col_len] = old_indices[col_start:col_end]
+                # Calculate destination position in new arrays
+                new_start = new_indptr[new_col] + col_positions[new_col]
+                new_end = new_start + col_len
+                
+                # Direct copy from old position to new position (no intermediate lists!)
+                new_data[new_start:new_end] = old_data[old_start:old_end]
+                new_indices[new_start:new_end] = old_indices[old_start:old_end]
+                
                 col_positions[new_col] += col_len
+    
+    # Free old array views now that we've copied the data we need
+    # This allows X_csc to be garbage collected
+    del old_data, old_indices, old_indptr
     
     # Trim arrays if needed (in case some columns weren't mapped)
     actual_nnz = new_indptr[-1]
     if actual_nnz < nnz:
         new_data = new_data[:actual_nnz]
         new_indices = new_indices[:actual_nnz]
+
+    # Build CSC matrix from reordered data
+    X_chunk_reordered_csc = csc_matrix((new_data, new_indices, new_indptr), 
+                                       shape=(n_rows, n_new_cols))
     
-    X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
-                                   shape=(n_rows, n_new_cols)).tocsr()
+    # Convert to CSR
+    X_chunk_reordered = X_chunk_reordered_csc.tocsr()
+    del X_chunk_reordered_csc
+    gc.collect()
     
     return X_chunk_reordered
 
@@ -166,46 +183,52 @@ def process_h5ad_file(h5ad_path, gene_list_path, old_to_new_idx, n_new_cols):
         RuntimeError: If processing fails
     """
     try:
-        # Read h5ad file (full load for matrix processing)
-        # We need the full matrix in memory anyway for column reordering
+        # Read h5ad file (h5ad files are loaded into memory by anndata)
         adata = ad.read_h5ad(h5ad_path)
         
-        # Get matrix (now in-memory, not lazy)
+        # Get matrix and close file
         X = adata.X
+        adata.file.close()
         
         # Convert to CSR if needed
         if not isinstance(X, csr_matrix):
             X_csr = X.tocsr()
+            if hasattr(X, 'shape') and X is not X_csr:
+                del X
         else:
             X_csr = X
         
         n_rows, n_old_cols = X_csr.shape
-        
-        # Convert to CSC for efficient column access
-        X_csc = X_csr.tocsc()
-        
-        # Reorder columns using shared helper
-        X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
-        
-        # Clean up immediately
-        del X_csr, X_csc
-        adata.file.close()  # Close h5ad file
         del adata
-        gc.collect()  # Force garbage collection
+        
+        # Convert to CSC and reorder columns
+        X_csc = X_csr.tocsc()
+        del X_csr
+        gc.collect()
+        
+        X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
+        del X_csc
+        gc.collect()
         
         return X_chunk_reordered, n_rows
         
     except Exception as e:
         raise RuntimeError(f"Failed to process h5ad file {h5ad_path}: {e}") from e
 
-def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
+def process_zarr_file_chunks(zarr_path, gene_list_path, old_to_new_idx, n_new_cols, mtx_chunk_size=131072):
     """
-    Process a single zarr file and return aligned CSR matrix.
-    Only keeps CSR matrix in memory, frees zarr resources immediately.
+    Process a single zarr file in chunks matching MTX file size.
+    Yields aligned CSR matrices in chunks to avoid loading entire compressed zarr into memory.
     
-    Returns:
-        csr_matrix: Aligned CSR matrix
-        n_rows: Number of rows processed
+    Args:
+        zarr_path: Path to zarr file
+        gene_list_path: Path to gene list (unused, kept for compatibility)
+        old_to_new_idx: Dictionary mapping old column indices to new column indices
+        n_new_cols: Number of columns in the aligned matrix
+        mtx_chunk_size: Number of rows per chunk (default: 131072, matching MTX file size)
+    
+    Yields:
+        tuple: (csr_matrix, n_rows_in_chunk, total_rows_in_file)
     
     Raises:
         RuntimeError: If processing fails
@@ -217,26 +240,53 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
         n_rows = zarr_group["obs"]["barcode"].shape[0]
         
         X = zarr_group['X']
+        # Get indptr to determine row boundaries (need full indptr for indexing)
         indptr = X["indptr"][:]
-        data = X["data"][:]
-        indices = X["indices"][:]
         
         if len(indptr) > 0:
             start = indptr[0]
             indptr = indptr - start
         
-        X_csr = csr_matrix((data, indices, indptr), shape=(n_rows, n_cols))
-        X_csc = X_csr.tocsc()
+        # Process in row chunks matching MTX file size to avoid loading entire compressed file
+        for chunk_start in range(0, n_rows, mtx_chunk_size):
+            chunk_end = min(chunk_start + mtx_chunk_size, n_rows)
+            chunk_n_rows = chunk_end - chunk_start
+            
+            # Extract row chunk boundaries from indptr
+            chunk_indptr_start = indptr[chunk_start]
+            chunk_indptr_end = indptr[chunk_end]
+            
+            # Load only the data/indices needed for this chunk (zarr decompresses on access)
+            chunk_data = X["data"][chunk_indptr_start:chunk_indptr_end]
+            chunk_indices = X["indices"][chunk_indptr_start:chunk_indptr_end]
+            chunk_indptr = indptr[chunk_start:chunk_end + 1] - chunk_indptr_start
+            
+            # Create CSR matrix for this chunk
+            chunk_csr = csr_matrix((chunk_data, chunk_indices, chunk_indptr), 
+                                  shape=(chunk_n_rows, n_cols))
+            del chunk_data, chunk_indices
+            
+            # Convert to CSC and reorder columns for this chunk
+            chunk_csc = chunk_csr.tocsc()
+            del chunk_csr
+            chunk_aligned = _reorder_matrix_columns(chunk_csc, old_to_new_idx, n_new_cols)
+            del chunk_csc
+            gc.collect()
+            
+            # Yield this chunk
+            yield chunk_aligned, chunk_n_rows, n_rows
+            
+            # Free chunk before next iteration
+            del chunk_aligned
+            gc.collect()
         
-        # Reorder columns using shared helper
-        X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
+        # Clean up zarr references
+        del indptr
+        zarr_group = None
+        gc.collect()
         
-        # Clean up immediately
-        del X_csr, X_csc
-        zarr_group = None  # Release zarr reference
-        gc.collect()  # Force garbage collection
-        
-        return X_chunk_reordered, n_rows
+    except Exception as e:
+        raise RuntimeError(f"Failed to process zarr file {zarr_path}: {e}") from e
         
     except Exception as e:
         raise RuntimeError(f"Failed to process zarr file {zarr_path}: {e}") from e
@@ -305,6 +355,53 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     manifest_data = []
     column_nnz_accumulator = np.zeros(n_new_cols, dtype=np.uint32)
     
+    def write_mtx_chunk(chunk_rows, chunk_zarrs_info, row_start, mtx_output_dir, n_new_cols):
+        """Write an MTX chunk and return updated tracking information.
+        
+        Args:
+            chunk_rows: List of CSR matrices to combine and write
+            chunk_zarrs_info: List of metadata about source files
+            row_start: Starting row index for this chunk
+            mtx_output_dir: Directory to write MTX files
+            n_new_cols: Number of columns in the matrix
+        
+        Returns:
+            tuple: (next_row_start, manifest_entry, column_nnz_chunk)
+        """
+        if not chunk_rows:
+            return row_start, None, np.zeros(n_new_cols, dtype=np.uint32)
+        
+        combined_matrix = vstack(chunk_rows, format='csr')
+        del chunk_rows
+        gc.collect()
+        
+        row_end = row_start + combined_matrix.shape[0] - 1
+        chunk_output_path = os.path.join(mtx_output_dir, f"rows_{row_start}_{row_end}.mtx")
+        
+        row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
+        column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
+        
+        print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
+        mmwrite(chunk_output_path, combined_matrix)
+        print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
+        
+        row_nnz_path = os.path.join(mtx_output_dir, f"rows_{row_start}_{row_end}_nnz.txt")
+        np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
+        
+        manifest_entry = {
+            'mtx_file': os.path.basename(chunk_output_path),
+            'mtx_path': chunk_output_path,
+            'row_start': row_start,
+            'row_end': row_end,
+            'n_rows': combined_matrix.shape[0],
+            'source_files': chunk_zarrs_info.copy()
+        }
+        
+        del combined_matrix
+        gc.collect()
+        
+        return row_end + 1, manifest_entry, column_nnz_chunk
+    
     current_chunk_rows = []
     current_chunk_zarrs = []  # Track which zarr files contributed to current chunk
     current_row_start = 0
@@ -346,219 +443,171 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                 old_col_idx = gene_to_old_idx[gene]
                 old_to_new_idx[old_col_idx] = new_idx
         
-        # Process file based on type
+        # Process file in chunks matching MTX file size (131072 rows)
         if file_type == 'zarr':
-            X_aligned, n_rows = process_zarr_file(str(file_path), gene_list_path, old_to_new_idx, n_new_cols)
-        elif file_type == 'h5ad':
-            X_aligned, n_rows = process_h5ad_file(str(file_path), gene_list_path, old_to_new_idx, n_new_cols)
-        
-        if X_aligned is None:
-            raise RuntimeError(f"Failed to process {file_type} file {file_path.name}. This file must be processed successfully - skipping is not allowed.")
-        
-        print(f"  Processed {n_rows} rows from {file_path.name}")
-        
-        # For very large files, write immediately to avoid memory accumulation
-        # If a single file exceeds chunk_size, write it in chunks
-        if n_rows > chunk_size:
-            print(f"  WARNING: File has {n_rows} rows (exceeds chunk_size {chunk_size}), writing in chunks...")
-            # Write current accumulated chunk first if any
-            if current_chunk_rows:
-                print(f"  Writing accumulated chunk with {sum(m.shape[0] for m in current_chunk_rows)} rows first...")
-                combined_matrix = vstack(current_chunk_rows, format='csr')
-                row_end = current_row_start + combined_matrix.shape[0] - 1
-                chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
-                output_files.append(chunk_output_path)
-                
-                row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
-                column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
-                column_nnz_accumulator += column_nnz_chunk
-                
-                print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
-                mmwrite(chunk_output_path, combined_matrix)
-                print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
-                
-                row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
-                np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
-                
-                manifest_data.append({
-                    'mtx_file': os.path.basename(chunk_output_path),
-                    'mtx_path': chunk_output_path,
-                    'row_start': current_row_start,
-                    'row_end': row_end,
-                    'n_rows': combined_matrix.shape[0],
-                    'source_files': current_chunk_zarrs.copy()
+            # Process zarr file in chunks using generator
+            for chunk_matrix, chunk_n_rows, total_file_rows in process_zarr_file_chunks(
+                str(file_path), gene_list_path, old_to_new_idx, n_new_cols, chunk_size
+            ):
+                # Add chunk to current accumulation
+                current_chunk_rows.append(chunk_matrix)
+                current_chunk_zarrs.append({
+                    'file': file_path.name,
+                    'file_path': str(file_path),
+                    'file_type': file_type,
+                    'rows_in_chunk': chunk_n_rows,
+                    'row_start_in_chunk': sum(m.shape[0] for m in current_chunk_rows[:-1])
                 })
                 
-                current_row_start = row_end + 1
-                mtx_file_idx += 1
-                del combined_matrix
-                current_chunk_rows = []
-                current_chunk_zarrs = []
+                total_rows_in_chunk = sum(m.shape[0] for m in current_chunk_rows)
+                
+                # Write MTX file when we've accumulated enough rows
+                if total_rows_in_chunk >= chunk_size:
+                    if total_rows_in_chunk > chunk_size:
+                        # Write exactly chunk_size rows
+                        rows_to_write = []
+                        rows_written = 0
+                        zarr_info_to_write = []
+                        
+                        for i, matrix in enumerate(current_chunk_rows):
+                            matrix_rows = matrix.shape[0]
+                            if rows_written + matrix_rows <= chunk_size:
+                                rows_to_write.append(matrix)
+                                zarr_info_to_write.append(current_chunk_zarrs[i])
+                                rows_written += matrix_rows
+                            else:
+                                # Partial matrix needed
+                                rows_needed = chunk_size - rows_written
+                                rows_to_write.append(matrix[:rows_needed])
+                                zarr_info_to_write.append({
+                                    **current_chunk_zarrs[i],
+                                    'rows_in_chunk': rows_needed
+                                })
+                                
+                                # Keep remainder for next chunk
+                                remainder = matrix[rows_needed:]
+                                current_chunk_rows = [remainder]
+                                current_chunk_zarrs = [{
+                                    **current_chunk_zarrs[i],
+                                    'rows_in_chunk': matrix_rows - rows_needed,
+                                    'row_start_in_chunk': 0
+                                }]
+                                break
+                        
+                        # Write the chunk
+                        current_row_start, manifest_entry, col_nnz = write_mtx_chunk(
+                            rows_to_write, zarr_info_to_write, current_row_start, 
+                            mtx_output_dir, n_new_cols
+                        )
+                        output_files.append(manifest_entry['mtx_path'])
+                        column_nnz_accumulator += col_nnz
+                        manifest_data.append(manifest_entry)
+                        mtx_file_idx += 1
+                    else:
+                        # Exactly chunk_size rows
+                        current_row_start, manifest_entry, col_nnz = write_mtx_chunk(
+                            current_chunk_rows, current_chunk_zarrs, current_row_start,
+                            mtx_output_dir, n_new_cols
+                        )
+                        output_files.append(manifest_entry['mtx_path'])
+                        column_nnz_accumulator += col_nnz
+                        manifest_data.append(manifest_entry)
+                        mtx_file_idx += 1
+                        current_chunk_rows = []
+                        current_chunk_zarrs = []
+        
+        elif file_type == 'h5ad':
+            # For h5ad, process in chunks too (split large files)
+            X_aligned, n_rows = process_h5ad_file(str(file_path), gene_list_path, old_to_new_idx, n_new_cols)
             
-            # Write this large file in chunks
+            if X_aligned is None:
+                raise RuntimeError(f"Failed to process {file_type} file {file_path.name}.")
+            
+            print(f"  Processed {n_rows} rows from {file_path.name}")
+            
+            # Process h5ad file in chunks
             for chunk_start in range(0, n_rows, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, n_rows)
                 X_chunk = X_aligned[chunk_start:chunk_end]
                 
-                row_nnz = np.diff(X_chunk.indptr).astype(np.uint32)
-                column_nnz_chunk = X_chunk.getnnz(axis=0).astype(np.uint32)
-                column_nnz_accumulator += column_nnz_chunk
-                
-                row_end = current_row_start + X_chunk.shape[0] - 1
-                chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
-                output_files.append(chunk_output_path)
-                
-                print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
-                mmwrite(chunk_output_path, X_chunk)
-                print(f"  ✓ {X_chunk.shape[0]} rows × {n_new_cols} cols, {X_chunk.nnz} non-zeros")
-                
-                row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
-                np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
-                
-                manifest_data.append({
-                    'mtx_file': os.path.basename(chunk_output_path),
-                    'mtx_path': chunk_output_path,
-                    'row_start': current_row_start,
-                    'row_end': row_end,
-                    'n_rows': X_chunk.shape[0],
-                    'source_files': [{
-                        'file': file_path.name,
-                        'file_path': str(file_path),
-                        'file_type': file_type,
-                        'rows_in_chunk': X_chunk.shape[0],
-                        'row_start_in_chunk': chunk_start
-                    }]
+                current_chunk_rows.append(X_chunk)
+                current_chunk_zarrs.append({
+                    'file': file_path.name,
+                    'file_path': str(file_path),
+                    'file_type': file_type,
+                    'rows_in_chunk': X_chunk.shape[0],
+                    'row_start_in_chunk': chunk_start
                 })
                 
-                current_row_start = row_end + 1
-                mtx_file_idx += 1
+                total_rows_in_chunk = sum(m.shape[0] for m in current_chunk_rows)
+                
+                # Write MTX file when we've accumulated enough rows
+                if total_rows_in_chunk >= chunk_size:
+                    if total_rows_in_chunk > chunk_size:
+                        # Write exactly chunk_size, keep remainder
+                        rows_to_write = []
+                        rows_written = 0
+                        zarr_info_to_write = []
+                        
+                        for i, matrix in enumerate(current_chunk_rows):
+                            matrix_rows = matrix.shape[0]
+                            if rows_written + matrix_rows <= chunk_size:
+                                rows_to_write.append(matrix)
+                                zarr_info_to_write.append(current_chunk_zarrs[i])
+                                rows_written += matrix_rows
+                            else:
+                                rows_needed = chunk_size - rows_written
+                                rows_to_write.append(matrix[:rows_needed])
+                                zarr_info_to_write.append({
+                                    **current_chunk_zarrs[i],
+                                    'rows_in_chunk': rows_needed
+                                })
+                                remainder = matrix[rows_needed:]
+                                current_chunk_rows = [remainder]
+                                current_chunk_zarrs = [{
+                                    **current_chunk_zarrs[i],
+                                    'rows_in_chunk': matrix_rows - rows_needed,
+                                    'row_start_in_chunk': current_chunk_zarrs[i]['row_start_in_chunk'] + rows_needed
+                                }]
+                                break
+                        
+                        current_row_start, manifest_entry, col_nnz = write_mtx_chunk(
+                            rows_to_write, zarr_info_to_write, current_row_start,
+                            mtx_output_dir, n_new_cols
+                        )
+                        output_files.append(manifest_entry['mtx_path'])
+                        column_nnz_accumulator += col_nnz
+                        manifest_data.append(manifest_entry)
+                        mtx_file_idx += 1
+                    else:
+                        current_row_start, manifest_entry, col_nnz = write_mtx_chunk(
+                            current_chunk_rows, current_chunk_zarrs, current_row_start,
+                            mtx_output_dir, n_new_cols
+                        )
+                        output_files.append(manifest_entry['mtx_path'])
+                        column_nnz_accumulator += col_nnz
+                        manifest_data.append(manifest_entry)
+                        mtx_file_idx += 1
+                        current_chunk_rows = []
+                        current_chunk_zarrs = []
+                
                 del X_chunk
                 gc.collect()
             
-            # Free the large matrix
             del X_aligned
             gc.collect()
-            continue
-        
-        current_chunk_rows.append(X_aligned)
-        current_chunk_zarrs.append({
-            'file': file_path.name,
-            'file_path': str(file_path),
-            'file_type': file_type,
-            'rows_in_chunk': n_rows,
-            'row_start_in_chunk': sum(m.shape[0] for m in current_chunk_rows[:-1])
-        })
-        
-        total_rows_in_chunk = sum(m.shape[0] for m in current_chunk_rows)
-        
-        if total_rows_in_chunk >= chunk_size:
-            print(f"  Concatenating {len(current_chunk_rows)} matrices ({total_rows_in_chunk} total rows)")
-            combined_matrix = vstack(current_chunk_rows, format='csr')
-            
-            rows_written = 0
-            zarr_files_written = []
-            remainder_zarr_info = None
-            
-            if combined_matrix.shape[0] > chunk_size:
-                matrix_to_write = combined_matrix[:chunk_size]
-                remainder = combined_matrix[chunk_size:]
-                
-                for zarr_info in current_chunk_zarrs:
-                    zarr_rows = zarr_info['rows_in_chunk']
-                    if rows_written + zarr_rows <= chunk_size:
-                        zarr_files_written.append(zarr_info.copy())
-                        rows_written += zarr_rows
-                    else:
-                        rows_from_this_zarr_in_written = chunk_size - rows_written
-                        remainder_rows = zarr_rows - rows_from_this_zarr_in_written
-                        
-                        partial_info = zarr_info.copy()
-                        partial_info['rows_in_chunk'] = rows_from_this_zarr_in_written
-                        zarr_files_written.append(partial_info)
-                        
-                        remainder_zarr_info = {
-                            'file': zarr_info['file'],
-                            'file_path': zarr_info['file_path'],
-                            'file_type': zarr_info['file_type'],
-                            'rows_in_chunk': remainder_rows,
-                            'row_start_in_chunk': 0
-                        }
-                        break
-                
-                current_chunk_rows = [remainder]
-                current_chunk_zarrs = [remainder_zarr_info] if remainder_zarr_info else []
-            else:
-                matrix_to_write = combined_matrix
-                zarr_files_written = current_chunk_zarrs.copy()
-                current_chunk_rows = []
-                current_chunk_zarrs = []
-            
-            row_nnz = np.diff(matrix_to_write.indptr).astype(np.uint32)
-            column_nnz_chunk = matrix_to_write.getnnz(axis=0).astype(np.uint32)
-            column_nnz_accumulator += column_nnz_chunk
-            
-            row_end = current_row_start + matrix_to_write.shape[0] - 1
-            chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
-            output_files.append(chunk_output_path)
-            
-            print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
-            mmwrite(chunk_output_path, matrix_to_write)
-            print(f"  ✓ {matrix_to_write.shape[0]} rows × {n_new_cols} cols, {matrix_to_write.nnz} non-zeros")
-            
-            row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
-            np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
-            
-            manifest_data.append({
-                'mtx_file': os.path.basename(chunk_output_path),
-                'mtx_path': chunk_output_path,
-                'row_start': current_row_start,
-                'row_end': row_end,
-                'n_rows': matrix_to_write.shape[0],
-                'source_files': zarr_files_written
-            })
-            
-            current_row_start = row_end + 1
-            mtx_file_idx += 1
-            
-            del combined_matrix, matrix_to_write
-            gc.collect()  # Force garbage collection after writing chunk
     
     # Write final chunk if there are remaining rows
     if current_chunk_rows:
         print(f"\nWriting final chunk with {sum(m.shape[0] for m in current_chunk_rows)} rows")
-        combined_matrix = vstack(current_chunk_rows, format='csr')
-        
-        row_end = current_row_start + combined_matrix.shape[0] - 1
-        chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
-        output_files.append(chunk_output_path)
-        
-        # Calculate row nnz (number of non-zeros per row) from CSR indptr
-        row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
-        
-        # Calculate column nnz directly from CSR matrix (no transposition needed)
-        column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
-        column_nnz_accumulator += column_nnz_chunk
-        
-        print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
-        mmwrite(chunk_output_path, combined_matrix)
-        print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
-        
-        # Write row nnz to temporary file (will be merged into obs.parquet later)
-        row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
-        np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
-        
-        # Record in manifest
-        manifest_data.append({
-            'mtx_file': os.path.basename(chunk_output_path),
-            'mtx_path': chunk_output_path,
-            'row_start': current_row_start,
-            'row_end': row_end,
-            'n_rows': combined_matrix.shape[0],
-            'source_files': current_chunk_zarrs
-        })
-        
-        del combined_matrix
-        gc.collect()  # Force garbage collection after final chunk
+        current_row_start, manifest_entry, col_nnz = write_mtx_chunk(
+            current_chunk_rows, current_chunk_zarrs, current_row_start,
+            mtx_output_dir, n_new_cols
+        )
+        output_files.append(manifest_entry['mtx_path'])
+        column_nnz_accumulator += col_nnz
+        manifest_data.append(manifest_entry)
+        mtx_file_idx += 1
     
     # Write column nnz to file (accumulated across all MTX files)
     column_nnz_path = os.path.join(output_dir, "column_nnz.txt")
