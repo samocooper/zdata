@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 # Minimal project section - all metadata is defined in setup.py
 [project]
-name = "zdata"
+name = "zdata-py"
 dynamic = ["version", "description", "readme", "requires-python", "license", "authors", "classifiers", "dependencies", "optional-dependencies"]
 
 [tool.setuptools]

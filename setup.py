@@ -337,7 +337,7 @@ def get_long_description():
 setup(
     name="zdata",
     version=get_version(),
-    description="Efficient storage and access for large single-cell RNA datasets",
+    description="Efficient storage and access for large single-cell RNA datasets (supports Zarr and H5AD formats)",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
     author="Sam Cooper",
