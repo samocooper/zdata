@@ -250,37 +250,6 @@ The zdata format is optimized for:
 
 Benchmark results can be obtained by running `test_fast_queries.py`.
 
-## Development
-
-### Building for PyPI
-
-```bash
-# Install build tools
-pip install build twine
-
-# Build distribution packages
-python -m build
-
-# Test locally
-pip install dist/zdata-*.whl
-
-# Upload to PyPI
-twine upload dist/*
-```
-
-### Cross-Platform Wheel Building
-
-The project uses `cibuildwheel` to build platform-specific wheels. See `.github/workflows/build_wheels.yml` for the CI configuration.
-
-**Building wheels locally:**
-```bash
-pip install cibuildwheel
-export ZSTD_BASE=/path/to/zstd-source
-cibuildwheel --output-dir wheelhouse
-```
-
-**Note:** C tools compilation is required. The setup script will compile C tools during installation if ZSTD is available, or use pre-compiled binaries from the wheel if available.
-
 ## License
 
 See LICENSE file for details.
