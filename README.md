@@ -31,7 +31,7 @@ The easiest way to create a zdata object is from a directory of zarr files or h5
 First check that the directory of zarr files / h5ad files is correct:
 
 ```bash
-python -m zdata.build_zzdata.check_directory <path to directory>
+python -m zdata.build_zdata.check_directory <path to directory>
 ```
 Next build the zdata object
 
