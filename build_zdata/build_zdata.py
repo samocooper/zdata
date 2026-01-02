@@ -35,7 +35,8 @@ def build_zdata_from_zarr(
     obs_join_on: list = None,
     obs_output_filename: str = "obs.parquet",
     cleanup_temp: bool = True,
-    mtx_chunk_size: int = 131072
+    mtx_chunk_size: int = 131072,
+    mtx_temp_dir: str = None
 ):
     """
     Build complete zdata object from directory of zarr or h5ad files.
@@ -50,8 +51,13 @@ def build_zdata_from_zarr(
         obs_join_strategy: Strategy for joining obs data ("inner", "outer", or "columns")
         obs_join_on: If obs_join_strategy is "columns", list of column names to join on
         obs_output_filename: Name of obs parquet file (default: "obs.parquet")
-        cleanup_temp: Whether to clean up temporary MTX files (default: True)
+        cleanup_temp: Whether to clean up temporary MTX files (default: True). 
+                      Ignored if mtx_temp_dir is specified (files are always preserved).
         mtx_chunk_size: Maximum rows per MTX file during alignment (default: 131072)
+        mtx_temp_dir: Optional path to directory for MTX files. If specified:
+                      - MTX files will be preserved (not cleaned up) even on failure
+                      - Existing MTX files in this directory will be reused if manifest exists
+                      - Allows rerunning pipeline from aligned MTX files
     
     Returns:
         Path to created zdata directory (as Path object)
@@ -91,25 +97,64 @@ def build_zdata_from_zarr(
     if not os.path.exists(gene_list_path):
         raise FileNotFoundError(f"Gene list file not found: {gene_list_path}")
     
-    # Create temporary directory for MTX files
-    with tempfile.TemporaryDirectory(prefix="zdata_build_") as temp_mtx_dir:
-        print(f"Using temporary directory for MTX files: {temp_mtx_dir}")
+    # Determine MTX directory: use custom if provided, otherwise create temp
+    use_custom_mtx_dir = mtx_temp_dir is not None
+    if use_custom_mtx_dir:
+        temp_mtx_dir = Path(mtx_temp_dir)
+        temp_mtx_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Using custom MTX directory: {temp_mtx_dir}")
+        print(f"  MTX files will be preserved (not cleaned up)")
         
-        # Align zarr files to MTX format
-        try:
-            manifest_path = align_zarr_directory_to_mtx(
-                str(zarr_dir_path),
-                gene_list_path,
-                temp_mtx_dir,
-                tmp_dir=None,
-                chunk_size=mtx_chunk_size
-            )
-            print(f"\n✓ Alignment complete! Manifest: {manifest_path}")
-        except Exception as e:
-            print(f"\n✗ ERROR in alignment step: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+        # Check if MTX files already exist (for rerun capability)
+        manifest_path = temp_mtx_dir / "manifest.json"
+        if manifest_path.exists():
+            print(f"  Found existing manifest: {manifest_path}")
+            print(f"  Checking if MTX files can be reused...")
+            mtx_output_dir = temp_mtx_dir / "rm_mtx_files"
+            if mtx_output_dir.exists() and list(mtx_output_dir.glob("*.mtx")):
+                mtx_count = len(list(mtx_output_dir.glob("*.mtx")))
+                print(f"  Found {mtx_count} existing MTX file(s) - will reuse them")
+                reuse_existing = True
+            else:
+                print(f"  No existing MTX files found - will regenerate")
+                reuse_existing = False
+        else:
+            reuse_existing = False
+        temp_dir_context = None
+        temp_dir_context_entered = False
+    else:
+        # Use temporary directory that will be cleaned up
+        temp_dir_context = tempfile.TemporaryDirectory(prefix="zdata_build_")
+        temp_mtx_dir = Path(temp_dir_context.__enter__())
+        print(f"Using temporary directory for MTX files: {temp_mtx_dir}")
+        reuse_existing = False
+        temp_dir_context_entered = True
+    
+    try:
+        # Align zarr files to MTX format (skip if reusing existing)
+        if not reuse_existing:
+            try:
+                manifest_path = align_zarr_directory_to_mtx(
+                    str(zarr_dir_path),
+                    gene_list_path,
+                    str(temp_mtx_dir),
+                    tmp_dir=None,
+                    chunk_size=mtx_chunk_size
+                )
+                print(f"\n✓ Alignment complete! Manifest: {manifest_path}")
+            except Exception as e:
+                print(f"\n✗ ERROR in alignment step: {e}")
+                import traceback
+                traceback.print_exc()
+                if use_custom_mtx_dir:
+                    print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                    print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
+                raise
+        else:
+            # Reusing existing MTX files
+            manifest_path = str(temp_mtx_dir / "manifest.json")
+            print(f"\n✓ Reusing existing MTX files from: {temp_mtx_dir}")
+            print(f"  Manifest: {manifest_path}")
         
         # Step 2: Build zdata from MTX files
         print("\n" + "=" * 70)
@@ -118,7 +163,7 @@ def build_zdata_from_zarr(
         
         try:
             zdata_dir = build_zdata(
-                temp_mtx_dir,
+                str(temp_mtx_dir),
                 output_name,
                 block_rows=block_rows,
                 max_rows=max_rows
@@ -130,6 +175,9 @@ def build_zdata_from_zarr(
             print(f"\n✗ ERROR in zdata build step: {e}")
             import traceback
             traceback.print_exc()
+            if use_custom_mtx_dir:
+                print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
             raise
         
         # Step 3: Concatenate obs/metadata from zarr files
@@ -207,7 +255,7 @@ def build_zdata_from_zarr(
             
             # Load column nnz from file (calculated during MTX processing)
             import numpy as np
-            column_nnz_path = os.path.join(temp_mtx_dir, "column_nnz.txt")
+            column_nnz_path = os.path.join(str(temp_mtx_dir), "column_nnz.txt")
             
             if not os.path.exists(column_nnz_path):
                 raise FileNotFoundError(
@@ -243,7 +291,20 @@ def build_zdata_from_zarr(
             print(f"\n✗ ERROR: Failed to save var.parquet: {e}")
             import traceback
             traceback.print_exc()
+            if use_custom_mtx_dir:
+                print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
             raise
+    
+    finally:
+        # Clean up temporary directory only if:
+        # 1. temp_dir_context was actually created (not using custom dir)
+        # 2. cleanup_temp is True
+        if temp_dir_context_entered and cleanup_temp:
+            try:
+                temp_dir_context.__exit__(None, None, None)
+            except:
+                pass
     
     print("\n" + "=" * 70)
     print("✓ Complete zdata object built successfully!")
@@ -336,6 +397,19 @@ def main():
         default=131072,
         help='Maximum rows per MTX file during alignment (default: 131072)'
     )
+    parser.add_argument(
+        '--mtx-temp-dir',
+        type=str,
+        default=None,
+        help='Directory to store MTX files. If specified, MTX files will be preserved (not cleaned up) '
+             'even on failure, allowing the pipeline to be rerun from aligned MTX files. '
+             'If existing MTX files are found, they will be reused.'
+    )
+    parser.add_argument(
+        '--no-cleanup-temp',
+        action='store_true',
+        help='Do not clean up temporary MTX files (only applies when --mtx-temp-dir is not specified)'
+    )
     
     args = parser.parse_args()
     
@@ -373,7 +447,9 @@ def main():
             obs_join_strategy=args.obs_join_strategy,
             obs_join_on=args.obs_join_on,
             obs_output_filename=args.obs_output_filename,
-            mtx_chunk_size=args.mtx_chunk_size
+            cleanup_temp=not args.no_cleanup_temp,
+            mtx_chunk_size=args.mtx_chunk_size,
+            mtx_temp_dir=args.mtx_temp_dir
         )
         print(f"\n✓ Build complete! Output: {zdata_dir}")
         return 0

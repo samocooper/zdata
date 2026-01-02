@@ -19,23 +19,26 @@ This approach provides excellent compression ratios while maintaining fast rando
 - **Scalable** - Handles datasets with millions of rows and columns
 - **Python API** - Simple, intuitive interface for data access
 - **C-based backend** - High-performance C implementation for core operations
+- **Multiple input formats** - Supports both Zarr and H5AD (AnnData) file formats
+- **Auto-detection** - Automatically detects and processes mixed file types in a directory
 
 ## Quick Start
 
-### Building zdata from Zarr Files
+### Building zdata from Zarr or H5AD Files
 
-The easiest way to create a zdata object is from a directory of zarr files:
+The easiest way to create a zdata object is from a directory of zarr files or h5ad files:
 
 ```python
 from zdata import build_zdata_from_zarr
 
-# Build zdata from a directory containing .zarr files
+# Build zdata from a directory containing .zarr files or .h5/.hdf5/.h5ad files
+# The function auto-detects file types based on extensions
 zdata_dir = build_zdata_from_zarr(
-    zarr_dir='/path/to/zarr/directory',  # Directory containing .zarr files
-    output_name='my_dataset.zdata',       # Output zdata directory name
-    block_rows=16,                        # Rows per block (default: 16)
-    max_rows=8192,                        # Max rows per chunk (default: 8192)
-    obs_join_strategy="outer"            # How to join obs metadata: "inner", "outer", or "columns"
+    zarr_dir='/path/to/data/directory',   # Directory containing .zarr or .h5/.hdf5/.h5ad files
+    output_name='my_dataset.zdata',        # Output zdata directory name
+    block_rows=16,                         # Rows per block (default: 16)
+    max_rows=8192,                         # Max rows per chunk (default: 8192)
+    obs_join_strategy="outer"              # How to join obs metadata: "inner", "outer", or "columns"
 )
 
 # The function returns the path to the created zdata directory
@@ -43,10 +46,15 @@ print(f"Created zdata directory at: {zdata_dir}")
 ```
 
 This single function:
-1. Aligns all zarr files to a standard gene list
-2. Converts them to zdata format with efficient compression
-3. Concatenates observation metadata from all zarr files
-4. Creates a complete `.zdata/` directory ready for querying
+1. Auto-detects file types (`.zarr` directories or `.h5`/`.hdf5`/`.h5ad` files)
+2. Aligns all files to a standard gene list
+3. Converts them to zdata format with efficient compression
+4. Concatenates observation metadata from all files
+5. Creates a complete `.zdata/` directory ready for querying
+
+**Supported Input Formats:**
+- **Zarr**: Directories ending in `.zarr` (e.g., `data.zarr/`)
+- **H5AD**: Files with extensions `.h5`, `.hdf5`, or `.h5ad` (e.g., `data.h5ad`)
 
 ### Reading from zdata
 
@@ -178,14 +186,15 @@ zdata/
 │   └── __init__.py
 ├── build_zdata/        # Build and preprocessing utilities
 │   ├── build_x.py     # Build zdata from MTX files
-│   ├── align_mtx.py   # Align zarr files to standard gene list
+│   ├── build_zdata.py # Main build function for zarr/h5ad directories
+│   ├── align_mtx.py   # Align zarr/h5ad files to standard gene list
 │   ├── check_directory.py  # Check zarr directory structure
-│   └── concat_obs.py  # Concatenate obs/metadata from zarr files
+│   └── concat_obs.py  # Concatenate obs/metadata from zarr/h5ad files
 ├── ctools/            # C command-line tools
 │   ├── mtx_to_zdata.c    # MTX to zdata converter
 │   ├── zdata_read.c      # Row reader
-│   ├── mtx_to_zdata      # Compiled binary
-│   └── zdata_read        # Compiled binary
+│   ├── mtx_to_zdata      # Compiled binary (generated during install)
+│   └── zdata_read        # Compiled binary (generated during install)
 ├── files/             # Package data files
 │   └── 2ks10c_genes.txt  # Default gene list for alignment (required)
 └── tests/             # Test suite
@@ -196,27 +205,40 @@ zdata/
 
 ### Default Gene List
 
-The package includes a default gene list (`files/2ks10c_genes.txt`) that is used as the standard gene set for aligning zarr files. This file is:
+The package includes a default gene list (`files/2ks10c_genes.txt`) that is used as the standard gene set for aligning zarr and h5ad files. This file is:
 - **Required**: Must be included in the package distribution
-- **Default**: Used automatically when building zdata from zarr files
-- **Overridable**: Can be replaced with `--gene-list` parameter if needed
+- **Default**: Used automatically when building zdata from zarr or h5ad files
+- **Overridable**: Can be replaced with a custom gene list path if needed
 
 ## Testing
+
+Run all tests with pytest:
+
+```bash
+pytest tests/
+```
 
 Run the full pipeline test (compiles, builds, and tests):
 
 ```bash
-python tests/test_full_pipeline.py [mtx_file] [output_name]
+# With zarr files (default)
+python tests/test_full_pipeline_at_scale.py [zarr_directory] [output_name]
+
+# With h5ad files
+python tests/test_full_pipeline_at_scale.py --h5ad [h5ad_directory] [output_name]
 ```
 
-Run individual tests:
+Run specific test modules:
 
 ```bash
-# Test random row extraction
-python tests/test_random_rows.py [zdata_directory] [n_rows] [seed]
+# Test core functionality
+pytest tests/test_core/
 
-# Performance benchmark
-python tests/test_fast_queries.py [zdata_directory]
+# Test h5ad support
+pytest tests/test_core/test_h5ad.py
+
+# Test with coverage
+pytest tests/ --cov=zdata --cov-report=html
 ```
 
 ## Performance
