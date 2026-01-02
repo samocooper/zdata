@@ -4,7 +4,7 @@ zdata - Efficient sparse matrix storage and retrieval using seekable zstd compre
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from zdata._settings import settings
 from zdata.core import ObsWrapper, ZData

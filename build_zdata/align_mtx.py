@@ -19,6 +19,7 @@ import json
 import argparse
 from pathlib import Path
 import shutil
+import gc
 
 # Default gene list path (relative to zdata package)
 # This file is required and must be included in the package distribution
@@ -84,6 +85,7 @@ def _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols):
     """
     Reorder columns of a CSC matrix according to old_to_new_idx mapping.
     Shared helper function for both zarr and h5ad processing.
+    Uses efficient numpy arrays instead of Python lists to avoid memory bloat.
     
     Args:
         X_csc: CSC sparse matrix to reorder
@@ -99,27 +101,47 @@ def _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols):
     old_indices = X_csc.indices
     old_indptr = X_csc.indptr
     
-    # Reorder columns according to old_to_new_idx mapping
-    new_col_data = [[] for _ in range(n_new_cols)]
-    new_col_indices = [[] for _ in range(n_new_cols)]
+    # Pre-allocate numpy arrays for efficiency (avoid Python list overhead)
+    # Estimate size: use nnz as upper bound
+    nnz = len(old_data)
+    new_data = np.empty(nnz, dtype=old_data.dtype)
+    new_indices = np.empty(nnz, dtype=old_indices.dtype)
+    new_indptr = np.zeros(n_new_cols + 1, dtype=np.int64)
     
+    # Count non-zeros per new column first (for indptr)
+    col_counts = np.zeros(n_new_cols, dtype=np.int64)
     for old_col in range(n_old_cols):
         if old_col in old_to_new_idx:
             new_col = old_to_new_idx[old_col]
             col_start = old_indptr[old_col]
             col_end = old_indptr[old_col + 1]
-            new_col_data[new_col].extend(old_data[col_start:col_end])
-            new_col_indices[new_col].extend(old_indices[col_start:col_end])
+            col_counts[new_col] += (col_end - col_start)
     
-    # Build new CSC matrix with reordered columns
-    new_data = []
-    new_indices = []
-    new_indptr = [0]
+    # Build indptr from counts
+    new_indptr[1:] = np.cumsum(col_counts)
     
-    for new_col in range(n_new_cols):
-        new_data.extend(new_col_data[new_col])
-        new_indices.extend(new_col_indices[new_col])
-        new_indptr.append(len(new_data))
+    # Track current position in each new column
+    col_positions = np.zeros(n_new_cols, dtype=np.int64)
+    
+    # Fill data and indices arrays
+    for old_col in range(n_old_cols):
+        if old_col in old_to_new_idx:
+            new_col = old_to_new_idx[old_col]
+            col_start = old_indptr[old_col]
+            col_end = old_indptr[old_col + 1]
+            col_len = col_end - col_start
+            
+            if col_len > 0:
+                pos = new_indptr[new_col] + col_positions[new_col]
+                new_data[pos:pos + col_len] = old_data[col_start:col_end]
+                new_indices[pos:pos + col_len] = old_indices[col_start:col_end]
+                col_positions[new_col] += col_len
+    
+    # Trim arrays if needed (in case some columns weren't mapped)
+    actual_nnz = new_indptr[-1]
+    if actual_nnz < nnz:
+        new_data = new_data[:actual_nnz]
+        new_indices = new_indices[:actual_nnz]
     
     X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
                                    shape=(n_rows, n_new_cols)).tocsr()
@@ -165,9 +187,11 @@ def process_h5ad_file(h5ad_path, gene_list_path, old_to_new_idx, n_new_cols):
         # Reorder columns using shared helper
         X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
         
-        # Clean up
+        # Clean up immediately
         del X_csr, X_csc
         adata.file.close()  # Close h5ad file
+        del adata
+        gc.collect()  # Force garbage collection
         
         return X_chunk_reordered, n_rows
         
@@ -207,7 +231,10 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
         # Reorder columns using shared helper
         X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
         
+        # Clean up immediately
         del X_csr, X_csc
+        zarr_group = None  # Release zarr reference
+        gc.collect()  # Force garbage collection
         
         return X_chunk_reordered, n_rows
         
@@ -304,6 +331,10 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             else:
                 # Fallback to var_names
                 file_genes = adata.var_names.tolist()
+            # Close file immediately to free memory
+            adata.file.close()
+            del adata
+            gc.collect()
         else:
             raise ValueError(f"Unknown file type for {file_path.name}")
         
@@ -325,6 +356,89 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             raise RuntimeError(f"Failed to process {file_type} file {file_path.name}. This file must be processed successfully - skipping is not allowed.")
         
         print(f"  Processed {n_rows} rows from {file_path.name}")
+        
+        # For very large files, write immediately to avoid memory accumulation
+        # If a single file exceeds chunk_size, write it in chunks
+        if n_rows > chunk_size:
+            print(f"  WARNING: File has {n_rows} rows (exceeds chunk_size {chunk_size}), writing in chunks...")
+            # Write current accumulated chunk first if any
+            if current_chunk_rows:
+                print(f"  Writing accumulated chunk with {sum(m.shape[0] for m in current_chunk_rows)} rows first...")
+                combined_matrix = vstack(current_chunk_rows, format='csr')
+                row_end = current_row_start + combined_matrix.shape[0] - 1
+                chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
+                output_files.append(chunk_output_path)
+                
+                row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
+                column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
+                column_nnz_accumulator += column_nnz_chunk
+                
+                print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
+                mmwrite(chunk_output_path, combined_matrix)
+                print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
+                
+                row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
+                np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
+                
+                manifest_data.append({
+                    'mtx_file': os.path.basename(chunk_output_path),
+                    'mtx_path': chunk_output_path,
+                    'row_start': current_row_start,
+                    'row_end': row_end,
+                    'n_rows': combined_matrix.shape[0],
+                    'source_files': current_chunk_zarrs.copy()
+                })
+                
+                current_row_start = row_end + 1
+                mtx_file_idx += 1
+                del combined_matrix
+                current_chunk_rows = []
+                current_chunk_zarrs = []
+            
+            # Write this large file in chunks
+            for chunk_start in range(0, n_rows, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, n_rows)
+                X_chunk = X_aligned[chunk_start:chunk_end]
+                
+                row_nnz = np.diff(X_chunk.indptr).astype(np.uint32)
+                column_nnz_chunk = X_chunk.getnnz(axis=0).astype(np.uint32)
+                column_nnz_accumulator += column_nnz_chunk
+                
+                row_end = current_row_start + X_chunk.shape[0] - 1
+                chunk_output_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}.mtx")
+                output_files.append(chunk_output_path)
+                
+                print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
+                mmwrite(chunk_output_path, X_chunk)
+                print(f"  ✓ {X_chunk.shape[0]} rows × {n_new_cols} cols, {X_chunk.nnz} non-zeros")
+                
+                row_nnz_path = os.path.join(mtx_output_dir, f"rows_{current_row_start}_{row_end}_nnz.txt")
+                np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
+                
+                manifest_data.append({
+                    'mtx_file': os.path.basename(chunk_output_path),
+                    'mtx_path': chunk_output_path,
+                    'row_start': current_row_start,
+                    'row_end': row_end,
+                    'n_rows': X_chunk.shape[0],
+                    'source_files': [{
+                        'file': file_path.name,
+                        'file_path': str(file_path),
+                        'file_type': file_type,
+                        'rows_in_chunk': X_chunk.shape[0],
+                        'row_start_in_chunk': chunk_start
+                    }]
+                })
+                
+                current_row_start = row_end + 1
+                mtx_file_idx += 1
+                del X_chunk
+                gc.collect()
+            
+            # Free the large matrix
+            del X_aligned
+            gc.collect()
+            continue
         
         current_chunk_rows.append(X_aligned)
         current_chunk_zarrs.append({
@@ -407,6 +521,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             mtx_file_idx += 1
             
             del combined_matrix, matrix_to_write
+            gc.collect()  # Force garbage collection after writing chunk
     
     # Write final chunk if there are remaining rows
     if current_chunk_rows:
@@ -443,6 +558,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         })
         
         del combined_matrix
+        gc.collect()  # Force garbage collection after final chunk
     
     # Write column nnz to file (accumulated across all MTX files)
     column_nnz_path = os.path.join(output_dir, "column_nnz.txt")
@@ -561,10 +677,12 @@ def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols)
         
         # Free original matrix
         del matrix
+        gc.collect()  # Force garbage collection after processing each MTX file
     
     print(f"  ✓ Created {sum(len(frags) for frags in fragment_map.values())} transposed fragments in tmp directory")
     
     # Step 2: Combine fragments covering the same column range
+    # Process incrementally to avoid loading all fragments at once
     print(f"\n  Combining fragments by column range...")
     
     for frag_idx in range(num_fragments):
@@ -577,33 +695,62 @@ def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols)
         
         print(f"    Fragment {frag_idx}: columns {col_start}-{col_end-1} ({len(frag_list)} fragments to combine)...")
         
-        # Load and combine all fragments for this column range
-        combined_fragments = []
-        for mtx_file, frag_path in frag_list:
-            frag_matrix = mmread(frag_path)
-            # Convert to CSR format if needed
-            if not isinstance(frag_matrix, csr_matrix):
-                frag_matrix = frag_matrix.tocsr()
-            combined_fragments.append(frag_matrix)
-            # Free memory immediately
-            del frag_matrix
+        # Process fragments incrementally: combine in batches to avoid memory bloat
+        # For very large datasets, combine in smaller batches
+        batch_size = max(10, min(50, len(frag_list)))  # Adaptive batch size
         
-        # Stack fragments horizontally (hstack): each fragment adds more columns (cells)
-        # After transposition: rows = genes (256), columns = cells
-        # Combining fragments from different MTX files adds more cells (columns)
-        if combined_fragments:
-            combined_matrix = hstack(combined_fragments, format='csr')
+        if len(frag_list) <= batch_size:
+            # Small enough to combine all at once
+            combined_fragments = []
+            for mtx_file, frag_path in frag_list:
+                frag_matrix = mmread(frag_path)
+                if not isinstance(frag_matrix, csr_matrix):
+                    frag_matrix = frag_matrix.tocsr()
+                combined_fragments.append(frag_matrix)
+                del frag_matrix
             
+            if combined_fragments:
+                combined_matrix = hstack(combined_fragments, format='csr')
+                del combined_fragments
+        else:
+            # Combine in batches to avoid memory issues
+            print(f"      Combining {len(frag_list)} fragments in batches of {batch_size}...")
+            combined_matrix = None
+            
+            for batch_start in range(0, len(frag_list), batch_size):
+                batch_end = min(batch_start + batch_size, len(frag_list))
+                batch_frags = []
+                
+                for mtx_file, frag_path in frag_list[batch_start:batch_end]:
+                    frag_matrix = mmread(frag_path)
+                    if not isinstance(frag_matrix, csr_matrix):
+                        frag_matrix = frag_matrix.tocsr()
+                    batch_frags.append(frag_matrix)
+                    del frag_matrix
+                
+                if batch_frags:
+                    batch_combined = hstack(batch_frags, format='csr')
+                    del batch_frags
+                    
+                    if combined_matrix is None:
+                        combined_matrix = batch_combined
+                    else:
+                        # Combine with previous batches
+                        combined_matrix = hstack([combined_matrix, batch_combined], format='csr')
+                        del batch_combined
+                        gc.collect()
+        
+        if combined_matrix is not None:
             # Save combined fragment
             cm_filename = f"cols_{col_start}_{col_end-1}.mtx"
             cm_path = os.path.join(cm_mtx_dir, cm_filename)
             mmwrite(cm_path, combined_matrix)
             
-            print(f"      ✓ Combined {len(combined_fragments)} fragments -> {combined_matrix.shape[0]} rows × {combined_matrix.shape[1]} cols")
+            print(f"      ✓ Combined {len(frag_list)} fragments -> {combined_matrix.shape[0]} rows × {combined_matrix.shape[1]} cols")
             
-            # Free memory
+            # Free memory immediately
             del combined_matrix
-            del combined_fragments
+            gc.collect()
     
     print(f"\n  ✓ Created {num_fragments} column-major MTX files in {cm_mtx_dir}")
     print(f"  ✓ Column-major fragments allow efficient access to gene columns")
