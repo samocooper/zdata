@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Align columns (genes) in zarr files to a standard gene list and output as MTX format.
-Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each by default).
+Align columns (genes) in zarr or h5ad files to a standard gene list and output as MTX format.
+Processes a directory of .zarr files (directories) or .h5/.hdf5 files (h5ad format),
+concatenating them into MTX files (max 131072 rows each by default).
+Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files).
 Outputs multiple MTX files named by row range (e.g., rows_0_131071.mtx) and a manifest file.
 These files can be converted to zdata format using mtx_to_zdata.
 """
 
 import zarr
+import anndata as ad
 from scipy.sparse import csr_matrix, csc_matrix, vstack, hstack
 from scipy.io import mmwrite, mmread
 import numpy as np
@@ -52,6 +55,125 @@ def get_default_gene_list_path() -> Path:
     
     return gene_list_path
 
+def _detect_file_type(file_path):
+    """
+    Detect file type based on extension and structure.
+    
+    Args:
+        file_path: Path to file or directory
+        
+    Returns:
+        str: 'zarr', 'h5ad', or None if unknown
+    """
+    path = Path(file_path)
+    
+    # Check if it's a directory (zarr files are directories)
+    if path.is_dir() and path.name.endswith('.zarr'):
+        return 'zarr'
+    
+    # Check file extensions for h5ad
+    if path.is_file():
+        if path.suffix in ['.h5', '.hdf5'] or path.name.endswith('.h5ad'):
+            return 'h5ad'
+        elif path.name.endswith('.zarr'):
+            return 'zarr'
+    
+    return None
+
+def _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols):
+    """
+    Reorder columns of a CSC matrix according to old_to_new_idx mapping.
+    Shared helper function for both zarr and h5ad processing.
+    
+    Args:
+        X_csc: CSC sparse matrix to reorder
+        old_to_new_idx: Dictionary mapping old column indices to new column indices
+        n_new_cols: Number of columns in the output matrix
+    
+    Returns:
+        csr_matrix: Reordered matrix in CSR format
+    """
+    n_rows, n_old_cols = X_csc.shape
+    
+    old_data = X_csc.data
+    old_indices = X_csc.indices
+    old_indptr = X_csc.indptr
+    
+    # Reorder columns according to old_to_new_idx mapping
+    new_col_data = [[] for _ in range(n_new_cols)]
+    new_col_indices = [[] for _ in range(n_new_cols)]
+    
+    for old_col in range(n_old_cols):
+        if old_col in old_to_new_idx:
+            new_col = old_to_new_idx[old_col]
+            col_start = old_indptr[old_col]
+            col_end = old_indptr[old_col + 1]
+            new_col_data[new_col].extend(old_data[col_start:col_end])
+            new_col_indices[new_col].extend(old_indices[col_start:col_end])
+    
+    # Build new CSC matrix with reordered columns
+    new_data = []
+    new_indices = []
+    new_indptr = [0]
+    
+    for new_col in range(n_new_cols):
+        new_data.extend(new_col_data[new_col])
+        new_indices.extend(new_col_indices[new_col])
+        new_indptr.append(len(new_data))
+    
+    X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
+                                   shape=(n_rows, n_new_cols)).tocsr()
+    
+    return X_chunk_reordered
+
+def process_h5ad_file(h5ad_path, gene_list_path, old_to_new_idx, n_new_cols):
+    """
+    Process a single h5ad file and return aligned CSR matrix.
+    
+    Args:
+        h5ad_path: Path to .h5 or .hdf5 file (h5ad format)
+        gene_list_path: Path to gene list file (for consistency with zarr function)
+        old_to_new_idx: Dictionary mapping old column indices to new column indices
+        n_new_cols: Number of columns in the aligned matrix
+    
+    Returns:
+        csr_matrix: Aligned CSR matrix
+        n_rows: Number of rows processed
+    
+    Raises:
+        RuntimeError: If processing fails
+    """
+    try:
+        # Read h5ad file (full load for matrix processing)
+        # We need the full matrix in memory anyway for column reordering
+        adata = ad.read_h5ad(h5ad_path)
+        
+        # Get matrix (now in-memory, not lazy)
+        X = adata.X
+        
+        # Convert to CSR if needed
+        if not isinstance(X, csr_matrix):
+            X_csr = X.tocsr()
+        else:
+            X_csr = X
+        
+        n_rows, n_old_cols = X_csr.shape
+        
+        # Convert to CSC for efficient column access
+        X_csc = X_csr.tocsc()
+        
+        # Reorder columns using shared helper
+        X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
+        
+        # Clean up
+        del X_csr, X_csc
+        adata.file.close()  # Close h5ad file
+        
+        return X_chunk_reordered, n_rows
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to process h5ad file {h5ad_path}: {e}") from e
+
 def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
     """
     Process a single zarr file and return aligned CSR matrix.
@@ -82,33 +204,8 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
         X_csr = csr_matrix((data, indices, indptr), shape=(n_rows, n_cols))
         X_csc = X_csr.tocsc()
         
-        old_data = X_csc.data
-        old_indices = X_csc.indices
-        old_indptr = X_csc.indptr
-        n_old_cols = X_csc.shape[1]
-        
-        new_col_data = [[] for _ in range(n_new_cols)]
-        new_col_indices = [[] for _ in range(n_new_cols)]
-        
-        for old_col in range(n_old_cols):
-            if old_col in old_to_new_idx:
-                new_col = old_to_new_idx[old_col]
-                col_start = old_indptr[old_col]
-                col_end = old_indptr[old_col + 1]
-                new_col_data[new_col].extend(old_data[col_start:col_end])
-                new_col_indices[new_col].extend(old_indices[col_start:col_end])
-        
-        new_data = []
-        new_indices = []
-        new_indptr = [0]
-        
-        for new_col in range(n_new_cols):
-            new_data.extend(new_col_data[new_col])
-            new_indices.extend(new_col_indices[new_col])
-            new_indptr.append(len(new_data))
-        
-        X_chunk_reordered = csc_matrix((new_data, new_indices, new_indptr), 
-                                       shape=(n_rows, n_new_cols)).tocsr()
+        # Reorder columns using shared helper
+        X_chunk_reordered = _reorder_matrix_columns(X_csc, old_to_new_idx, n_new_cols)
         
         del X_csr, X_csc
         
@@ -119,11 +216,12 @@ def process_zarr_file(zarr_path, gene_list_path, old_to_new_idx, n_new_cols):
 
 def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=None, chunk_size=131072):
     """
-    Process a directory of zarr files, align columns to standard gene list, and write as MTX files.
-    Concatenates multiple zarr files into single MTX files (max chunk_size rows each).
+    Process a directory of zarr or h5ad files, align columns to standard gene list, and write as MTX files.
+    Concatenates multiple files into single MTX files (max chunk_size rows each).
+    Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files).
     
     Args:
-        zarr_dir: Directory containing .zarr files to process
+        zarr_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad) to process
         gene_list_path: Path to file containing standard gene list (one per line)
         output_dir: Directory where output MTX files will be written
         tmp_dir: Optional temporary directory for intermediate files
@@ -142,12 +240,28 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     n_new_cols = len(gene_list)
     
     zarr_dir_path = Path(zarr_dir)
+    
+    # Auto-detect and collect files (zarr directories and h5ad files)
     zarr_files = sorted([f for f in zarr_dir_path.glob("*.zarr") if f.is_dir()])
+    h5ad_files = sorted([f for f in zarr_dir_path.iterdir() 
+                         if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
     
-    if not zarr_files:
-        raise ValueError(f"No .zarr files found in {zarr_dir}")
+    all_files = []
+    file_types = {}
     
-    print(f"Found {len(zarr_files)} zarr file(s) to process")
+    for f in zarr_files:
+        all_files.append(f)
+        file_types[f] = 'zarr'
+    
+    for f in h5ad_files:
+        all_files.append(f)
+        file_types[f] = 'h5ad'
+    
+    if not all_files:
+        raise ValueError(f"No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {zarr_dir}")
+    
+    print(f"Found {len(zarr_files)} zarr file(s) and {len(h5ad_files)} h5ad file(s) to process")
+    print(f"Total files: {len(all_files)}")
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
@@ -169,33 +283,54 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     current_row_start = 0
     mtx_file_idx = 0
     
-    for zarr_idx, zarr_path in enumerate(zarr_files):
-        print(f"\n[{zarr_idx + 1}/{len(zarr_files)}] Processing: {zarr_path.name}")
+    for file_idx, file_path in enumerate(all_files):
+        file_type = file_types[file_path]
+        print(f"\n[{file_idx + 1}/{len(all_files)}] Processing {file_type.upper()}: {file_path.name}")
         
-        zarr_group = zarr.open(str(zarr_path), mode='r')
-        if 'var' not in zarr_group or 'gene' not in zarr_group['var']:
-            raise ValueError(f"Zarr file {zarr_path.name} is missing required 'var/gene' array. All zarr files must have this structure.")
+        # Get genes based on file type
+        if file_type == 'zarr':
+            zarr_group = zarr.open(str(file_path), mode='r')
+            if 'var' not in zarr_group or 'gene' not in zarr_group['var']:
+                raise ValueError(f"Zarr file {file_path.name} is missing required 'var/gene' array. All zarr files must have this structure.")
+            file_genes = zarr_group['var']['gene'][:].tolist()
+        elif file_type == 'h5ad':
+            # Use full loading for gene list extraction (small operation)
+            adata = ad.read_h5ad(file_path)
+            # Try var_names (standard anndata) or var/gene (if exists)
+            if hasattr(adata.var, 'index'):
+                file_genes = adata.var.index.tolist()
+            elif 'gene' in adata.var.columns:
+                file_genes = adata.var['gene'].tolist()
+            else:
+                # Fallback to var_names
+                file_genes = adata.var_names.tolist()
+        else:
+            raise ValueError(f"Unknown file type for {file_path.name}")
         
-        zarr_genes = zarr_group['var']['gene'][:].tolist()
-        
-        gene_to_old_idx = {gene: idx for idx, gene in enumerate(zarr_genes)}
+        # Create gene mapping
+        gene_to_old_idx = {gene: idx for idx, gene in enumerate(file_genes)}
         old_to_new_idx = {}
         for new_idx, gene in enumerate(gene_list):
             if gene in gene_to_old_idx:
                 old_col_idx = gene_to_old_idx[gene]
                 old_to_new_idx[old_col_idx] = new_idx
         
-        X_aligned, n_rows = process_zarr_file(str(zarr_path), gene_list_path, old_to_new_idx, n_new_cols)
+        # Process file based on type
+        if file_type == 'zarr':
+            X_aligned, n_rows = process_zarr_file(str(file_path), gene_list_path, old_to_new_idx, n_new_cols)
+        elif file_type == 'h5ad':
+            X_aligned, n_rows = process_h5ad_file(str(file_path), gene_list_path, old_to_new_idx, n_new_cols)
         
         if X_aligned is None:
-            raise RuntimeError(f"Failed to process zarr file {zarr_path.name}. This file must be processed successfully - skipping is not allowed.")
+            raise RuntimeError(f"Failed to process {file_type} file {file_path.name}. This file must be processed successfully - skipping is not allowed.")
         
-        print(f"  Processed {n_rows} rows from {zarr_path.name}")
+        print(f"  Processed {n_rows} rows from {file_path.name}")
         
         current_chunk_rows.append(X_aligned)
         current_chunk_zarrs.append({
-            'zarr_file': zarr_path.name,
-            'zarr_path': str(zarr_path),
+            'file': file_path.name,
+            'file_path': str(file_path),
+            'file_type': file_type,
             'rows_in_chunk': n_rows,
             'row_start_in_chunk': sum(m.shape[0] for m in current_chunk_rows[:-1])
         })
@@ -228,8 +363,9 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                         zarr_files_written.append(partial_info)
                         
                         remainder_zarr_info = {
-                            'zarr_file': zarr_info['zarr_file'],
-                            'zarr_path': zarr_info['zarr_path'],
+                            'file': zarr_info['file'],
+                            'file_path': zarr_info['file_path'],
+                            'file_type': zarr_info['file_type'],
                             'rows_in_chunk': remainder_rows,
                             'row_start_in_chunk': 0
                         }
@@ -264,7 +400,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
                 'row_start': current_row_start,
                 'row_end': row_end,
                 'n_rows': matrix_to_write.shape[0],
-                'zarr_files': zarr_files_written
+                'source_files': zarr_files_written
             })
             
             current_row_start = row_end + 1
@@ -303,7 +439,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             'row_start': current_row_start,
             'row_end': row_end,
             'n_rows': combined_matrix.shape[0],
-            'zarr_files': current_chunk_zarrs
+            'source_files': current_chunk_zarrs
         })
         
         del combined_matrix
@@ -318,8 +454,9 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     manifest = {
         'gene_list_file': str(gene_list_path),
         'n_genes': n_new_cols,
-        'zarr_files_processed': [str(f) for f in zarr_files],
-        'zarr_files_order': [f.name for f in zarr_files],
+        'source_files_processed': [str(f) for f in all_files],
+        'source_files_order': [f.name for f in all_files],
+        'file_types': {str(f): file_types[f] for f in all_files},
         'mtx_files': manifest_data,
         'total_mtx_files': len(output_files),
         'chunk_size': chunk_size,
@@ -482,13 +619,15 @@ def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols)
 def main():
     """Main function with command-line interface."""
     parser = argparse.ArgumentParser(
-        description='Align zarr file(s) columns to standard gene list and output as MTX format. '
-                    'Processes a directory of zarr files, concatenating them into MTX files (max 131072 rows each by default).'
+        description='Align zarr or h5ad file(s) columns to standard gene list and output as MTX format. '
+                    'Processes a directory of .zarr files (directories) or .h5/.hdf5 files (h5ad), '
+                    'concatenating them into MTX files (max 131072 rows each by default). '
+                    'Auto-detects file type based on extensions.'
     )
     parser.add_argument(
         'zarr_input',
         type=str,
-        help='Path to input .zarr file or directory containing .zarr files'
+        help='Path to input directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)'
     )
     parser.add_argument(
         'output_dir',
@@ -551,18 +690,18 @@ def main():
                 args.tmp_dir,
                 args.chunk_size
             )
-        elif str(zarr_input_path).endswith('.zarr'):
-            # Single zarr file - treat parent directory as input (will only find this one file)
-            zarr_dir = zarr_input_path.parent
+        elif str(zarr_input_path).endswith('.zarr') or zarr_input_path.suffix in ['.h5', '.hdf5']:
+            # Single file - treat parent directory as input (will only find this one file)
+            input_dir = zarr_input_path.parent
             align_zarr_directory_to_mtx(
-                str(zarr_dir),
+                str(input_dir),
                 gene_list_path,
                 args.output_dir,
                 args.tmp_dir,
                 args.chunk_size
             )
         else:
-            print(f"ERROR: Input must be a directory containing .zarr files or a .zarr file/directory")
+            print(f"ERROR: Input must be a directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)")
             sys.exit(1)
         print("\n✓ Alignment complete!")
         return 0

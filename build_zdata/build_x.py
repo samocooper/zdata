@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 # Get the path to the mtx_to_zdata executable
-_MODULE_DIR = Path(__file__).parent  # zdata/build/
+_MODULE_DIR = Path(__file__).parent  # zdata/build_zdata/
 _PROJECT_ROOT = _MODULE_DIR.parent   # zdata/
 _MTX_TO_ZDATA = _PROJECT_ROOT / "ctools" / "mtx_to_zdata"
 

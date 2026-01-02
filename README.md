@@ -20,6 +20,48 @@ This approach provides excellent compression ratios while maintaining fast rando
 - **Python API** - Simple, intuitive interface for data access
 - **C-based backend** - High-performance C implementation for core operations
 
+## Quick Start
+
+### Building zdata from Zarr Files
+
+The easiest way to create a zdata object is from a directory of zarr files:
+
+```python
+from zdata import build_zdata_from_zarr
+
+# Build zdata from a directory containing .zarr files
+zdata_dir = build_zdata_from_zarr(
+    zarr_dir='/path/to/zarr/directory',  # Directory containing .zarr files
+    output_name='my_dataset.zdata',       # Output zdata directory name
+    block_rows=16,                        # Rows per block (default: 16)
+    max_rows=8192,                        # Max rows per chunk (default: 8192)
+    obs_join_strategy="outer"            # How to join obs metadata: "inner", "outer", or "columns"
+)
+
+# The function returns the path to the created zdata directory
+print(f"Created zdata directory at: {zdata_dir}")
+```
+
+This single function:
+1. Aligns all zarr files to a standard gene list
+2. Converts them to zdata format with efficient compression
+3. Concatenates observation metadata from all zarr files
+4. Creates a complete `.zdata/` directory ready for querying
+
+### Reading from zdata
+
+```python
+from zdata import ZData
+
+# Open the zdata directory
+reader = ZData("my_dataset.zdata")
+
+# Query specific rows
+rows_data = reader.read_rows([100, 200, 300])
+for row_id, cols, vals in rows_data:
+    print(f"Row {row_id}: {len(cols)} non-zero values")
+```
+
 ## Installation
 
 ### Prerequisites
@@ -134,7 +176,7 @@ zdata/
 ├── core/              # Python core module
 │   ├── zdata.py      # ZData class implementation
 │   └── __init__.py
-├── build/             # Build and preprocessing utilities
+├── build_zdata/        # Build and preprocessing utilities
 │   ├── build_x.py     # Build zdata from MTX files
 │   ├── align_mtx.py   # Align zarr files to standard gene list
 │   ├── check_directory.py  # Check zarr directory structure

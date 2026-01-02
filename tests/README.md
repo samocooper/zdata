@@ -16,7 +16,28 @@ tests/
 ├── test_index/              # Indexing tests
 │   └── test_normalize_indices.py  # Index normalization tests
 ├── test_full_pipeline_at_scale.py  # Large-scale pipeline tests (external data)
-└── zarr_test_dir/           # Test zarr data files
+├── zarr_test_dir/           # Test zarr data files
+└── h5ad_test_dir/           # Test h5ad data files (.h5/.hdf5)
+```
+
+## H5AD File Support
+
+The test suite now supports both zarr and h5ad file formats:
+
+- **Zarr files**: Tested via `zarr_test_dir/` and `zdata_instance` fixture
+- **H5AD files**: Tested via `h5ad_test_dir/` and `zdata_instance_h5ad` fixture
+
+### Running H5AD Tests
+
+```bash
+# Run h5ad-specific tests
+pytest tests/test_core/test_h5ad.py
+
+# Run full pipeline test with h5ad files
+python tests/test_full_pipeline_at_scale.py --h5ad
+
+# Or specify h5ad directory explicitly
+python tests/test_full_pipeline_at_scale.py /path/to/h5ad_test_dir
 ```
 
 ## Running Tests
@@ -55,7 +76,9 @@ pytest tests/ -m "not slow"
 
 The `conftest.py` file provides reusable fixtures:
 
-- `zdata_instance`: Creates a ZData instance from test zarr files
+- `zdata_instance`: Creates a ZData instance from test zarr files (session-scoped)
+- `zdata_instance_h5ad`: Creates a ZData instance from test h5ad files (session-scoped)
+- `h5ad_test_dir`: Provides path to h5ad test directory
 - `tmp_zdata_dir`: Creates a temporary zdata directory structure
 - `sample_metadata`: Creates sample metadata for testing
 - `sample_obs_data`: Creates sample observation data
@@ -95,7 +118,7 @@ def test_read_rows_with_slice(zdata_instance: ZData):
 ## Test Data
 
 - Small test data is created on-the-fly using fixtures
-- Larger tests use the `zarr_test_dir/` directory
+- Larger tests use the `zarr_test_dir/` or `h5ad_test_dir/` directories
 - `test_full_pipeline_at_scale.py` requires external data and is not run by default
 - C tools tests create sample MTX files dynamically
 
@@ -104,7 +127,7 @@ def test_read_rows_with_slice(zdata_instance: ZData):
 Some tests may be skipped if required dependencies are not available:
 
 1. **`test_zdata.py` tests**: These require:
-   - Zarr test files in `tests/zarr_test_dir/`
+   - Zarr test files in `tests/zarr_test_dir/` or h5ad files in `tests/h5ad_test_dir/`
    - C tools compiled (`ctools/mtx_to_zdata`, `ctools/zdata_read`)
    - ZSTD library available
    - Successful build of zdata from zarr files
@@ -118,7 +141,7 @@ Some tests may be skipped if required dependencies are not available:
    The `-rs` flag shows skip reasons.
 
 3. **To ensure all tests run**, make sure:
-   - Zarr test files exist in `tests/zarr_test_dir/`
+   - Zarr test files exist in `tests/zarr_test_dir/` or h5ad files in `tests/h5ad_test_dir/`
    - C tools are compiled (run the test suite once to compile them)
    - ZSTD library is available
 

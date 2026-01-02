@@ -8,6 +8,7 @@ and saves the result as a parquet file in the zdata directory.
 """
 
 import zarr
+import anndata as ad
 import polars as pl
 import numpy as np
 import sys
@@ -16,6 +17,47 @@ import argparse
 from pathlib import Path
 from typing import List, Optional
 
+
+def read_obs_from_h5ad(h5ad_path: str, h5ad_name: str) -> pl.DataFrame:
+    """
+    Read obs/metadata from a single h5ad file and convert to polars DataFrame.
+    
+    Args:
+        h5ad_path: Path to the h5ad file (.h5 or .hdf5)
+        h5ad_name: Name of the h5ad file (for source tracking)
+    
+    Returns:
+        polars DataFrame with obs data
+    
+    Raises:
+        RuntimeError: If reading fails
+    """
+    try:
+        # Use full loading instead of backed mode for better type consistency
+        adata = ad.read_h5ad(h5ad_path)
+        
+        # Get obs DataFrame (pandas)
+        obs_df = adata.obs
+        
+        # Convert to polars
+        df = pl.from_pandas(obs_df)
+        
+        # Normalize integer types to avoid schema conflicts when concatenating
+        # Cast all integer types to Int64 for consistency
+        for col in df.columns:
+            dtype = df[col].dtype
+            if dtype in [pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32]:
+                df = df.with_columns(pl.col(col).cast(pl.Int64))
+        
+        # Add source column
+        df = df.with_columns([
+            pl.lit(h5ad_name).alias("_source_file")
+        ])
+        
+        return df
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to read obs data from {h5ad_name}: {e}") from e
 
 def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
     """
@@ -150,8 +192,24 @@ def concat_obs_dataframes(
     
     if join_strategy == "outer":
         # Outer: keep all columns from all dataframes, fill missing with null
+        # Normalize integer types across all dataframes before concatenation
+        # to avoid schema conflicts (Int8 vs Int64, etc.)
+        normalized_dfs = []
+        for df in dataframes:
+            # Cast all integer types to Int64 for consistency
+            cast_exprs = []
+            for col in df.columns:
+                dtype = df[col].dtype
+                if dtype in [pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32]:
+                    cast_exprs.append(pl.col(col).cast(pl.Int64))
+                else:
+                    cast_exprs.append(pl.col(col))
+            if cast_exprs:
+                df = df.with_columns(cast_exprs)
+            normalized_dfs.append(df)
+        
         # Use concat with how='diagonal' to align columns and fill missing values
-        result = pl.concat(dataframes, how='diagonal')
+        result = pl.concat(normalized_dfs, how='diagonal')
         return result
     
     elif join_strategy == "inner":
@@ -184,7 +242,21 @@ def concat_obs_dataframes(
             cols_to_select = common_cols.copy()
             if "_source_zarr" in df.columns:
                 cols_to_select.append("_source_zarr")
-            selected_dfs.append(df.select(cols_to_select))
+            if "_source_file" in df.columns:
+                cols_to_select.append("_source_file")
+            df_selected = df.select(cols_to_select)
+            
+            # Normalize integer types
+            cast_exprs = []
+            for col in df_selected.columns:
+                dtype = df_selected[col].dtype
+                if dtype in [pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32]:
+                    cast_exprs.append(pl.col(col).cast(pl.Int64))
+                else:
+                    cast_exprs.append(pl.col(col))
+            if cast_exprs:
+                df_selected = df_selected.with_columns(cast_exprs)
+            selected_dfs.append(df_selected)
         
         # Concatenate rows
         result = pl.concat(selected_dfs, how='diagonal')
@@ -209,7 +281,21 @@ def concat_obs_dataframes(
             cols_to_select = list(join_on)
             if "_source_zarr" in df.columns:
                 cols_to_select.append("_source_zarr")
-            selected_dfs.append(df.select(cols_to_select))
+            if "_source_file" in df.columns:
+                cols_to_select.append("_source_file")
+            df_selected = df.select(cols_to_select)
+            
+            # Normalize integer types
+            cast_exprs = []
+            for col in df_selected.columns:
+                dtype = df_selected[col].dtype
+                if dtype in [pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32]:
+                    cast_exprs.append(pl.col(col).cast(pl.Int64))
+                else:
+                    cast_exprs.append(pl.col(col))
+            if cast_exprs:
+                df_selected = df_selected.with_columns(cast_exprs)
+            selected_dfs.append(df_selected)
         
         # Concatenate rows
         result = pl.concat(selected_dfs, how='diagonal')
@@ -229,66 +315,88 @@ def concat_obs_from_zarr_directory(
     row_nnz_files: Optional[List[str]] = None
 ):
     """
-    Read obs data from all zarr files in a directory, join them, and save to parquet.
+    Read obs data from all zarr or h5ad files in a directory, join them, and save to parquet.
+    Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files).
     
     Args:
-        zarr_dir: Directory containing .zarr files
+        zarr_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad)
         output_dir: Directory where parquet file will be saved (typically zdata directory)
         join_strategy: One of "inner", "outer", or "columns"
         join_on: If join_strategy is "columns", list of column names to join on
         output_filename: Name of output parquet file
-        zarr_files_filter: Optional set of zarr file names to process (filters available files)
+        zarr_files_filter: Optional set of file names to process (filters available files)
         row_nnz_files: Optional list of text files containing row nnz values (one per line)
                       These will be merged into the obs DataFrame as an 'nnz' column
     
     Returns:
         Path to created parquet file
     """
+    from zdata.build_zdata.align_mtx import _detect_file_type
+    
     zarr_dir_path = Path(zarr_dir)
     
-    # Find all zarr files in directory (alphabetical order)
+    # Find all files (zarr directories and h5ad files)
     all_zarr_files = sorted([f for f in zarr_dir_path.glob("*.zarr") if f.is_dir()])
+    all_h5ad_files = sorted([f for f in zarr_dir_path.iterdir() 
+                              if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
     
-    # Filter to only process zarr files that were successfully processed in alignment step
+    all_files = []
+    file_types = {}
+    
+    for f in all_zarr_files:
+        all_files.append(f)
+        file_types[f] = 'zarr'
+    
+    for f in all_h5ad_files:
+        all_files.append(f)
+        file_types[f] = 'h5ad'
+    
+    # Filter to only process files that were successfully processed in alignment step
     if zarr_files_filter is not None:
-        zarr_files = [f for f in all_zarr_files if f.name in zarr_files_filter]
-        if len(zarr_files) < len(all_zarr_files):
-            skipped = len(all_zarr_files) - len(zarr_files)
-            print(f"Filtering zarr files: {len(zarr_files)} to process, {skipped} skipped (not in alignment manifest)")
+        files = [f for f in all_files if f.name in zarr_files_filter]
+        if len(files) < len(all_files):
+            skipped = len(all_files) - len(files)
+            print(f"Filtering files: {len(files)} to process, {skipped} skipped (not in alignment manifest)")
     else:
-        zarr_files = all_zarr_files
+        files = all_files
     
-    if not zarr_files:
+    if not files:
         if zarr_files_filter:
-            raise ValueError(f"No zarr files found matching filter. Available: {[f.name for f in all_zarr_files]}")
+            raise ValueError(f"No files found matching filter. Available: {[f.name for f in all_files]}")
         else:
-            raise ValueError(f"No .zarr files found in {zarr_dir}")
+            raise ValueError(f"No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {zarr_dir}")
     
-    print(f"Found {len(zarr_files)} zarr file(s) to process")
+    print(f"Found {len([f for f in files if file_types[f] == 'zarr'])} zarr file(s) and {len([f for f in files if file_types[f] == 'h5ad'])} h5ad file(s) to process")
     print(f"Join strategy: {join_strategy}")
     if join_on:
         print(f"Join columns: {', '.join(join_on)}")
     
-    # Read obs data from each zarr file
-    print(f"\nReading obs data from zarr files...")
+    # Read obs data from each file
+    print(f"\nReading obs data from files...")
     dataframes = []
     
-    for zarr_idx, zarr_path in enumerate(zarr_files):
-        zarr_name = zarr_path.name
-        print(f"  [{zarr_idx + 1}/{len(zarr_files)}] Processing: {zarr_name}")
+    for file_idx, file_path in enumerate(files):
+        file_name = file_path.name
+        file_type = file_types[file_path]
+        print(f"  [{file_idx + 1}/{len(files)}] Processing {file_type.upper()}: {file_name}")
         
-        df = read_obs_from_zarr(str(zarr_path), zarr_name)
+        if file_type == 'zarr':
+            df = read_obs_from_zarr(str(file_path), file_name)
+        elif file_type == 'h5ad':
+            df = read_obs_from_h5ad(str(file_path), file_name)
+        else:
+            raise ValueError(f"Unknown file type for {file_name}")
         
         if df is None:
-            raise RuntimeError(f"Failed to read obs data from {zarr_name}. This file must be processed successfully - skipping is not allowed.")
+            raise RuntimeError(f"Failed to read obs data from {file_name}. This file must be processed successfully - skipping is not allowed.")
         
         print(f"    ✓ Read {df.height} rows, {len(df.columns)} columns")
         dataframes.append(df)
     
     if not dataframes:
-        raise ValueError("No obs data successfully read from any zarr files")
+        raise ValueError("No obs data successfully read from any files")
     
-    print(f"\nSuccessfully read obs data from {len(dataframes)} zarr file(s)")
+    print(f"\nSuccessfully read obs data from {len(dataframes)} file(s)")
     
     # Join dataframes
     print(f"\nJoining dataframes...")

@@ -18,9 +18,9 @@ import tempfile
 from pathlib import Path
 
 # Import functions from other build scripts
-from zdata.build.align_mtx import align_zarr_directory_to_mtx
-from zdata.build.build_x import build_zdata
-from zdata.build.concat_obs import concat_obs_from_zarr_directory
+from zdata.build_zdata.align_mtx import align_zarr_directory_to_mtx
+from zdata.build_zdata.build_x import build_zdata
+from zdata.build_zdata.concat_obs import concat_obs_from_zarr_directory
 
 import polars as pl
 
@@ -38,10 +38,11 @@ def build_zdata_from_zarr(
     mtx_chunk_size: int = 131072
 ):
     """
-    Build complete zdata object from directory of zarr files.
+    Build complete zdata object from directory of zarr or h5ad files.
+    Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files).
     
     Args:
-        zarr_dir: Directory containing .zarr files
+        zarr_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)
         output_name: Output directory name (can include .zdata suffix, e.g., "atlas.zdata")
         gene_list_path: Path to standard gene list file (default: uses package default)
         block_rows: Number of rows per block (default: 16)
@@ -62,17 +63,20 @@ def build_zdata_from_zarr(
     if not zarr_dir_path.is_dir():
         raise ValueError(f"Path is not a directory: {zarr_dir}")
     
-    # Check for zarr files
+    # Auto-detect and check for files (zarr directories and h5ad files)
     zarr_files = sorted([f for f in zarr_dir_path.glob("*.zarr") if f.is_dir()])
-    if not zarr_files:
-        raise ValueError(f"No .zarr files found in {zarr_dir}")
+    h5ad_files = sorted([f for f in zarr_dir_path.iterdir() 
+                         if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
+    
+    if not zarr_files and not h5ad_files:
+        raise ValueError(f"No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {zarr_dir}")
     
     print("=" * 70)
-    print("Building zdata from zarr files")
+    print("Building zdata from files")
     print("=" * 70)
-    print(f"Input zarr directory: {zarr_dir}")
+    print(f"Input directory: {zarr_dir}")
     print(f"Output zdata directory: {output_name}")
-    print(f"Found {len(zarr_files)} zarr file(s)")
+    print(f"Found {len(zarr_files)} zarr file(s) and {len(h5ad_files)} h5ad file(s)")
     
     # Step 1: Align zarr files to standard gene list and convert to MTX
     print("\n" + "=" * 70)
@@ -81,7 +85,7 @@ def build_zdata_from_zarr(
     
     # Use default gene list if not provided
     if gene_list_path is None:
-        from zdata.build.align_mtx import get_default_gene_list_path
+        from zdata.build_zdata.align_mtx import get_default_gene_list_path
         gene_list_path = str(get_default_gene_list_path())
     
     if not os.path.exists(gene_list_path):
@@ -143,15 +147,18 @@ def build_zdata_from_zarr(
             if os.path.exists(manifest_path):
                 with open(manifest_path, 'r') as f:
                     manifest = json.load(f)
-                    # Collect all zarr files that contributed to MTX files
+                    # Collect all source files that contributed to MTX files
+                    # Support both old format ('zarr_files') and new format ('source_files')
                     for mtx_entry in manifest.get('mtx_files', []):
-                        for zarr_info in mtx_entry.get('zarr_files', []):
-                            zarr_file_name = zarr_info.get('zarr_file', '')
-                            if zarr_file_name:
-                                successfully_processed_zarrs.add(zarr_file_name)
+                        source_files = mtx_entry.get('source_files', mtx_entry.get('zarr_files', []))
+                        for file_info in source_files:
+                            # Support both old format ('zarr_file') and new format ('file')
+                            file_name = file_info.get('file', file_info.get('zarr_file', ''))
+                            if file_name:
+                                successfully_processed_zarrs.add(file_name)
             
             if successfully_processed_zarrs:
-                print(f"Processing obs from {len(successfully_processed_zarrs)} zarr file(s) that were successfully aligned")
+                print(f"Processing obs from {len(successfully_processed_zarrs)} file(s) that were successfully aligned")
                 
                 # Find row nnz files from MTX processing
                 row_nnz_files = []
@@ -179,7 +186,7 @@ def build_zdata_from_zarr(
                 )
                 print(f"\n✓ Obs concatenation complete! Output: {obs_output_path}")
             else:
-                raise RuntimeError("No zarr files found in manifest. This indicates a problem with the alignment step.")
+                raise RuntimeError("No source files found in manifest. This indicates a problem with the alignment step.")
         except Exception as e:
             print(f"\n✗ ERROR: Obs concatenation failed: {e}")
             import traceback
@@ -271,13 +278,14 @@ def build_zdata_from_zarr(
 def main():
     """Main function with command-line interface."""
     parser = argparse.ArgumentParser(
-        description='Build complete zdata object from directory of zarr files. '
+        description='Build complete zdata object from directory of zarr or h5ad files. '
+                    'Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files). '
                     'This orchestrates the full pipeline: alignment, zdata build, and obs concatenation.'
     )
     parser.add_argument(
         'zarr_dir',
         type=str,
-        help='Directory containing .zarr files to process'
+        help='Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format) to process'
     )
     parser.add_argument(
         'output_name',

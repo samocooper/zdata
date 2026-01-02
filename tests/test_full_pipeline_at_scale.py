@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full pipeline test: compiles C tools, builds .zdata from zarr files, and runs tests.
+Full pipeline test: compiles C tools, builds .zdata from zarr or h5ad files, and runs tests.
 """
 
 import subprocess
@@ -18,7 +18,7 @@ _parent_dir = _project_root.parent  # This is /home/ubuntu/zdata_work
 sys.path.insert(0, str(_parent_dir))
 
 # Import build_zdata_from_zarr
-from zdata.build.build_zdata import build_zdata_from_zarr
+from zdata.build_zdata.build_zdata import build_zdata_from_zarr
 
 # Configuration
 ZSTD_BASE = os.environ.get("ZSTD_BASE", "/usr/local")  # Default to common location, override with env var
@@ -30,6 +30,7 @@ ZDATA_READ_BIN = CTOOLS_DIR / "zdata_read"
 
 # Default paths (can be overridden via command line)
 DEFAULT_ZARR_DIR = os.environ.get("ZDATA_ZARR_DIR", str(_parent_dir / "zarr_datasets"))
+DEFAULT_H5AD_DIR = os.environ.get("ZDATA_H5AD_DIR", str(_test_dir / "h5ad_test_dir"))
 DEFAULT_OUTPUT_NAME = "atlas.zdata"
 DEFAULT_OUTPUT_DIR = _parent_dir / DEFAULT_OUTPUT_NAME
 
@@ -170,28 +171,56 @@ def compile_c_tools():
     print("\n✓ Both C tools compiled successfully!")
     return True
 
-def build_zdata_directory(zarr_dir, output_name, output_dir):
-    """Build .zdata directory from zarr directory using build_zdata_from_zarr.
+def build_zdata_directory(input_dir, output_name, output_dir, file_type="auto"):
+    """Build .zdata directory from zarr or h5ad directory using build_zdata_from_zarr.
+    
+    Args:
+        input_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad)
+        output_name: Output directory name
+        output_dir: Full output directory path
+        file_type: "zarr", "h5ad", or "auto" (auto-detect)
     
     Returns:
         tuple: (success: bool, actual_output_dir: Path)
     """
-    print_section("Step 2: Building .zdata from Zarr Files")
+    if file_type == "auto":
+        print_section("Step 2: Building .zdata from Files (auto-detecting type)")
+    elif file_type == "zarr":
+        print_section("Step 2: Building .zdata from Zarr Files")
+    elif file_type == "h5ad":
+        print_section("Step 2: Building .zdata from H5AD Files")
+    else:
+        print_section(f"Step 2: Building .zdata from {file_type} Files")
     
-    if not os.path.exists(zarr_dir):
-        print(f"ERROR: Zarr directory not found: {zarr_dir}")
+    if not os.path.exists(input_dir):
+        print(f"ERROR: Input directory not found: {input_dir}")
         return False, None
     
-    if not os.path.isdir(zarr_dir):
-        print(f"ERROR: Path is not a directory: {zarr_dir}")
+    if not os.path.isdir(input_dir):
+        print(f"ERROR: Path is not a directory: {input_dir}")
         return False, None
     
-    zarr_files = sorted([f for f in Path(zarr_dir).glob("*.zarr") if f.is_dir()])
-    if not zarr_files:
-        print(f"ERROR: No .zarr files found in {zarr_dir}")
-        return False, None
+    # Auto-detect file types
+    zarr_files = sorted([f for f in Path(input_dir).glob("*.zarr") if f.is_dir()])
+    h5ad_files = sorted([f for f in Path(input_dir).iterdir() 
+                         if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
     
-    print(f"Found {len(zarr_files)} zarr file(s) in {zarr_dir}")
+    if file_type == "zarr":
+        if not zarr_files:
+            print(f"ERROR: No .zarr files found in {input_dir}")
+            return False, None
+        print(f"Found {len(zarr_files)} zarr file(s) in {input_dir}")
+    elif file_type == "h5ad":
+        if not h5ad_files:
+            print(f"ERROR: No .h5/.hdf5 files found in {input_dir}")
+            return False, None
+        print(f"Found {len(h5ad_files)} h5ad file(s) in {input_dir}")
+    else:  # auto
+        if not zarr_files and not h5ad_files:
+            print(f"ERROR: No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {input_dir}")
+            return False, None
+        print(f"Found {len(zarr_files)} zarr file(s) and {len(h5ad_files)} h5ad file(s) in {input_dir}")
+        print(f"Total files: {len(zarr_files) + len(h5ad_files)}")
     
     # Check if output directory already exists
     if os.path.exists(output_dir):
@@ -206,15 +235,18 @@ def build_zdata_directory(zarr_dir, output_name, output_dir):
     original_cwd = os.getcwd()
     try:
         os.chdir(output_parent)
-        print(f"\nBuilding {output_name_only} from zarr directory: {os.path.basename(zarr_dir)}...")
-        print(f"  (Processing {len(zarr_files)} zarr files)")
+        file_count = len(zarr_files) if file_type == "zarr" else (len(h5ad_files) if file_type == "h5ad" else len(zarr_files) + len(h5ad_files))
+        file_type_str = file_type if file_type != "auto" else "zarr/h5ad"
+        print(f"\nBuilding {output_name_only} from {file_type_str} directory: {os.path.basename(input_dir)}...")
+        print(f"  (Processing {file_count} file(s))")
         
         # Use build_zdata_from_zarr to build complete zdata object
         # Pass the full directory name (e.g., "atlas.zdata")
         # Note: block_rows and max_rows match zdata.settings defaults
         # but are explicitly set here for reproducibility
+        # The function auto-detects file types (zarr vs h5ad)
         zdata_dir = build_zdata_from_zarr(
-            zarr_dir,
+            input_dir,
             output_name_only,
             block_rows=16,  # Matches zdata.settings.block_rows default
             max_rows=8192,  # Matches zdata.settings.max_rows_per_chunk default
@@ -362,10 +394,21 @@ def main():
     if keep_output:
         sys.argv.remove("--keep-output")
     
+    # Check for --h5ad flag to use h5ad test directory
+    use_h5ad = "--h5ad" in sys.argv
+    if use_h5ad:
+        sys.argv.remove("--h5ad")
+    
     if len(sys.argv) > 1:
-        zarr_input = sys.argv[1]
+        input_dir = sys.argv[1]
+        file_type = "auto"  # Auto-detect
     else:
-        zarr_input = DEFAULT_ZARR_DIR
+        if use_h5ad:
+            input_dir = DEFAULT_H5AD_DIR
+            file_type = "h5ad"
+        else:
+            input_dir = DEFAULT_ZARR_DIR
+            file_type = "zarr"
     
     if len(sys.argv) > 2:
         output_name = sys.argv[2]
@@ -379,8 +422,10 @@ def main():
     else:
         output_dir = _parent_dir / output_name
     
+    file_type_str = file_type if file_type != "auto" else "zarr/h5ad (auto)"
     print(f"Configuration:")
-    print(f"  Zarr directory: {zarr_input}")
+    print(f"  Input directory: {input_dir}")
+    print(f"  File type: {file_type_str}")
     print(f"  Output: {output_dir}")
     print(f"  ZSTD base: {ZSTD_BASE}")
     if not keep_output:
@@ -391,7 +436,7 @@ def main():
             print("\n✗ Pipeline failed at compilation step")
             return 1
         
-        build_success, actual_output_dir = build_zdata_directory(zarr_input, output_name, output_dir)
+        build_success, actual_output_dir = build_zdata_directory(input_dir, output_name, output_dir, file_type)
         if not build_success:
             print("\n✗ Pipeline failed at build step")
             return 1
