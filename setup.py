@@ -235,7 +235,9 @@ class InstallWithCTools(install):
         project_root = Path(__file__).parent
         
         # Determine installation location for binaries
-        if self.editable:
+        # Check if this is an editable install (attribute may not exist during wheel building)
+        is_editable = getattr(self, 'editable', False)
+        if is_editable:
             bin_dir = project_root / "ctools"
             package_dir = project_root
         else:
@@ -338,10 +340,11 @@ setup(
     description="Efficient storage and access for large single-cell RNA datasets",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    author="",  # Add author name
-    author_email="",  # Add author email
-    url="",  # Add project URL
-    packages=["zdata", "zdata.core", "zdata.build", "zdata.files"],
+    author="Sam Cooper",
+    author_email="",  # Add author email if desired
+    url="",  # Add project URL if desired (e.g., GitHub repository)
+    license="MIT",
+    packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
     package_dir={"zdata": "."},
     include_package_data=True,
     python_requires=">=3.8",

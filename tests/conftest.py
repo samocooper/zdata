@@ -35,9 +35,31 @@ def test_data_dir() -> Path:
 @pytest.fixture(scope="session")
 def zarr_test_dir(test_data_dir: Path) -> Path:
     """Get the zarr test directory if it exists."""
-    if test_data_dir.exists():
-        return test_data_dir
-    pytest.skip("zarr_test_dir not found - skipping tests that require it")
+    if not test_data_dir.exists():
+        pytest.fail(f"zarr_test_dir not found at {test_data_dir}. Tests require this directory to exist.")
+    
+    zarr_files = sorted([f for f in test_data_dir.glob("*.zarr") if f.is_dir()])
+    if not zarr_files:
+        pytest.fail(f"No .zarr files found in {test_data_dir}. Tests require at least one .zarr directory.")
+    
+    return test_data_dir
+
+
+@pytest.fixture(scope="session")
+def h5ad_test_dir() -> Path:
+    """Get the h5ad test directory if it exists."""
+    _test_dir = Path(__file__).parent
+    h5ad_dir = _test_dir / "h5ad_test_dir"
+    
+    if not h5ad_dir.exists():
+        pytest.fail(f"h5ad_test_dir not found at {h5ad_dir}. Tests require this directory to exist.")
+    
+    h5ad_files = sorted([f for f in h5ad_dir.iterdir() 
+                         if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
+    if not h5ad_files:
+        pytest.fail(f"No .h5/.hdf5 files found in {h5ad_dir}. Tests require at least one h5ad file.")
+    
+    return h5ad_dir
 
 
 @pytest.fixture
@@ -147,12 +169,12 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
     - C tools to be compiled (mtx_to_zdata, zdata_read)
     - ZSTD library available
     """
-    # Check if we have zarr test files
+    # Check if we have zarr test files (already validated by zarr_test_dir fixture)
     zarr_files = sorted(zarr_test_dir.glob("*.zarr"))
     if not zarr_files:
-        pytest.skip(
+        pytest.fail(
             f"No zarr test files found in {zarr_test_dir}. "
-            f"Tests that require zdata_instance will be skipped."
+            f"This should have been caught by the zarr_test_dir fixture."
         )
     
     project_root = Path(__file__).parent.parent
@@ -160,13 +182,13 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
     read_bin = project_root / "ctools" / "zdata_read"
     
     if not mtx_bin.exists() or not read_bin.exists():
-        pytest.skip(
+        pytest.fail(
             f"C tools not found. Expected: {mtx_bin}, {read_bin}. "
             f"Please compile the C tools first. "
-            f"Tests that require zdata_instance will be skipped."
+            f"Run: cd {project_root} && export ZSTD_BASE=/path/to/zstd && python setup.py build_py"
         )
     
-    from zdata.build.build_zdata import build_zdata_from_zarr
+    from zdata.build_zdata.build_zdata import build_zdata_from_zarr
     
     tmp_path = tmp_path_factory.mktemp("zdata_test")
     output_name = "test_zdata"
@@ -199,19 +221,18 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
         
         if not zdata_dir.exists():
             existing = list(tmp_path.iterdir()) if tmp_path.exists() else []
-            pytest.skip(
+            pytest.fail(
                 f"ZData directory was not created. "
                 f"Expected at: {zdata_dir} or {tmp_path / output_name}. "
                 f"Found in tmp_path: {[str(p) for p in existing]}. "
-                f"Build may have failed silently. "
-                f"Tests that require zdata_instance will be skipped."
+                f"Build may have failed silently. Check the error output above."
             )
         
         return ZData(str(zdata_dir))
     except ImportError as e:
-        pytest.skip(
+        pytest.fail(
             f"Failed to import build_zdata_from_zarr: {e}. "
-            f"Tests that require zdata_instance will be skipped."
+            f"This indicates a problem with the package installation."
         )
     except Exception as e:
         import traceback
@@ -222,9 +243,102 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
         print(f"\nFull traceback:")
         traceback.print_exc()
         print(f"{'='*70}\n")
-        pytest.skip(
+        pytest.fail(
             f"{error_msg}. "
-            f"Tests that require zdata_instance will be skipped. "
+            f"Check the error above for details."
+        )
+
+
+@pytest.fixture(scope="session")
+def zdata_instance_h5ad(h5ad_test_dir: Path, tmp_path_factory) -> ZData:
+    """Create a ZData instance from test h5ad files (session-scoped for speed).
+    
+    This fixture builds a zdata directory from the test h5ad files
+    and returns a ZData instance. The zdata directory is created once
+    per test session and reused across all tests for better performance.
+    
+    Note: This requires:
+    - H5ad test files in tests/h5ad_test_dir/
+    - C tools to be compiled (mtx_to_zdata, zdata_read)
+    - ZSTD library available
+    """
+    # Check if we have h5ad test files (already validated by h5ad_test_dir fixture)
+    h5ad_files = sorted([f for f in h5ad_test_dir.iterdir() 
+                         if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
+    if not h5ad_files:
+        pytest.fail(
+            f"No h5ad test files found in {h5ad_test_dir}. "
+            f"This should have been caught by the h5ad_test_dir fixture."
+        )
+    
+    project_root = Path(__file__).parent.parent
+    mtx_bin = project_root / "ctools" / "mtx_to_zdata"
+    read_bin = project_root / "ctools" / "zdata_read"
+    
+    if not mtx_bin.exists() or not read_bin.exists():
+        pytest.fail(
+            f"C tools not found. Expected: {mtx_bin}, {read_bin}. "
+            f"Please compile the C tools first. "
+            f"Run: cd {project_root} && export ZSTD_BASE=/path/to/zstd && python setup.py build_py"
+        )
+    
+    from zdata.build_zdata.build_zdata import build_zdata_from_zarr
+    
+    tmp_path = tmp_path_factory.mktemp("zdata_test_h5ad")
+    output_name = "test_zdata_h5ad"
+    output_dir = tmp_path / output_name
+    
+    try:
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            zdata_dir = build_zdata_from_zarr(
+                str(h5ad_test_dir),
+                output_name,
+                block_rows=16,
+                max_rows=8192,
+                obs_join_strategy="outer",
+            )
+        finally:
+            os.chdir(original_cwd)
+        
+        zdata_dir = Path(zdata_dir)
+        if not zdata_dir.is_absolute():
+            zdata_dir = (tmp_path / zdata_dir).resolve()
+        else:
+            zdata_dir = zdata_dir.resolve()
+        
+        if not zdata_dir.exists():
+            candidate = tmp_path / output_name
+            if candidate.exists():
+                zdata_dir = candidate.resolve()
+        
+        if not zdata_dir.exists():
+            existing = list(tmp_path.iterdir()) if tmp_path.exists() else []
+            pytest.fail(
+                f"ZData directory was not created from h5ad files. "
+                f"Expected at: {zdata_dir} or {tmp_path / output_name}. "
+                f"Found in tmp_path: {[str(p) for p in existing]}. "
+                f"Build may have failed silently. Check the error output above."
+            )
+        
+        return ZData(str(zdata_dir))
+    except ImportError as e:
+        pytest.fail(
+            f"Failed to import build_zdata_from_zarr: {e}. "
+            f"This indicates a problem with the package installation."
+        )
+    except Exception as e:
+        import traceback
+        error_msg = f"Failed to build test zdata from h5ad: {type(e).__name__}: {e}"
+        print(f"\n{'='*70}")
+        print(f"ERROR building zdata_instance_h5ad fixture:")
+        print(f"{error_msg}")
+        print(f"\nFull traceback:")
+        traceback.print_exc()
+        print(f"{'='*70}\n")
+        pytest.fail(
+            f"{error_msg}. "
             f"Check the error above for details."
         )
 

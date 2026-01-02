@@ -2,41 +2,13 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Minimal project section - all metadata is defined in setup.py
 [project]
 name = "zdata"
-version = "0.1.0"
-description = "Efficient storage and access for large single-cell RNA datasets"
-readme = "README.md"
-requires-python = ">=3.8"
-dependencies = [
-    "numpy>=1.20.0",
-    "scipy>=1.7.0",
-    "polars>=0.18.0",
-    "pandas>=1.3.0",
-    "anndata>=0.8.0",
-    "zarr>=2.10.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "pytest-xdist>=3.0.0",
-]
-test = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "pytest-xdist>=3.0.0",
-]
-
-# [project.urls]
-# Homepage = "https://github.com/yourusername/zdata"  # Add project homepage
-# Documentation = "https://zdata.readthedocs.io"  # Add documentation URL
-# Repository = "https://github.com/yourusername/zdata"  # Add repository URL
-# Issues = "https://github.com/yourusername/zdata/issues"  # Add issues URL
+dynamic = ["version", "description", "readme", "requires-python", "license", "authors", "classifiers", "dependencies", "optional-dependencies"]
 
 [tool.setuptools]
-packages = ["zdata", "zdata.core", "zdata.build", "zdata.files"]
+packages = ["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"]
 
 [tool.setuptools.package-data]
 zdata = ["ctools/*.c", "ctools/mtx_to_zdata*", "ctools/zdata_read*", "files/2ks10c_genes.txt"]
