@@ -44,34 +44,53 @@ def normalize_row_indices(
     index: RowIndex,
     nrows: int,
 ) -> list[int]:
-    """
+    """\
     Normalize row indices to a list of integer indices.
 
-    Supports:
-    - Integer indices (including negative)
-    - Slices
-    - Boolean arrays (length must match nrows)
-    - Lists/arrays of integers
+    This function handles various index types and converts them to a sorted,
+    deduplicated list of integer indices suitable for efficient chunk-based access.
 
     Parameters
     ----------
     index
-        Row index or indices to normalize.
+        Row index or indices to normalize. Supported types:
+        - int: Single row index (supports negative indices, e.g., -1 for last row)
+        - slice: Row slice (e.g., slice(0, 100) or 0:100)
+        - list[int]: List of row indices
+        - numpy.ndarray[int]: Array of row indices
+        - numpy.ndarray[bool]: Boolean mask (length must match nrows)
+        - pandas.Index or pandas.Series: Pandas index objects
     nrows
         Total number of rows in the dataset.
 
     Returns
     -------
-    List of integer row indices (0-based, non-negative, sorted and deduplicated).
+    list[int]
+        List of integer row indices (0-based, non-negative, sorted and deduplicated).
+        The list is guaranteed to contain only valid indices in range [0, nrows).
 
     Raises
     ------
     IndexError
-        If any index is out of bounds.
+        If any index is out of bounds [0, nrows) or negative index is too large.
     ValueError
-        If boolean array length doesn't match nrows.
+        If boolean array length doesn't match nrows or step slicing is not 1.
     TypeError
         If index type is not supported.
+
+    Examples
+    --------
+    >>> normalize_row_indices(5, nrows=1000)
+    [5]
+    >>> normalize_row_indices(-1, nrows=1000)  # Last row
+    [999]
+    >>> normalize_row_indices(slice(0, 100), nrows=1000)
+    [0, 1, 2, ..., 99]
+    >>> normalize_row_indices([0, 5, 10, -1], nrows=1000)
+    [0, 5, 10, 999]
+    >>> mask = np.array([True] * 100 + [False] * 900)
+    >>> normalize_row_indices(mask, nrows=1000)
+    [0, 1, 2, ..., 99]
     """
     # Handle single integer
     if isinstance(index, (int, np.integer)):
@@ -167,38 +186,67 @@ def normalize_column_indices(
     ncols: int,
     gene_names: pd.Index | None = None,
 ) -> list[int]:
-    """
+    """\
     Normalize column (gene) indices to a list of integer indices.
 
-    Supports:
-    - Integer indices (including negative)
-    - Slices
-    - Gene names (strings) - requires gene_names
-    - Lists/arrays of integers
-    - Lists/arrays of gene names (strings) - requires gene_names
-    - Boolean arrays (length must match ncols)
+    This function handles various index types including gene names (strings) and
+    converts them to a sorted, deduplicated list of integer indices suitable for
+    efficient chunk-based access.
 
     Parameters
     ----------
     index
-        Column index or indices to normalize.
+        Column (gene) index or indices to normalize. Supported types:
+        - int: Single column index (supports negative indices)
+        - str: Single gene name (requires gene_names)
+        - slice: Column slice (supports integer or string bounds)
+        - list[int]: List of column indices
+        - list[str]: List of gene names (requires gene_names)
+        - numpy.ndarray[int]: Array of column indices
+        - numpy.ndarray[bool]: Boolean mask (length must match ncols)
+        - pandas.Index or pandas.Series: Pandas index objects
     ncols
         Total number of columns (genes) in the dataset.
     gene_names
         Optional pandas Index of gene names for string-based indexing.
+        Required when index contains strings or string slices.
 
     Returns
     -------
-    List of integer column indices (0-based, non-negative, sorted and deduplicated).
+    list[int]
+        List of integer column indices (0-based, non-negative, sorted and deduplicated).
+        The list is guaranteed to contain only valid indices in range [0, ncols).
 
     Raises
     ------
     IndexError
-        If any index is out of bounds or gene name not found.
+        If any index is out of bounds [0, ncols) or gene name not found.
     ValueError
-        If boolean array length doesn't match ncols or gene_names not provided when needed.
+        If boolean array length doesn't match ncols, gene_names not provided when
+        needed, or step slicing is not 1.
     TypeError
         If index type is not supported.
+
+    Examples
+    --------
+    >>> # Integer indexing
+    >>> normalize_column_indices(5, ncols=20000)
+    [5]
+    >>> normalize_column_indices([0, 5, 10], ncols=20000)
+    [0, 5, 10]
+    >>> # Gene name indexing (requires gene_names)
+    >>> gene_names = pd.Index(['GAPDH', 'PCNA', 'COL1A1', ...])
+    >>> normalize_column_indices('GAPDH', ncols=20000, gene_names=gene_names)
+    [0]
+    >>> normalize_column_indices(['GAPDH', 'PCNA'], ncols=20000, gene_names=gene_names)
+    [0, 1]
+    >>> # Slice with gene names
+    >>> normalize_column_indices(slice('GAPDH', 'PCNA'), ncols=20000, gene_names=gene_names)
+    [0, 1]
+    >>> # Boolean mask
+    >>> mask = np.array([True] * 100 + [False] * 19900)
+    >>> normalize_column_indices(mask, ncols=20000)
+    [0, 1, 2, ..., 99]
     """
     # Handle single integer
     if isinstance(index, (int, np.integer)):
@@ -350,7 +398,7 @@ def normalize_column_indices(
 
 
 def validate_row_indices(indices: list[int], nrows: int) -> None:
-    """
+    """\
     Validate that row indices are within bounds.
 
     Parameters
@@ -363,7 +411,12 @@ def validate_row_indices(indices: list[int], nrows: int) -> None:
     Raises
     ------
     IndexError
-        If any index is out of bounds.
+        If any index is out of bounds [0, nrows).
+
+    Examples
+    --------
+    >>> validate_row_indices([0, 5, 10], nrows=100)  # OK
+    >>> validate_row_indices([0, 5, 100], nrows=100)  # Raises IndexError
     """
     if not indices:
         return
@@ -375,7 +428,7 @@ def validate_row_indices(indices: list[int], nrows: int) -> None:
 
 
 def validate_column_indices(indices: list[int], ncols: int) -> None:
-    """
+    """\
     Validate that column indices are within bounds.
 
     Parameters
@@ -388,7 +441,12 @@ def validate_column_indices(indices: list[int], ncols: int) -> None:
     Raises
     ------
     IndexError
-        If any index is out of bounds.
+        If any index is out of bounds [0, ncols).
+
+    Examples
+    --------
+    >>> validate_column_indices([0, 5, 10], ncols=20000)  # OK
+    >>> validate_column_indices([0, 5, 20000], ncols=20000)  # Raises IndexError
     """
     if not indices:
         return

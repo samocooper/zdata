@@ -153,13 +153,30 @@ def build_zdata_from_zarr(
             
             if successfully_processed_zarrs:
                 print(f"Processing obs from {len(successfully_processed_zarrs)} zarr file(s) that were successfully aligned")
+                
+                # Find row nnz files from MTX processing
+                row_nnz_files = []
+                if os.path.exists(manifest_path):
+                    with open(manifest_path, 'r') as f:
+                        manifest = json.load(f)
+                        mtx_output_dir = os.path.join(temp_mtx_dir, "rm_mtx_files")
+                        for mtx_entry in manifest.get('mtx_files', []):
+                            mtx_file = mtx_entry.get('mtx_file', '')
+                            if mtx_file:
+                                # Extract row range from filename (e.g., rows_0_131071.mtx -> rows_0_131071_nnz.txt)
+                                base_name = os.path.splitext(mtx_file)[0]
+                                nnz_file = os.path.join(mtx_output_dir, f"{base_name}_nnz.txt")
+                                if os.path.exists(nnz_file):
+                                    row_nnz_files.append(nnz_file)
+                
                 obs_output_path = concat_obs_from_zarr_directory(
                     str(zarr_dir_path),
                     str(zdata_dir),
                     join_strategy=obs_join_strategy,
                     join_on=obs_join_on,
                     output_filename=obs_output_filename,
-                    zarr_files_filter=successfully_processed_zarrs  # Only process these files
+                    zarr_files_filter=successfully_processed_zarrs,  # Only process these files
+                    row_nnz_files=row_nnz_files  # Add row nnz values
                 )
                 print(f"\n✓ Obs concatenation complete! Output: {obs_output_path}")
             else:
@@ -170,9 +187,9 @@ def build_zdata_from_zarr(
             traceback.print_exc()
             raise  # Fail the build if obs concatenation fails
         
-        # Step 4: Save gene list as var.parquet
+        # Step 4: Load column nnz and save gene list as var.parquet
         print("\n" + "=" * 70)
-        print("Step 4: Saving gene list as var.parquet")
+        print("Step 4: Loading column nnz and saving gene list as var.parquet")
         print("=" * 70)
         
         try:
@@ -180,18 +197,42 @@ def build_zdata_from_zarr(
                 genes = [line.strip() for line in f if line.strip()]
             
             if not genes:
-                print(f"\n✗ WARNING: No genes found in gene list file: {gene_list_path}")
-            else:
-                var_df = pl.DataFrame({
-                    'gene': genes,
-                    'index': range(len(genes))
-                })
-                
-                var_output_path = zdata_dir / "var.parquet"
-                var_df.write_parquet(str(var_output_path), compression="zstd")
-                print(f"\n✓ Gene list saved to var.parquet")
-                print(f"  Output: {var_output_path}")
-                print(f"  Genes: {len(genes)}")
+                raise ValueError(f"No genes found in gene list file: {gene_list_path}")
+            
+            # Load column nnz from file (calculated during MTX processing)
+            import numpy as np
+            column_nnz_path = os.path.join(temp_mtx_dir, "column_nnz.txt")
+            
+            if not os.path.exists(column_nnz_path):
+                raise FileNotFoundError(
+                    f"Column nnz file not found: {column_nnz_path}. "
+                    f"This file should have been created during MTX alignment."
+                )
+            
+            print(f"\nLoading column nnz from {os.path.basename(column_nnz_path)}...")
+            column_nnz = np.loadtxt(column_nnz_path, dtype=np.uint32)
+            
+            if len(column_nnz) != len(genes):
+                raise ValueError(
+                    f"Column nnz count ({len(column_nnz)}) doesn't match gene count ({len(genes)}). "
+                    f"This indicates a mismatch in the alignment process."
+                )
+            
+            print(f"  ✓ Loaded nnz for {len(column_nnz)} columns")
+            
+            # Create var DataFrame with gene list and nnz column
+            var_df = pl.DataFrame({
+                'gene': genes,
+                'index': range(len(genes)),
+                'nnz': column_nnz.tolist()
+            })
+            
+            var_output_path = zdata_dir / "var.parquet"
+            var_df.write_parquet(str(var_output_path), compression="zstd")
+            print(f"\n✓ Gene list saved to var.parquet")
+            print(f"  Output: {var_output_path}")
+            print(f"  Genes: {len(genes)}")
+            print(f"  Column nnz: included")
         except Exception as e:
             print(f"\n✗ ERROR: Failed to save var.parquet: {e}")
             import traceback

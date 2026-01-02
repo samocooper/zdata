@@ -491,3 +491,11 @@ settings.register(
     get_from_env=check_and_get_int,
 )
 
+settings.register(
+    "override_memory_check",
+    default_value=False,
+    description="If True, allow queries to proceed even if they exceed 80% of available memory (issues warning instead of raising MemoryError).",
+    validate=validate_bool,
+    get_from_env=check_and_get_bool,
+)
+
