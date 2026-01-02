@@ -8,7 +8,7 @@ Efficient sparse matrix storage and retrieval for large-scale transcriptomics da
 
 - **Block-compressed sparse row (CSR) format** - Organized into e.g. 16-row blocks for efficient access
 - **Zstd seekable compression** - Enables random access to compressed data without full decompression
-- **Chunked storage** - Large matrices are split into e.g. 4096-row chunks stored as separate `.bin` files
+- **Chunked storage** - Large matrices are split into e.g. 8192-row chunks stored as separate `.bin` files
 
 This approach provides excellent compression ratios while maintaining fast random row retrieval performance, making it ideal for querying subsets of large datasets.
 
