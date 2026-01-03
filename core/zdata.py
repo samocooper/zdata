@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import struct
 import subprocess
 import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
@@ -270,6 +272,13 @@ class ZData:
             self._var_df.index = pd.RangeIndex(start=0, stop=len(self._var_df))
         except Exception as e:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
+        
+        # Cache for column-major chunk mappings (built lazily)
+        self._cm_chunk_files: dict[int, str] | None = None
+        self._cm_chunk_info: dict[int, dict[str, Any]] | None = None
+        self._cm_file_to_chunk: dict[str, int] | None = None
+        # Sorted list of (start_row, end_row, chunk_num) for binary search
+        self._cm_chunk_ranges: list[tuple[int, int, int]] | None = None
     
     @property
     def obs(self) -> ObsWrapper:
@@ -397,6 +406,58 @@ class ZData:
         
         return ncols, out
     
+    def _process_file_for_rows(
+        self,
+        file_path: str,
+        row_info_list: list[tuple[int, int, int]],
+        file_to_chunk: dict[str, int]
+    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]:
+        """
+        Process a single file for row reading (used in parallel processing).
+        
+        Args:
+            file_path: Path to the chunk file
+            row_info_list: List of (local_row, orig_idx, global_row) tuples
+            file_to_chunk: Mapping from file path to chunk number
+        
+        Returns:
+            (file_path, chunk_num, file_results, file_ncols)
+        """
+        chunk_num = file_to_chunk[file_path]
+        
+        row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
+        local_rows = [info[0] for info in row_info_list_sorted]
+        
+        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+        
+        return file_path, chunk_num, file_results, file_ncols
+    
+    def _process_file_for_cols(
+        self,
+        file_path: str,
+        col_info_list: list[tuple[int, int, int]],
+        file_to_chunk: dict[str, int]
+    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]:
+        """
+        Process a single file for column reading (used in parallel processing).
+        
+        Args:
+            file_path: Path to the chunk file
+            col_info_list: List of (local_row, orig_idx, global_col) tuples
+            file_to_chunk: Mapping from file path to chunk number
+        
+        Returns:
+            (file_path, chunk_num, file_results, file_ncols)
+        """
+        chunk_num = file_to_chunk[file_path]
+        
+        col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
+        local_rows = [info[0] for info in col_info_list_sorted]
+        
+        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+        
+        return file_path, chunk_num, file_results, file_ncols
+    
     def read_rows(
         self, 
         global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
@@ -468,6 +529,8 @@ class ZData:
                 UserWarning
             )
         
+        # Group rows by file: all rows from the same chunk file are grouped together
+        # This ensures that rows from the same block are processed by a single worker
         rows_by_file = defaultdict(list)
         
         for idx, global_row in enumerate(global_rows):
@@ -477,24 +540,71 @@ class ZData:
             if chunk_num not in self.chunk_files:
                 raise IndexError(f"Row {global_row} is beyond available data (chunk {chunk_num} not found)")
             
+            # Group by file path - all rows from same file will be processed together
             rows_by_file[self.chunk_files[chunk_num]].append((local_row, idx, global_row))
         
         all_results = [None] * len(global_rows)
         
-        for file_path, row_info_list in rows_by_file.items():
-            chunk_num = self.file_to_chunk[file_path]
-            
-            row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
-            local_rows = [info[0] for info in row_info_list_sorted]
-            
-            file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
-            if self.ncols != file_ncols:
-                raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
-            
-            for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
-                if returned_local_row != local_row:
-                    raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                all_results[orig_idx] = (global_row, cols, vals)
+        # Determine number of unique files that need to be processed
+        num_files = len(rows_by_file)
+        
+        # Use parallel processing only if:
+        # 1. Multiple files need to be processed (rows span multiple blocks)
+        # 2. max_workers > 1 (parallelization enabled)
+        # If all rows belong to one file, only one worker will be used (sequential processing)
+        max_workers = settings.max_workers
+        if max_workers is None:
+            # Auto-detect: limit workers to number of files (no point in more workers than files)
+            max_workers = min(num_files, (os.cpu_count() or 1) + 4)
+        else:
+            # User-specified: still limit to number of files
+            max_workers = min(max_workers, num_files)
+        
+        if num_files > 1 and max_workers > 1:
+            # Parallel processing for multiple files
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._process_file_for_rows,
+                        file_path,
+                        row_info_list,
+                        self.file_to_chunk
+                    ): file_path
+                    for file_path, row_info_list in rows_by_file.items()
+                }
+                
+                for future in as_completed(futures):
+                    file_path = futures[future]
+                    try:
+                        _, chunk_num, file_results, file_ncols = future.result()
+                        if self.ncols != file_ncols:
+                            raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
+                        
+                        row_info_list = rows_by_file[file_path]
+                        row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
+                        
+                        for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
+                            if returned_local_row != local_row:
+                                raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
+                            all_results[orig_idx] = (global_row, cols, vals)
+                    except Exception as e:
+                        raise RuntimeError(f"Error processing file {file_path}: {e}") from e
+        else:
+            # Sequential processing (single file or max_workers <= 1)
+            for file_path, row_info_list in rows_by_file.items():
+                chunk_num = self.file_to_chunk[file_path]
+                
+                row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
+                local_rows = [info[0] for info in row_info_list_sorted]
+                
+                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+                if self.ncols != file_ncols:
+                    raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
+                
+                for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
+                    if returned_local_row != local_row:
+                        raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
+                    all_results[orig_idx] = (global_row, cols, vals)
         
         return all_results
     
@@ -537,20 +647,22 @@ class ZData:
     
     def _build_cm_chunk_mapping(
         self
-    ) -> tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int]]:
+    ) -> tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int], list[tuple[int, int, int]]]:
         """\
         Build chunk mapping for X_CM (column-major) files from metadata.
         
         This is an internal method that constructs the mapping between column
-        indices and chunk files for column-major access.
+        indices and chunk files for column-major access. Results are cached
+        for subsequent calls.
         
         Returns
         -------
-        tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int]]
+        tuple[dict[int, str], dict[int, dict[str, Any]], dict[str, int], list[tuple[int, int, int]]]
             Tuple containing:
             - cm_chunk_files: Mapping from chunk number to file path
             - cm_chunk_info: Mapping from chunk number to chunk metadata
             - cm_file_to_chunk: Reverse mapping from file path to chunk number
+            - cm_chunk_ranges: Sorted list of (start_row, end_row, chunk_num) for binary search
         
         Raises
         ------
@@ -559,6 +671,13 @@ class ZData:
         ValueError
             If metadata is missing required 'chunks_cm' field.
         """
+        # Return cached results if available
+        if (self._cm_chunk_files is not None and 
+            self._cm_chunk_info is not None and 
+            self._cm_file_to_chunk is not None and
+            self._cm_chunk_ranges is not None):
+            return self._cm_chunk_files, self._cm_chunk_info, self._cm_file_to_chunk, self._cm_chunk_ranges
+        
         xcm_dir = os.path.join(self.dir_path, "X_CM")
         if not os.path.exists(xcm_dir):
             raise FileNotFoundError(f"X_CM directory not found: {xcm_dir}")
@@ -584,16 +703,37 @@ class ZData:
         for file_name, file_chunks in chunks_by_file.items():
             chunk_num = file_chunks[0]['chunk_num']
             file_path = os.path.join(self.dir_path, "X_CM", file_name)
+            start_row = min(c['start_row'] for c in file_chunks)
+            end_row = max(c['end_row'] for c in file_chunks)
+            
             cm_chunk_files[chunk_num] = file_path
             cm_chunk_info[chunk_num] = {
                 'chunk_num': chunk_num,
                 'file': file_name,
-                'start_row': min(c['start_row'] for c in file_chunks),
-                'end_row': max(c['end_row'] for c in file_chunks)
+                'start_row': start_row,
+                'end_row': end_row
             }
             cm_file_to_chunk[file_path] = chunk_num
         
-        return cm_chunk_files, cm_chunk_info, cm_file_to_chunk
+        # Use pre-computed ranges from metadata if available (faster, computed during build)
+        # Otherwise compute them (for backward compatibility with old metadata)
+        if 'cm_chunk_ranges' in self.metadata:
+            # Read pre-computed sorted ranges from metadata (lists are stored as lists in JSON)
+            cm_chunk_ranges = [tuple(r) for r in self.metadata['cm_chunk_ranges']]
+        else:
+            # Fallback: compute ranges (for old metadata files)
+            cm_chunk_ranges = []
+            for chunk_num, chunk_info in cm_chunk_info.items():
+                cm_chunk_ranges.append((chunk_info['start_row'], chunk_info['end_row'], chunk_num))
+            cm_chunk_ranges.sort(key=lambda x: x[0])
+        
+        # Cache the results
+        self._cm_chunk_files = cm_chunk_files
+        self._cm_chunk_info = cm_chunk_info
+        self._cm_file_to_chunk = cm_file_to_chunk
+        self._cm_chunk_ranges = cm_chunk_ranges
+        
+        return cm_chunk_files, cm_chunk_info, cm_file_to_chunk, cm_chunk_ranges
     
     def read_cols_cm(
         self, 
@@ -667,42 +807,94 @@ class ZData:
             raise ValueError("Empty selection: no columns selected")
         
         self._check_memory_requirements(column_indices=global_cols)
-        cm_chunk_files, cm_chunk_info, cm_file_to_chunk = self._build_cm_chunk_mapping()
+        cm_chunk_files, cm_chunk_info, cm_file_to_chunk, cm_chunk_ranges = self._build_cm_chunk_mapping()
         
+        # Group genes by file: all genes from the same chunk file are grouped together
+        # This ensures that genes from the same block are processed by a single worker
         cols_by_file = defaultdict(list)
         
+        # Use binary search for O(log n) chunk lookup instead of O(n) linear search
         for idx, global_col in enumerate(global_cols):
-            # Find which chunk contains this gene by checking chunk ranges
+            # Binary search to find which chunk contains this gene
+            # Ranges are sorted by start_row, so we find the rightmost range with start_row <= global_col
             chunk_num = None
             local_row = None
-            for cnum, chunk_info in cm_chunk_info.items():
-                chunk_start = chunk_info['start_row']
-                chunk_end = chunk_info['end_row']
-                
-                if chunk_start <= global_col < chunk_end:
+            
+            # Binary search: find insertion point for (global_col, ...) in sorted list
+            # bisect_right finds the position where (global_col, ...) would be inserted
+            # to maintain sorted order
+            pos = bisect.bisect_right(cm_chunk_ranges, (global_col, float('inf'), 0))
+            if pos > 0:
+                # Check the range at pos-1 (the rightmost range with start_row <= global_col)
+                start_row, end_row, cnum = cm_chunk_ranges[pos - 1]
+                if global_col < end_row:  # Check if global_col is within the range
                     chunk_num = cnum
-                    local_row = global_col - chunk_start
-                    break
+                    local_row = global_col - start_row
             
             if chunk_num is None:
                 raise IndexError(f"Column {global_col} is beyond available data (no chunk found containing this gene)")
             
+            # Group by file path - all genes from same file will be processed together
             cols_by_file[cm_chunk_files[chunk_num]].append((local_row, idx, global_col))
         
         all_results = [None] * len(global_cols)
         
-        for file_path, col_info_list in cols_by_file.items():
-            chunk_num = cm_file_to_chunk[file_path]
-            
-            col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
-            local_rows = [info[0] for info in col_info_list_sorted]
-            
-            file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
-            
-            for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
-                if returned_local_row != local_row:
-                    raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                all_results[orig_idx] = (global_col, rows, vals)
+        # Determine number of unique files that need to be processed
+        num_files = len(cols_by_file)
+        
+        # Use parallel processing only if:
+        # 1. Multiple files need to be processed (genes span multiple blocks)
+        # 2. max_workers > 1 (parallelization enabled)
+        # If all genes belong to one file, only one worker will be used (sequential processing)
+        max_workers = settings.max_workers
+        if max_workers is None:
+            # Auto-detect: limit workers to number of files (no point in more workers than files)
+            max_workers = min(num_files, (os.cpu_count() or 1) + 4)
+        else:
+            # User-specified: still limit to number of files
+            max_workers = min(max_workers, num_files)
+        
+        if num_files > 1 and max_workers > 1:
+            # Parallel processing for multiple files
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._process_file_for_cols,
+                        file_path,
+                        col_info_list,
+                        cm_file_to_chunk
+                    ): file_path
+                    for file_path, col_info_list in cols_by_file.items()
+                }
+                
+                for future in as_completed(futures):
+                    file_path = futures[future]
+                    try:
+                        _, chunk_num, file_results, file_ncols = future.result()
+                        
+                        col_info_list = cols_by_file[file_path]
+                        col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
+                        
+                        for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
+                            if returned_local_row != local_row:
+                                raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
+                            all_results[orig_idx] = (global_col, rows, vals)
+                    except Exception as e:
+                        raise RuntimeError(f"Error processing file {file_path}: {e}") from e
+        else:
+            # Sequential processing (single file or max_workers <= 1)
+            for file_path, col_info_list in cols_by_file.items():
+                chunk_num = cm_file_to_chunk[file_path]
+                
+                col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
+                local_rows = [info[0] for info in col_info_list_sorted]
+                
+                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+                
+                for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
+                    if returned_local_row != local_row:
+                        raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
+                    all_results[orig_idx] = (global_col, rows, vals)
         
         return all_results
     

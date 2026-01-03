@@ -499,3 +499,11 @@ settings.register(
     get_from_env=check_and_get_bool,
 )
 
+settings.register(
+    "max_workers",
+    default_value=None,
+    description="Maximum number of worker threads for parallel file reads. None means auto-detect based on CPU count. Set to 1 to disable parallelization.",
+    validate=lambda val, s: None if val is None else validate_positive_int(val, s),
+    get_from_env=lambda opt, default: None if os.environ.get(f"ZDATA_{opt.upper()}") is None else check_and_get_int(opt, default or 4),
+)
+

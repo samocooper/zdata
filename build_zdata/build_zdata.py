@@ -30,7 +30,9 @@ def build_zdata_from_zarr(
     output_name: str,
     gene_list_path: str = None,
     block_rows: int = 16,
+    block_columns: int = None,
     max_rows: int = 8192,
+    max_columns: int = 256,
     obs_join_strategy: str = "outer",
     obs_join_on: list = None,
     obs_output_filename: str = "obs.parquet",
@@ -46,8 +48,10 @@ def build_zdata_from_zarr(
         zarr_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)
         output_name: Output directory name (can include .zdata suffix, e.g., "atlas.zdata")
         gene_list_path: Path to standard gene list file (default: uses package default)
-        block_rows: Number of rows per block (default: 16)
-        max_rows: Maximum rows per chunk (default: 8192)
+        block_rows: Number of rows per block for row-major (X_RM) files (default: 16)
+        block_columns: Number of rows per block for column-major (X_CM) files (default: None, uses block_rows)
+        max_rows: Maximum rows per chunk for row-major files (default: 8192)
+        max_columns: Maximum rows per chunk for column-major files (default: 256)
         obs_join_strategy: Strategy for joining obs data ("inner", "outer", or "columns")
         obs_join_on: If obs_join_strategy is "columns", list of column names to join on
         obs_output_filename: Name of obs parquet file (default: "obs.parquet")
@@ -166,7 +170,9 @@ def build_zdata_from_zarr(
                 str(temp_mtx_dir),
                 output_name,
                 block_rows=block_rows,
-                max_rows=max_rows
+                block_columns=block_columns,
+                max_rows=max_rows,
+                max_columns=max_columns
             )
             # Convert to Path if not already
             zdata_dir = Path(zdata_dir)
@@ -363,13 +369,25 @@ def main():
         '--block-rows',
         type=int,
         default=16,
-        help='Number of rows per block (default: 16)'
+        help='Number of rows per block for row-major (X_RM) files (default: 16)'
+    )
+    parser.add_argument(
+        '--block-columns',
+        type=int,
+        default=None,
+        help='Number of rows per block for column-major (X_CM) files (default: same as --block-rows)'
     )
     parser.add_argument(
         '--max-rows',
         type=int,
         default=8192,
-        help='Maximum rows per chunk (default: 8192)'
+        help='Maximum rows per chunk for row-major files (default: 8192)'
+    )
+    parser.add_argument(
+        '--max-columns',
+        type=int,
+        default=256,
+        help='Maximum rows per chunk for column-major files (default: 256)'
     )
     parser.add_argument(
         '--obs-join-strategy',
@@ -433,8 +451,17 @@ def main():
         print(f"ERROR: block_rows must be between 1 and 256, got {args.block_rows}")
         sys.exit(1)
     
+    block_columns = args.block_columns if args.block_columns is not None else args.block_rows
+    if block_columns < 1 or block_columns > 256:
+        print(f"ERROR: block_columns must be between 1 and 256, got {block_columns}")
+        sys.exit(1)
+    
     if args.max_rows < 1 or args.max_rows > 1000000:
         print(f"ERROR: max_rows must be between 1 and 1000000, got {args.max_rows}")
+        sys.exit(1)
+    
+    if args.max_columns < 1 or args.max_columns > 1000000:
+        print(f"ERROR: max_columns must be between 1 and 1000000, got {args.max_columns}")
         sys.exit(1)
     
     try:
@@ -443,7 +470,9 @@ def main():
             args.output_name,
             gene_list_path=args.gene_list,
             block_rows=args.block_rows,
+            block_columns=block_columns,
             max_rows=args.max_rows,
+            max_columns=args.max_columns,
             obs_join_strategy=args.obs_join_strategy,
             obs_join_on=args.obs_join_on,
             obs_output_filename=args.obs_output_filename,
