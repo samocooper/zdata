@@ -58,7 +58,7 @@ def _sort_mtx_files_numerically(mtx_files):
     
     return sorted(mtx_files, key=extract_start_index)
 
-def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max_rows=8192):
+def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, block_columns=None, max_rows=8192, max_columns=256):
     """
     Build a .zdata directory from an MTX file or directory of MTX files.
     
@@ -66,8 +66,10 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
         mtx_file_or_dir: Path to a single MTX file or directory containing MTX files
         output_name: Output directory name (e.g., "andrews" -> "andrews/")
         zstd_base: Optional path to zstd library (for compilation if needed)
-        block_rows: Number of rows per block (default: 16)
-        max_rows: Maximum rows per chunk (default: 8192)
+        block_rows: Number of rows per block for row-major (X_RM) files (default: 16)
+        block_columns: Number of rows per block for column-major (X_CM) files (default: None, uses block_rows)
+        max_rows: Maximum rows per chunk for row-major files (default: 8192)
+        max_columns: Maximum rows per chunk for column-major files (default: 256)
     
     Returns:
         Path to the created zdata directory
@@ -76,11 +78,19 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
     if not input_path.exists():
         raise FileNotFoundError(f"Input path not found: {mtx_file_or_dir}")
     
+    # Use block_rows for block_columns if not specified
+    if block_columns is None:
+        block_columns = block_rows
+    
     # Validate parameters
     if block_rows < 1 or block_rows > 256:
         raise ValueError(f"block_rows must be between 1 and 256, got {block_rows}")
+    if block_columns < 1 or block_columns > 256:
+        raise ValueError(f"block_columns must be between 1 and 256, got {block_columns}")
     if max_rows < 1 or max_rows > 1000000:
         raise ValueError(f"max_rows must be between 1 and 1000000, got {max_rows}")
+    if max_columns < 1 or max_columns > 1000000:
+        raise ValueError(f"max_columns must be between 1 and 1000000, got {max_columns}")
     
     # Determine if input is a directory or single file
     if input_path.is_dir():
@@ -107,14 +117,33 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
                 if zdata_dir is None:
                     zdata_dir = Path(output_name)
                     zdata_dir.mkdir(parents=True, exist_ok=True)
-                # Use max_rows=256 for column-major files to match the 256-gene fragment size
-                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows=256, subdir="X_CM", return_metadata=True)
+                # Use block_columns and max_columns for column-major files
+                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_columns, max_columns, subdir="X_CM", return_metadata=True)
         
         # Combine metadata if both exist
         if rm_metadata is not None and cm_metadata is not None:
             # Merge metadata: use shape from RM (cells, genes), but include both chunk lists
             # X_RM shape: [cells, genes]
             # X_CM shape: [genes, cells] - but we want to use RM shape as the canonical shape
+            # Build sorted ranges for CM chunks for fast binary search lookup
+            cm_chunk_ranges = []
+            chunks_by_file_cm = {}
+            for chunk_info in cm_metadata['chunks_cm']:
+                file_name = chunk_info['file']
+                if file_name not in chunks_by_file_cm:
+                    chunks_by_file_cm[file_name] = []
+                chunks_by_file_cm[file_name].append(chunk_info)
+            
+            # Build ranges: group by file and create [start_row, end_row, chunk_num] lists
+            for file_name, file_chunks in chunks_by_file_cm.items():
+                chunk_num = file_chunks[0]['chunk_num']
+                start_row = min(c['start_row'] for c in file_chunks)
+                end_row = max(c['end_row'] for c in file_chunks)
+                cm_chunk_ranges.append([start_row, end_row, chunk_num])
+            
+            # Sort by start_row for binary search
+            cm_chunk_ranges.sort(key=lambda x: x[0])
+            
             combined_metadata = {
                 "version": 1,
                 "format": "zdata",
@@ -126,9 +155,12 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
                 "total_blocks_cm": cm_metadata['total_blocks_cm'],
                 "blocks_per_chunk": rm_metadata['blocks_per_chunk'],
                 "block_rows": block_rows,
+                "block_columns": block_columns,
                 "max_rows_per_chunk": max_rows,
+                "max_columns_per_chunk": max_columns,
                 "chunks_rm": rm_metadata['chunks_rm'],  # Chunk ranges are cell indices (0 to nrows-1)
                 "chunks_cm": cm_metadata['chunks_cm'],  # Chunk ranges are gene indices (0 to ncols-1)
+                "cm_chunk_ranges": cm_chunk_ranges,  # Sorted list of [start_row, end_row, chunk_num] for binary search
                 "source_files_rm": rm_metadata.get('source_files', []),
                 "source_files_cm": cm_metadata.get('source_files', [])
             }
@@ -146,6 +178,29 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, max
             if 'shape' in cm_metadata:
                 cm_shape = cm_metadata['shape']
                 cm_metadata['shape'] = [cm_shape[1], cm_shape[0]]  # Swap to [cells, genes]
+            
+            # Build sorted ranges for CM chunks for fast binary search lookup
+            cm_chunk_ranges = []
+            chunks_by_file_cm = {}
+            for chunk_info in cm_metadata['chunks_cm']:
+                file_name = chunk_info['file']
+                if file_name not in chunks_by_file_cm:
+                    chunks_by_file_cm[file_name] = []
+                chunks_by_file_cm[file_name].append(chunk_info)
+            
+            # Build ranges: group by file and create (start_row, end_row, chunk_num) tuples
+            for file_name, file_chunks in chunks_by_file_cm.items():
+                chunk_num = file_chunks[0]['chunk_num']
+                start_row = min(c['start_row'] for c in file_chunks)
+                end_row = max(c['end_row'] for c in file_chunks)
+                cm_chunk_ranges.append([start_row, end_row, chunk_num])
+            
+            # Sort by start_row for binary search
+            cm_chunk_ranges.sort(key=lambda x: x[0])
+            cm_metadata['cm_chunk_ranges'] = cm_chunk_ranges
+            cm_metadata['block_columns'] = block_columns
+            cm_metadata['max_columns_per_chunk'] = max_columns
+            
             metadata_file = zdata_dir / "metadata.json"
             with open(metadata_file, 'w') as f:
                 json.dump(cm_metadata, f, indent=2)
