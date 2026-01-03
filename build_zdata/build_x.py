@@ -98,8 +98,20 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
         rm_mtx_dir = input_path / "rm_mtx_files"
         cm_mtx_dir = input_path / "cm_mtx_files"
         
+        # Clean up existing output directory to ensure clean rebuild
+        zdata_dir = Path(output_name)
+        if zdata_dir.exists():
+            # Remove existing metadata and parquet files
+            for old_file in zdata_dir.glob("*.json"):
+                old_file.unlink()
+            for old_file in zdata_dir.glob("*.parquet"):
+                old_file.unlink()
+            # Remove existing chunk directories
+            for subdir_path in [zdata_dir / "X_RM", zdata_dir / "X_CM"]:
+                if subdir_path.exists():
+                    shutil.rmtree(subdir_path)
+        
         # Process row-major MTX files if they exist
-        zdata_dir = None
         rm_metadata = None
         if rm_mtx_dir.exists() and rm_mtx_dir.is_dir():
             mtx_files = _sort_mtx_files_numerically(list(rm_mtx_dir.glob("*.mtx")))
@@ -379,6 +391,12 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
     
     # Create output directory if it doesn't exist
     zdata_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Clean up existing chunk files in the subdirectory to ensure clean rebuild
+    chunk_dir = zdata_dir / subdir
+    if chunk_dir.exists():
+        for old_chunk_file in chunk_dir.glob("*.bin"):
+            old_chunk_file.unlink()
     
     # Track cumulative statistics
     # For X_RM: total_rows tracks cells
