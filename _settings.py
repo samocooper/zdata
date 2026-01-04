@@ -478,14 +478,14 @@ settings.register(
 settings.register(
     "warn_on_large_queries",
     default_value=True,
-    description="Whether to warn when querying a large number of rows (>10000)",
+    description="Whether to warn when querying a large number of rows (>50000)",
     validate=validate_bool,
     get_from_env=check_and_get_bool,
 )
 
 settings.register(
     "large_query_threshold",
-    default_value=10000,
+    default_value=50000,
     description="Threshold for warning on large queries (in number of rows)",
     validate=validate_positive_int,
     get_from_env=check_and_get_int,

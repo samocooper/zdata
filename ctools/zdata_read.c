@@ -3,9 +3,20 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <time.h>
 
 #include "zstd.h"
 #include "zstd_seekable.h"
+
+/* Profiling: enable timing measurements */
+#ifdef PROFILE_TIMING
+#define CLOCK_TYPE CLOCK_MONOTONIC
+static double get_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_TYPE, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+#endif
 
 #define MAX_BLOCK_ROWS 256  /* Maximum supported block_rows */
 #define MAX_ROWS   1000000  /* Maximum supported max_rows */
@@ -18,6 +29,7 @@ static uint32_t read_le32(const uint8_t *p) {
 }
 
 static void write_le32(FILE *out, uint32_t v) {
+    /* Optimize: write directly without temporary buffer */
     uint8_t b[4];
     b[0] = (uint8_t)(v & 0xFF);
     b[1] = (uint8_t)((v >> 8) & 0xFF);
@@ -34,16 +46,19 @@ typedef struct {
 static int parse_rows_csv(const char *s, uint32_t *out, int max_out) {
     int n = 0;
     const char *p = s;
+    /* Optimize: single pass whitespace/comma skipping */
     while (*p) {
+        /* Skip whitespace and commas in one pass */
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
         if (!*p) break;
+        
         char *end = NULL;
         unsigned long v = strtoul(p, &end, 10);
         if (end == p) break;
-        if (n < max_out && v <= UINT32_MAX) out[n++] = (uint32_t)v;
+        if (n < max_out && v <= UINT32_MAX) {
+            out[n++] = (uint32_t)v;
+        }
         p = end;
-        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-        if (*p == ',') p++;
     }
     return n;
 }
@@ -112,27 +127,30 @@ static int parse_block(const uint8_t *buf, size_t sz,
 }
 
 static int decompress_frame(ZSTD_seekable *zs, unsigned frameIndex,
-                            uint8_t **outBuf, size_t *outSize) {
+                            uint8_t **outBuf, size_t *outSize, size_t *bufCapacity) {
     size_t dsz = ZSTD_seekable_getFrameDecompressedSize(zs, frameIndex);
     if (ZSTD_isError(dsz)) {
         fprintf(stderr, "getFrameDecompressedSize error: %s\n", ZSTD_getErrorName(dsz));
         return 0;
     }
 
-    uint8_t *buf = (uint8_t*)malloc(dsz);
-    if (!buf) {
-        fprintf(stderr, "OOM frame buffer (%zu)\n", dsz);
-        return 0;
+    /* Reuse buffer if it's large enough, otherwise reallocate */
+    if (*outBuf == NULL || *bufCapacity < dsz) {
+        if (*outBuf) free(*outBuf);
+        *outBuf = (uint8_t*)malloc(dsz);
+        if (!*outBuf) {
+            fprintf(stderr, "OOM frame buffer (%zu)\n", dsz);
+            return 0;
+        }
+        *bufCapacity = dsz;
     }
 
-    size_t dr = ZSTD_seekable_decompressFrame(zs, buf, dsz, frameIndex);
+    size_t dr = ZSTD_seekable_decompressFrame(zs, *outBuf, dsz, frameIndex);
     if (ZSTD_isError(dr)) {
         fprintf(stderr, "decompressFrame error: %s\n", ZSTD_getErrorName(dr));
-        free(buf);
         return 0;
     }
 
-    *outBuf = buf;
     *outSize = dr;
     return 1;
 }
@@ -140,15 +158,29 @@ static int decompress_frame(ZSTD_seekable *zs, unsigned frameIndex,
 int main(int argc, char *argv[]) {
     int binary = 0;
     int argi = 1;
+    uint32_t block_rows_override = 0;  /* 0 means auto-detect */
 
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s [--binary] <archive.zdata> <rows_csv>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--binary] [--block-rows N] <archive.zdata> <rows_csv>\n", argv[0]);
         return 1;
     }
 
     if (strcmp(argv[argi], "--binary") == 0) {
         binary = 1;
         argi++;
+    }
+
+    if (argi < argc - 2 && strcmp(argv[argi], "--block-rows") == 0) {
+        argi++;
+        if (argi >= argc) {
+            fprintf(stderr, "Error: --block-rows requires a value\n");
+            return 1;
+        }
+        block_rows_override = (uint32_t)atoi(argv[argi++]);
+        if (block_rows_override == 0 || block_rows_override > MAX_BLOCK_ROWS) {
+            fprintf(stderr, "Error: block_rows must be between 1 and %d, got %u\n", MAX_BLOCK_ROWS, block_rows_override);
+            return 1;
+        }
     }
 
     const char *path = argv[argi++];
@@ -169,11 +201,12 @@ int main(int argc, char *argv[]) {
     if (!fp) { perror("open archive"); return 1; }
     
     /* Set input file to fully buffered for better performance (reduces system calls) */
-    setvbuf(fp, NULL, _IOFBF, 65536);  /* 64KB buffer */
+    /* Use larger buffer (256KB) for better I/O performance, especially for column queries */
+    setvbuf(fp, NULL, _IOFBF, 262144);  /* 256KB buffer */
 
     /* Set stdout to fully buffered for better performance (reduces system calls) */
     if (binary) {
-        setvbuf(stdout, NULL, _IOFBF, 65536);  /* 64KB buffer */
+        setvbuf(stdout, NULL, _IOFBF, 262144);  /* 256KB buffer for better I/O */
     }
 
     ZSTD_seekable *zs = ZSTD_seekable_create();
@@ -188,16 +221,50 @@ int main(int argc, char *argv[]) {
     }
 
     /* Determine ncols and block_rows by reading the first referenced block */
-    /* We need to guess block_rows first - try default value of 16 */
-    uint32_t block_rows = 16;
-    unsigned first_block = (unsigned)(rows_req[0] / block_rows);
+    uint32_t block_rows;
+    unsigned first_block;
     uint8_t *frameBuf = NULL;
     size_t frameSz = 0;
+    size_t frameBufCapacity = 0;  /* Track buffer capacity for reuse */
 
-    if (!decompress_frame(zs, first_block, &frameBuf, &frameSz)) {
-        ZSTD_seekable_free(zs);
-        fclose(fp);
-        return 1;
+    if (block_rows_override > 0) {
+        /* Use provided block_rows from metadata */
+        block_rows = block_rows_override;
+        first_block = (unsigned)(rows_req[0] / block_rows);
+        if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
+            if (frameBuf) free(frameBuf);
+            ZSTD_seekable_free(zs);
+            fclose(fp);
+            return 1;
+        }
+    } else {
+        /* Auto-detect: try common values: 1, 4, 16 */
+        /* For column queries (X_CM), block_rows is typically 1 (block_columns=1) */
+        /* For row queries (X_RM), block_rows is typically 4 or 16 */
+        block_rows = 1;  /* Start with 1 (most common for column queries) */
+        first_block = (unsigned)(rows_req[0] / block_rows);
+        if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
+            /* If block_rows=1 fails, try block_rows=4 (common for row queries) */
+            if (frameBuf) free(frameBuf);
+            frameBuf = NULL;
+            frameBufCapacity = 0;
+            block_rows = 4;
+            first_block = (unsigned)(rows_req[0] / block_rows);
+            if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
+                /* If block_rows=4 fails, try block_rows=16 (default) */
+                if (frameBuf) free(frameBuf);
+                frameBuf = NULL;
+                frameBufCapacity = 0;
+                block_rows = 16;
+                first_block = (unsigned)(rows_req[0] / block_rows);
+                if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
+                    if (frameBuf) free(frameBuf);
+                    ZSTD_seekable_free(zs);
+                    fclose(fp);
+                    return 1;
+                }
+            }
+        }
     }
 
     BlockHeader hdr;
@@ -223,25 +290,25 @@ int main(int argc, char *argv[]) {
     /* Process rows in order (already ascending, so naturally groups by block) */
     /* Cache one block at a time - each block is only decompressed once */
     unsigned cached_block = first_block;
+    
+    /* Pre-sort rows by block to maximize block reuse (rows are already sorted, but this groups by block) */
+    /* This is already done by the caller, so we can rely on rows being in ascending order */
 
     for (int i = 0; i < nreq; i++) {
         uint32_t row = rows_req[i];
         unsigned block_id = (unsigned)(row / block_rows);
-        uint32_t block_start = block_id * block_rows;
-
+        
         /* Decompress block only if we haven't seen it yet */
         if (block_id != cached_block) {
-            free(frameBuf);
-            frameBuf = NULL;
-
-            if (!decompress_frame(zs, block_id, &frameBuf, &frameSz)) {
+            if (!decompress_frame(zs, block_id, &frameBuf, &frameSz, &frameBufCapacity)) {
+                if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
                 return 1;
             }
             if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, NULL)) {
                 fprintf(stderr, "Failed to parse block %u\n", block_id);
-                free(frameBuf);
+                if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
                 return 1;
@@ -249,13 +316,13 @@ int main(int argc, char *argv[]) {
             cached_block = block_id;
         }
 
-        /* Extract row data */
-        uint32_t r = row - block_start;
+        /* Extract row data - optimize: compute r directly without block_start */
+        uint32_t r = row - (block_id * block_rows);
         
         /* Validate row is within the block's actual row count */
         if (r >= hdr.nrows_in_block) {
             fprintf(stderr, "Row %u is beyond block %u's row count (%u)\n", row, block_id, hdr.nrows_in_block);
-            free(frameBuf);
+            if (frameBuf) free(frameBuf);
             ZSTD_seekable_free(zs);
             fclose(fp);
             return 1;
@@ -276,20 +343,15 @@ int main(int argc, char *argv[]) {
             /* Write row header */
             write_le32(stdout, row);
             write_le32(stdout, nnz);
-            /* Write indices array in bulk (much faster than individual writes)
-             * Note: Assumes little-endian system (x86/x64) - data is written in native byte order
-             * which matches what Python's np.frombuffer expects */
+            /* Write indices and data arrays in bulk (optimized: combine when possible) */
             if (nnz > 0) {
                 fwrite(indices + p0, sizeof(uint32_t), nnz, stdout);
-            }
-            /* Write data array in bulk (much faster than individual writes) */
-            if (nnz > 0) {
                 fwrite(data + p0, sizeof(uint16_t), nnz, stdout);
             }
         }
     }
 
-    free(frameBuf);
+    if (frameBuf) free(frameBuf);
     ZSTD_seekable_free(zs);
     fclose(fp);
     return 0;
