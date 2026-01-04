@@ -228,6 +228,7 @@ class ZData:
         self.total_blocks: int | None = self.metadata.get('total_blocks_rm', None)
         
         self.block_rows: int = self.metadata.get('block_rows', settings.block_rows)
+        self.block_columns: int = self.metadata.get('block_columns', self.block_rows)
         self.max_rows_per_chunk: int = self.metadata.get(
             'max_rows_per_chunk', settings.max_rows_per_chunk
         )
@@ -360,7 +361,8 @@ class ZData:
     def _read_rows_from_file(
         self, 
         file_path: str | Path, 
-        local_rows: list[int]
+        local_rows: list[int],
+        block_rows: int | None = None
     ) -> tuple[int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]]]:
         """
         Read rows from a single .bin file. Rows are local indices within that file.
@@ -368,41 +370,70 @@ class ZData:
         Args:
             file_path: Path to the .bin file
             local_rows: List of local row indices (0-based within the chunk)
+            block_rows: Block size to use. If None, uses self.block_rows from metadata.
         
         Returns:
             (ncols, results) where results is a list of (local_row_id, cols, vals) tuples
         """
-        rows_csv = ",".join(map(str, local_rows))
-        # Use the absolute path to zdata_read
-        bin_path = _get_zdata_read_path()
-        blob = subprocess.check_output([bin_path, "--binary", file_path, rows_csv])
+        # Build CSV string (list comprehension for large lists, map for small)
+        rows_csv = ",".join([str(r) for r in local_rows] if len(local_rows) > 50 else map(str, local_rows))
         
-        off = 0
+        # Build command: always pass block_rows from metadata (no auto-detect needed)
+        # Cache zdata_read path to avoid repeated lookups
+        if not hasattr(self, '_zdata_read_path'):
+            self._zdata_read_path = _get_zdata_read_path()
+        block_rows_val = block_rows if block_rows is not None else self.block_rows
+        cmd = [self._zdata_read_path, "--binary", "--block-rows", str(block_rows_val), str(file_path), rows_csv]
+        
+        # Profile subprocess overhead (if profiling enabled)
+        import time
+        subprocess_start = time.perf_counter()
+        # Use subprocess with optimized settings: larger buffer for faster I/O
+        # For column queries, we often read many sparse rows, so use larger buffer
+        blob = subprocess.check_output(
+            cmd,
+            bufsize=262144,  # 256KB buffer for better I/O performance
+            stderr=subprocess.DEVNULL  # Suppress stderr for cleaner output
+        )
+        subprocess_time = time.perf_counter() - subprocess_start
+        
+        # Profile parsing overhead
+        parse_start = time.perf_counter()
+        
         if len(blob) < 8:
             raise ValueError(f"Output too small: {len(blob)} bytes")
         
-        nreq, ncols = struct.unpack_from("<II", blob, off); off += 8
+        # Unpack header and process rows
+        nreq, ncols = struct.unpack_from("<II", blob, 0)
+        out = [None] * nreq
+        blob_mv = memoryview(blob)
+        off = 8
         
-        out = []
+        # Process rows - optimize by avoiding repeated array creation for empty rows
+        empty_cols = np.array([], dtype=np.uint32)
+        empty_vals = np.array([], dtype=np.uint16)
+        
         for i in range(nreq):
-            if off + 8 > len(blob):
-                raise ValueError(f"Truncated before row header {i}: off={off}, len={len(blob)}")
+            row_id, nnz = struct.unpack_from("<II", blob_mv, off)
+            off += 8
             
-            row_id, nnz = struct.unpack_from("<II", blob, off); off += 8
-            
-            need = off + nnz * 4 + nnz * 2  # indices (uint32) + data (uint16)
-            if need > len(blob):
-                raise ValueError(
-                    f"Truncated row {i} (row_id={row_id}, nnz={nnz}). "
-                    f"need={need}, len={len(blob)}, off={off}"
-                )
-            
-            cols = np.frombuffer(blob, dtype=np.uint32, count=nnz, offset=off)
-            off += nnz * 4
-            vals = np.frombuffer(blob, dtype=np.uint16, count=nnz, offset=off)
-            off += nnz * 2
-            
-            out.append((row_id, cols, vals))
+            if nnz > 0:
+                cols = np.frombuffer(blob_mv, dtype=np.uint32, count=nnz, offset=off).copy()
+                off += nnz * 4
+                vals = np.frombuffer(blob_mv, dtype=np.uint16, count=nnz, offset=off).copy()
+                off += nnz * 2
+                out[i] = (row_id, cols, vals)
+            else:
+                out[i] = (row_id, empty_cols, empty_vals)
+        
+        parse_time = time.perf_counter() - parse_start
+        
+        # Profile timing (only for debugging - can be disabled)
+        if hasattr(self, '_profile_timing') and self._profile_timing:
+            if not hasattr(self, '_timing_stats'):
+                self._timing_stats = {'subprocess': [], 'parse': []}
+            self._timing_stats['subprocess'].append(subprocess_time)
+            self._timing_stats['parse'].append(parse_time)
         
         return ncols, out
     
@@ -428,7 +459,7 @@ class ZData:
         row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
         local_rows = [info[0] for info in row_info_list_sorted]
         
-        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_rows)
         
         return file_path, chunk_num, file_results, file_ncols
     
@@ -437,7 +468,7 @@ class ZData:
         file_path: str,
         col_info_list: list[tuple[int, int, int]],
         file_to_chunk: dict[str, int]
-    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]:
+    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int, list[tuple[int, int, int]]]:
         """
         Process a single file for column reading (used in parallel processing).
         
@@ -447,16 +478,17 @@ class ZData:
             file_to_chunk: Mapping from file path to chunk number
         
         Returns:
-            (file_path, chunk_num, file_results, file_ncols)
+            (file_path, chunk_num, file_results, file_ncols, col_info_list_sorted)
         """
         chunk_num = file_to_chunk[file_path]
         
+        # Sort once and reuse
         col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
         local_rows = [info[0] for info in col_info_list_sorted]
         
-        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_columns)
         
-        return file_path, chunk_num, file_results, file_ncols
+        return file_path, chunk_num, file_results, file_ncols, col_info_list_sorted
     
     def read_rows(
         self, 
@@ -597,7 +629,7 @@ class ZData:
                 row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
                 local_rows = [info[0] for info in row_info_list_sorted]
                 
-                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_rows)
                 if self.ncols != file_ncols:
                     raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
                 
@@ -813,29 +845,22 @@ class ZData:
         # This ensures that genes from the same block are processed by a single worker
         cols_by_file = defaultdict(list)
         
-        # Use binary search for O(log n) chunk lookup instead of O(n) linear search
+        # Use binary search for O(log n) chunk lookup
+        # Optimize: cache float('inf') to avoid repeated creation
+        inf_val = float('inf')
         for idx, global_col in enumerate(global_cols):
-            # Binary search to find which chunk contains this gene
-            # Ranges are sorted by start_row, so we find the rightmost range with start_row <= global_col
-            chunk_num = None
-            local_row = None
-            
             # Binary search: find insertion point for (global_col, ...) in sorted list
-            # bisect_right finds the position where (global_col, ...) would be inserted
-            # to maintain sorted order
-            pos = bisect.bisect_right(cm_chunk_ranges, (global_col, float('inf'), 0))
-            if pos > 0:
-                # Check the range at pos-1 (the rightmost range with start_row <= global_col)
-                start_row, end_row, cnum = cm_chunk_ranges[pos - 1]
-                if global_col < end_row:  # Check if global_col is within the range
-                    chunk_num = cnum
-                    local_row = global_col - start_row
+            pos = bisect.bisect_right(cm_chunk_ranges, (global_col, inf_val, 0))
+            if pos == 0:
+                raise IndexError(f"Column {global_col} is beyond available data (no chunk found containing this gene)")
             
-            if chunk_num is None:
+            # Check the range at pos-1 (the rightmost range with start_row <= global_col)
+            start_row, end_row, cnum = cm_chunk_ranges[pos - 1]
+            if global_col >= end_row:
                 raise IndexError(f"Column {global_col} is beyond available data (no chunk found containing this gene)")
             
             # Group by file path - all genes from same file will be processed together
-            cols_by_file[cm_chunk_files[chunk_num]].append((local_row, idx, global_col))
+            cols_by_file[cm_chunk_files[cnum]].append((global_col - start_row, idx, global_col))
         
         all_results = [None] * len(global_cols)
         
@@ -870,11 +895,9 @@ class ZData:
                 for future in as_completed(futures):
                     file_path = futures[future]
                     try:
-                        _, chunk_num, file_results, file_ncols = future.result()
+                        _, chunk_num, file_results, file_ncols, col_info_list_sorted = future.result()
                         
-                        col_info_list = cols_by_file[file_path]
-                        col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
-                        
+                        # Use pre-sorted list from worker (avoids redundant sorting)
                         for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
                             if returned_local_row != local_row:
                                 raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
@@ -889,7 +912,7 @@ class ZData:
                 col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
                 local_rows = [info[0] for info in col_info_list_sorted]
                 
-                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows)
+                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_columns)
                 
                 for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
                     if returned_local_row != local_row:
