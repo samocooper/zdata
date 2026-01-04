@@ -233,6 +233,9 @@ class ZData:
             'max_rows_per_chunk', settings.max_rows_per_chunk
         )
         
+        # Using regular subprocess.check_output with optimized work distribution
+        # ThreadPoolExecutor reuses threads efficiently, minimizing subprocess churn
+        
         self.chunk_files: dict[int, str] = {}
         self.chunk_info: dict[int, dict[str, Any]] = {}
         self.file_to_chunk: dict[str, int] = {}
@@ -383,22 +386,15 @@ class ZData:
         if not hasattr(self, '_zdata_read_path'):
             self._zdata_read_path = _get_zdata_read_path()
         block_rows_val = block_rows if block_rows is not None else self.block_rows
-        cmd = [self._zdata_read_path, "--binary", "--block-rows", str(block_rows_val), str(file_path), rows_csv]
         
-        # Profile subprocess overhead (if profiling enabled)
-        import time
-        subprocess_start = time.perf_counter()
-        # Use subprocess with optimized settings: larger buffer for faster I/O
-        # For column queries, we often read many sparse rows, so use larger buffer
+        # Use regular subprocess.check_output (reliable and fast)
+        # Work distribution is optimized at ThreadPoolExecutor level to minimize worker churn
+        cmd_full = [self._zdata_read_path, "--binary", "--block-rows", str(block_rows_val), str(file_path), rows_csv]
         blob = subprocess.check_output(
-            cmd,
-            bufsize=262144,  # 256KB buffer for better I/O performance
-            stderr=subprocess.DEVNULL  # Suppress stderr for cleaner output
+            cmd_full,
+            bufsize=262144,
+            stderr=subprocess.DEVNULL
         )
-        subprocess_time = time.perf_counter() - subprocess_start
-        
-        # Profile parsing overhead
-        parse_start = time.perf_counter()
         
         if len(blob) < 8:
             raise ValueError(f"Output too small: {len(blob)} bytes")
@@ -425,15 +421,6 @@ class ZData:
                 out[i] = (row_id, cols, vals)
             else:
                 out[i] = (row_id, empty_cols, empty_vals)
-        
-        parse_time = time.perf_counter() - parse_start
-        
-        # Profile timing (only for debugging - can be disabled)
-        if hasattr(self, '_profile_timing') and self._profile_timing:
-            if not hasattr(self, '_timing_stats'):
-                self._timing_stats = {'subprocess': [], 'parse': []}
-            self._timing_stats['subprocess'].append(subprocess_time)
-            self._timing_stats['parse'].append(parse_time)
         
         return ncols, out
     
@@ -577,50 +564,50 @@ class ZData:
         
         all_results = [None] * len(global_rows)
         
-        # Determine number of unique files that need to be processed
         num_files = len(rows_by_file)
         
-        # Use parallel processing only if:
-        # 1. Multiple files need to be processed (rows span multiple blocks)
-        # 2. max_workers > 1 (parallelization enabled)
-        # If all rows belong to one file, only one worker will be used (sequential processing)
+        # Determine optimal number of workers
         max_workers = settings.max_workers
         if max_workers is None:
-            # Auto-detect: limit workers to number of files (no point in more workers than files)
-            max_workers = min(num_files, (os.cpu_count() or 1) + 4)
+            max_workers = min(num_files, min(8, (os.cpu_count() or 1)))
         else:
-            # User-specified: still limit to number of files
             max_workers = min(max_workers, num_files)
         
         if num_files > 1 and max_workers > 1:
-            # Parallel processing for multiple files
+            # Batch files to reduce subprocess startup overhead
+            # Each worker processes multiple files sequentially (up to 10 files per batch)
+            files_per_batch = max(1, min(10, num_files // max_workers + 1))
+            file_items = list(rows_by_file.items())
+            file_batches = [file_items[i:i + files_per_batch] for i in range(0, len(file_items), files_per_batch)]
+            
+            def process_batch(batch: list[tuple[str, list[tuple[int, int, int]]]]) -> dict[str, tuple[int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]]:
+                """Process a batch of files sequentially in a single worker thread."""
+                results = {}
+                for file_path, row_info_list in batch:
+                    _, chunk_num, file_results, file_ncols = self._process_file_for_rows(
+                        file_path, row_info_list, self.file_to_chunk
+                    )
+                    results[file_path] = (chunk_num, file_results, file_ncols)
+                return results
+            
+            # Process batches in parallel
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        self._process_file_for_rows,
-                        file_path,
-                        row_info_list,
-                        self.file_to_chunk
-                    ): file_path
-                    for file_path, row_info_list in rows_by_file.items()
-                }
+                futures = {executor.submit(process_batch, batch): batch for batch in file_batches}
                 
                 for future in as_completed(futures):
-                    file_path = futures[future]
                     try:
-                        _, chunk_num, file_results, file_ncols = future.result()
-                        if self.ncols != file_ncols:
-                            raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
-                        
-                        row_info_list = rows_by_file[file_path]
-                        row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
-                        
-                        for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
-                            if returned_local_row != local_row:
-                                raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                            all_results[orig_idx] = (global_row, cols, vals)
+                        batch_results = future.result()
+                        for file_path, (chunk_num, file_results, file_ncols) in batch_results.items():
+                            if self.ncols != file_ncols:
+                                raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
+                            
+                            row_info_list_sorted = sorted(rows_by_file[file_path], key=lambda x: x[0])
+                            for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
+                                if returned_local_row != local_row:
+                                    raise ValueError(f"Row mismatch: expected {local_row}, got {returned_local_row}")
+                                all_results[orig_idx] = (global_row, cols, vals)
                     except Exception as e:
-                        raise RuntimeError(f"Error processing file {file_path}: {e}") from e
+                        raise RuntimeError(f"Error processing batch: {e}") from e
         else:
             # Sequential processing (single file or max_workers <= 1)
             for file_path, row_info_list in rows_by_file.items():
@@ -867,43 +854,44 @@ class ZData:
         # Determine number of unique files that need to be processed
         num_files = len(cols_by_file)
         
-        # Use parallel processing only if:
-        # 1. Multiple files need to be processed (genes span multiple blocks)
-        # 2. max_workers > 1 (parallelization enabled)
-        # If all genes belong to one file, only one worker will be used (sequential processing)
+        # Determine optimal number of workers
         max_workers = settings.max_workers
         if max_workers is None:
-            # Auto-detect: limit workers to number of files (no point in more workers than files)
-            max_workers = min(num_files, (os.cpu_count() or 1) + 4)
+            max_workers = min(num_files, min(8, (os.cpu_count() or 1)))
         else:
-            # User-specified: still limit to number of files
             max_workers = min(max_workers, num_files)
         
         if num_files > 1 and max_workers > 1:
-            # Parallel processing for multiple files
+            # Batch files to reduce subprocess startup overhead
+            # Each worker processes multiple files sequentially (up to 10 files per batch)
+            files_per_batch = max(1, min(10, num_files // max_workers + 1))
+            file_items = list(cols_by_file.items())
+            file_batches = [file_items[i:i + files_per_batch] for i in range(0, len(file_items), files_per_batch)]
+            
+            def process_batch(batch: list[tuple[str, list[tuple[int, int, int]]]]) -> dict[str, tuple[int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int, list[tuple[int, int, int]]]]:
+                """Process a batch of files sequentially in a single worker thread."""
+                results = {}
+                for file_path, col_info_list in batch:
+                    _, chunk_num, file_results, file_ncols, col_info_list_sorted = self._process_file_for_cols(
+                        file_path, col_info_list, cm_file_to_chunk
+                    )
+                    results[file_path] = (chunk_num, file_results, file_ncols, col_info_list_sorted)
+                return results
+            
+            # Process batches in parallel
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        self._process_file_for_cols,
-                        file_path,
-                        col_info_list,
-                        cm_file_to_chunk
-                    ): file_path
-                    for file_path, col_info_list in cols_by_file.items()
-                }
+                futures = {executor.submit(process_batch, batch): batch for batch in file_batches}
                 
                 for future in as_completed(futures):
-                    file_path = futures[future]
                     try:
-                        _, chunk_num, file_results, file_ncols, col_info_list_sorted = future.result()
-                        
-                        # Use pre-sorted list from worker (avoids redundant sorting)
-                        for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
-                            if returned_local_row != local_row:
-                                raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                            all_results[orig_idx] = (global_col, rows, vals)
+                        batch_results = future.result()
+                        for file_path, (chunk_num, file_results, file_ncols, col_info_list_sorted) in batch_results.items():
+                            for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
+                                if returned_local_row != local_row:
+                                    raise ValueError(f"Row mismatch: expected {local_row}, got {returned_local_row}")
+                                all_results[orig_idx] = (global_col, rows, vals)
                     except Exception as e:
-                        raise RuntimeError(f"Error processing file {file_path}: {e}") from e
+                        raise RuntimeError(f"Error processing batch: {e}") from e
         else:
             # Sequential processing (single file or max_workers <= 1)
             for file_path, col_info_list in cols_by_file.items():
@@ -1311,3 +1299,7 @@ class ZData:
             )
         
         return adata
+    
+    def close(self):
+        """Explicitly close and cleanup resources (no-op for now, kept for API compatibility)."""
+        pass

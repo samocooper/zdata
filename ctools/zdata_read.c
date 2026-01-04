@@ -3,20 +3,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
-#include <time.h>
 
 #include "zstd.h"
 #include "zstd_seekable.h"
-
-/* Profiling: enable timing measurements */
-#ifdef PROFILE_TIMING
-#define CLOCK_TYPE CLOCK_MONOTONIC
-static double get_time(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_TYPE, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-#endif
 
 #define MAX_BLOCK_ROWS 256  /* Maximum supported block_rows */
 #define MAX_ROWS   1000000  /* Maximum supported max_rows */
@@ -155,11 +144,56 @@ static int decompress_frame(ZSTD_seekable *zs, unsigned frameIndex,
     return 1;
 }
 
+/* Forward declaration */
+static int process_file(const char *path, const char *rows_csv, uint32_t block_rows_override, int binary, int is_stdin_mode);
+
 int main(int argc, char *argv[]) {
     int binary = 0;
     int argi = 1;
     uint32_t block_rows_override = 0;  /* 0 means auto-detect */
+    int read_from_stdin = 0;  /* If true, read commands from stdin */
 
+    /* Check if we should read from stdin (for persistent pool mode) */
+    if (argc == 2 && strcmp(argv[1], "--binary") == 0) {
+        binary = 1;
+        read_from_stdin = 1;
+    } else if (argc == 1) {
+        read_from_stdin = 1;
+    }
+
+    if (read_from_stdin) {
+        /* Persistent pool mode: read commands from stdin */
+        char line[4096];
+        while (fgets(line, sizeof(line), stdin) != NULL) {
+            /* Parse command: "file_path\nrows_csv\nblock_rows\n" */
+            char *path = line;
+            /* Remove newline */
+            size_t len = strlen(path);
+            if (len > 0 && path[len-1] == '\n') path[len-1] = '\0';
+            
+            if (!fgets(line, sizeof(line), stdin)) break;
+            char *rows_csv = line;
+            len = strlen(rows_csv);
+            if (len > 0 && rows_csv[len-1] == '\n') rows_csv[len-1] = '\0';
+            
+            if (!fgets(line, sizeof(line), stdin)) break;
+            block_rows_override = (uint32_t)atoi(line);
+            if (block_rows_override == 0 || block_rows_override > MAX_BLOCK_ROWS) {
+                fprintf(stderr, "Error: invalid block_rows\n");
+                continue;
+            }
+            
+            /* Process this command */
+            if (process_file(path, rows_csv, block_rows_override, binary, 1) != 0) {
+                return 1;
+            }
+            /* Flush stdout after each command to ensure output is available to reader */
+            fflush(stdout);
+        }
+        return 0;
+    }
+
+    /* Normal mode: command-line arguments */
     if (argc < 3) {
         fprintf(stderr, "Usage: %s [--binary] [--block-rows N] <archive.zdata> <rows_csv>\n", argv[0]);
         return 1;
@@ -185,7 +219,11 @@ int main(int argc, char *argv[]) {
 
     const char *path = argv[argi++];
     const char *rows_csv = argv[argi++];
+    
+    return process_file(path, rows_csv, block_rows_override, binary, 0);
+}
 
+static int process_file(const char *path, const char *rows_csv, uint32_t block_rows_override, int binary, int is_stdin_mode) {
     uint32_t rows_req[4096];
     int nreq = parse_rows_csv(rows_csv, rows_req, 4096);
     if (nreq <= 0) { fprintf(stderr, "No rows parsed\n"); return 1; }
@@ -204,9 +242,14 @@ int main(int argc, char *argv[]) {
     /* Use larger buffer (256KB) for better I/O performance, especially for column queries */
     setvbuf(fp, NULL, _IOFBF, 262144);  /* 256KB buffer */
 
-    /* Set stdout to fully buffered for better performance (reduces system calls) */
+    /* Set stdout to line buffered for persistent mode (ensures data is available immediately) */
+    /* In stdin mode, we need immediate flushing so readers don't block */
     if (binary) {
-        setvbuf(stdout, NULL, _IOFBF, 262144);  /* 256KB buffer for better I/O */
+        if (is_stdin_mode) {
+            setvbuf(stdout, NULL, _IOLBF, 0);  /* Line buffered for stdin mode */
+        } else {
+            setvbuf(stdout, NULL, _IOFBF, 262144);  /* 256KB buffer for normal mode */
+        }
     }
 
     ZSTD_seekable *zs = ZSTD_seekable_create();
