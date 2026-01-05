@@ -150,9 +150,11 @@ Some tests may be skipped if required dependencies are not available:
 The `test_ctools.py` module tests the C tools (`mtx_to_zdata.c` and `zdata_read.c`):
 
 ### Requirements
-- ZSTD library installed (set `ZSTD_BASE` environment variable or use default `/home/ubuntu/zstd`)
+- ZSTD library installed (set `ZSTD_BASE` environment variable to point to ZSTD source directory)
 - GCC compiler available
 - ZSTD source files in expected locations
+
+**Note:** See the main README.md for detailed instructions on setting up ZSTD.
 
 ### Test Coverage
 - **Compilation**: Verifies both C tools compile without errors
