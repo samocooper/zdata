@@ -546,7 +546,7 @@ static int process_chunk_from_csr(
         return 0;
     }
 
-    int compressionLevel = 3;
+    int compressionLevel = 1;
     int checksumFlag = 0;
     unsigned maxFrameSize = 0;
     size_t initR = ZSTD_seekable_initCStream(zcs, compressionLevel, checksumFlag, maxFrameSize);
