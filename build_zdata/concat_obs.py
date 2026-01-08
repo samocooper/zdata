@@ -325,8 +325,8 @@ def concat_obs_from_zarr_directory(
         join_on: If join_strategy is "columns", list of column names to join on
         output_filename: Name of output parquet file
         zarr_files_filter: Optional set of file names to process (filters available files)
-        row_nnz_files: Optional list of text files containing row nnz values (one per line)
-                      These will be merged into the obs DataFrame as an 'nnz' column
+        row_nnz_files: Optional list of text files containing row stats (nnz and total_counts as two columns)
+                      These will be merged into the obs DataFrame as 'nnz' and 'total_counts' columns
     
     Returns:
         Path to created parquet file
@@ -404,36 +404,62 @@ def concat_obs_from_zarr_directory(
     
     print(f"  ✓ Combined DataFrame: {combined_df.height} rows × {len(combined_df.columns)} columns")
     
-    # Add row nnz (number of non-zeros per row/cell) - required
+    # Add row nnz (number of non-zeros per row/cell) and total_counts - required
     if not row_nnz_files:
         raise ValueError(
-            "row_nnz_files must be provided. Row nnz values are required for obs DataFrame."
+            "row_nnz_files must be provided. Row stats (nnz and total_counts) are required for obs DataFrame."
         )
     
-    print(f"\nLoading row nnz values from {len(row_nnz_files)} file(s)...")
+    print(f"\nLoading row stats (nnz and total_counts) from {len(row_nnz_files)} file(s)...")
     all_row_nnz = []
-    for nnz_file in sorted(row_nnz_files):
-        if not os.path.exists(nnz_file):
-            raise FileNotFoundError(f"Row nnz file not found: {nnz_file}")
+    all_row_total_counts = []
+    for stats_file in sorted(row_nnz_files):
+        if not os.path.exists(stats_file):
+            raise FileNotFoundError(f"Row stats file not found: {stats_file}")
         
-        nnz_values = np.loadtxt(nnz_file, dtype=np.uint32)
+        # Load stats file with two columns: nnz and total_counts
+        # Use whitespace delimiter to be robust to space or tab separation
+        stats_data = np.loadtxt(stats_file, skiprows=1)  # Skip header row
+        # stats_data is now a 2D array with shape (n_rows, 2)
+        nnz_values = stats_data[:, 0].astype(np.uint32)
+        total_counts_values = stats_data[:, 1].astype(np.float32)
+        
         all_row_nnz.extend(nnz_values.tolist())
-        print(f"  ✓ Loaded {len(nnz_values)} nnz values from {os.path.basename(nnz_file)}")
+        all_row_total_counts.extend(total_counts_values.tolist())
+        print(f"  ✓ Loaded {len(nnz_values)} stats values from {os.path.basename(stats_file)}")
     
     if len(all_row_nnz) != combined_df.height:
         raise ValueError(
-            f"Row nnz count ({len(all_row_nnz)}) doesn't match obs rows ({combined_df.height}). "
+            f"Row stats count ({len(all_row_nnz)}) doesn't match obs rows ({combined_df.height}). "
             f"This indicates a mismatch in the alignment process."
         )
     
     combined_df = combined_df.with_columns([
-        pl.Series("nnz", all_row_nnz, dtype=pl.UInt32)
+        pl.Series("nnz", all_row_nnz, dtype=pl.UInt32),
+        pl.Series("total_counts", all_row_total_counts, dtype=pl.Float32)
     ])
-    print(f"  ✓ Added nnz column to obs DataFrame ({len(all_row_nnz)} values)")
-    
-    # Add explicit integer index column to prevent pandas from inferring string index
-    # This ensures clean conversion to pandas without ImplicitModificationWarning
+    # scaling_factor = 10,000 / total_counts (avoid div-by-zero -> null)
+    combined_df = combined_df.with_columns(
+        pl.when(pl.col("total_counts") > 0)
+        .then(10000.0 / pl.col("total_counts"))
+        .otherwise(None)
+        .alias("scaling_factor")
+    )
+    print(f"  ✓ Added nnz, total_counts, scaling_factor columns to obs DataFrame ({len(all_row_nnz)} values)")
+
+    # Add explicit integer index column BEFORE filtering
+    # This ensures _row_index corresponds to the original row indices in the x matrix
+    # This prevents pandas from inferring string index and ensures alignment with x matrix
     combined_df = combined_df.with_row_index("_row_index")
+
+    # Filter cells with nnz < 300
+    nnz_threshold = 300
+    before_rows = combined_df.height
+    combined_df = combined_df.filter(pl.col("nnz") >= nnz_threshold)
+    after_rows = combined_df.height
+    removed = before_rows - after_rows
+    print(f"  ✓ Filtered cells with nnz < {nnz_threshold}: removed {removed}, kept {after_rows}")
+    print(f"  ✓ _row_index preserved original row indices (0 to {before_rows-1}) to match x matrix")
     
     # Show column summary
     print(f"  Columns: {', '.join(combined_df.columns[:10])}" + 
@@ -495,7 +521,7 @@ def main():
         type=str,
         nargs='+',
         default=None,
-        help='Optional list of row nnz text files to merge into obs DataFrame'
+        help='Optional list of row stats text files (nnz and total_counts as two columns) to merge into obs DataFrame'
     )
     
     args = parser.parse_args()
