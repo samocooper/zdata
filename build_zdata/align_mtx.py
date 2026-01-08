@@ -381,12 +381,17 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         row_nnz = np.diff(combined_matrix.indptr).astype(np.uint32)
         column_nnz_chunk = combined_matrix.getnnz(axis=0).astype(np.uint32)
         
+        # Calculate total read counts per row (sum of all values per row)
+        row_total_counts = np.array(combined_matrix.sum(axis=1)).flatten().astype(np.float32)
+        
         print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
         mmwrite(chunk_output_path, combined_matrix)
         print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
         
-        row_nnz_path = os.path.join(mtx_output_dir, f"rows_{row_start}_{row_end}_nnz.txt")
-        np.savetxt(row_nnz_path, row_nnz, fmt='%u', delimiter='\n')
+        # Save both nnz and total counts to the same file as two columns
+        row_stats_path = os.path.join(mtx_output_dir, f"rows_{row_start}_{row_end}_stats.txt")
+        row_stats = np.column_stack([row_nnz, row_total_counts])
+        np.savetxt(row_stats_path, row_stats, fmt='%u %.6f', delimiter='\t', header='nnz\ttotal_counts', comments='')
         
         manifest_entry = {
             'mtx_file': os.path.basename(chunk_output_path),
@@ -394,6 +399,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
             'row_start': row_start,
             'row_end': row_end,
             'n_rows': combined_matrix.shape[0],
+            'row_stats_file': os.path.basename(row_stats_path),
             'source_files': chunk_zarrs_info.copy()
         }
         

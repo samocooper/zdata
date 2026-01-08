@@ -214,20 +214,28 @@ def build_zdata_from_zarr(
             if successfully_processed_zarrs:
                 print(f"Processing obs from {len(successfully_processed_zarrs)} file(s) that were successfully aligned")
                 
-                # Find row nnz files from MTX processing
+                # Find row stats files from MTX processing
                 row_nnz_files = []
                 if os.path.exists(manifest_path):
                     with open(manifest_path, 'r') as f:
                         manifest = json.load(f)
                         mtx_output_dir = os.path.join(temp_mtx_dir, "rm_mtx_files")
                         for mtx_entry in manifest.get('mtx_files', []):
-                            mtx_file = mtx_entry.get('mtx_file', '')
-                            if mtx_file:
-                                # Extract row range from filename (e.g., rows_0_131071.mtx -> rows_0_131071_nnz.txt)
-                                base_name = os.path.splitext(mtx_file)[0]
-                                nnz_file = os.path.join(mtx_output_dir, f"{base_name}_nnz.txt")
-                                if os.path.exists(nnz_file):
-                                    row_nnz_files.append(nnz_file)
+                            # Check if manifest has row_stats_file entry (new format)
+                            stats_file = mtx_entry.get('row_stats_file')
+                            if stats_file:
+                                stats_path = os.path.join(mtx_output_dir, stats_file)
+                                if os.path.exists(stats_path):
+                                    row_nnz_files.append(stats_path)
+                            else:
+                                # Fallback: try to construct from mtx_file name (backward compatibility)
+                                mtx_file = mtx_entry.get('mtx_file', '')
+                                if mtx_file:
+                                    # Extract row range from filename (e.g., rows_0_131071.mtx -> rows_0_131071_stats.txt)
+                                    base_name = os.path.splitext(mtx_file)[0]
+                                    stats_file = os.path.join(mtx_output_dir, f"{base_name}_stats.txt")
+                                    if os.path.exists(stats_file):
+                                        row_nnz_files.append(stats_file)
                 
                 obs_output_path = concat_obs_from_zarr_directory(
                     str(zarr_dir_path),
