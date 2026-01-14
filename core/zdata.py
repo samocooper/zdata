@@ -233,8 +233,8 @@ class ZData:
             'max_rows_per_chunk', settings.max_rows_per_chunk
         )
         
-        # Using regular subprocess.check_output with optimized work distribution
-        # ThreadPoolExecutor reuses threads efficiently, minimizing subprocess churn
+        # Initialize obs shape matching flag early (will be updated after loading obs_df)
+        self._obs_matches_expression_shape = False
         
         self.chunk_files: dict[int, str] = {}
         self.chunk_info: dict[int, dict[str, Any]] = {}
@@ -269,6 +269,10 @@ class ZData:
             self._obs_df: PolarsDataFrame = pl.read_parquet(obs_file)
             self._obs_wrapper: ObsWrapper = ObsWrapper(self._obs_df)
             
+            # Check if obs shape matches expression shape
+            obs_nrows = len(self._obs_df)
+            self._obs_matches_expression_shape = (obs_nrows == self.nrows)
+                        
             # Cache var DataFrame for __getitem__ access
             var_polars = pl.read_parquet(var_file)
             var_dict = var_polars.to_dict(as_series=False)
@@ -1255,7 +1259,14 @@ class ZData:
         
         if is_column_query:
             csr_result = self.read_cols_cm_csr(key)
-            return csr_result.T.tocsc()
+            csc_result = csr_result.T
+            
+            if not self._obs_matches_expression_shape:
+                row_indices = self._obs_df['_row_index'].to_numpy()
+                csr_subset = csc_result.tocsr()[row_indices, :]
+                csc_result = csr_subset.tocsc()
+            
+            return csc_result
         
         row_indices = normalize_row_indices(key, self.nrows)
         
