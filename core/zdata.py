@@ -117,6 +117,35 @@ class ObsWrapper:
         
         return pandas_df
     
+    def gather(self, row_indices: list[int]) -> pd.DataFrame:
+        """\
+        Efficiently select multiple (possibly non-consecutive) rows by index.
+        
+        Uses Polars row selection for a single fast gather instead of
+        row-by-row slicing and concatenation.
+        
+        Parameters
+        ----------
+        row_indices
+            List of integer row positions to select.
+        
+        Returns
+        -------
+        pd.DataFrame
+            Pandas DataFrame with the selected rows.
+        """
+        polars_result = self.obs_df[pl.Series(row_indices)]
+        data_dict = polars_result.to_dict(as_series=False)
+        pandas_df = pd.DataFrame(data_dict)
+        
+        if "_row_index" in pandas_df.columns:
+            pandas_df = pandas_df.set_index("_row_index")
+            pandas_df.index = pandas_df.index.astype(int)
+        else:
+            pandas_df.index = pd.RangeIndex(start=0, stop=len(pandas_df))
+        
+        return pandas_df
+    
     def __len__(self) -> int:
         return len(self.obs_df)
     
@@ -277,6 +306,9 @@ class ZData:
         except Exception as e:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
         
+        # Cache zdata_read executable path (resolved once at init for thread safety)
+        self._zdata_read_path: str = _get_zdata_read_path()
+        
         # Cache for column-major chunk mappings (built lazily)
         self._cm_chunk_files: dict[int, str] | None = None
         self._cm_chunk_info: dict[int, dict[str, Any]] | None = None
@@ -381,14 +413,11 @@ class ZData:
         # Build CSV string (list comprehension for large lists, map for small)
         rows_csv = ",".join([str(r) for r in local_rows] if len(local_rows) > 50 else map(str, local_rows))
         
-        # Build command: always pass block_rows from metadata (no auto-detect needed)
-        # Cache zdata_read path to avoid repeated lookups
-        if not hasattr(self, '_zdata_read_path'):
-            self._zdata_read_path = _get_zdata_read_path()
         block_rows_val = block_rows if block_rows is not None else self.block_rows
         
-        # Use regular subprocess.check_output (reliable and fast)
-        # Work distribution is optimized at ThreadPoolExecutor level to minimize worker churn
+        # TODO: For even better performance, replace subprocess with ctypes/cffi
+        # to call C decompression in-process (avoids ~5-20ms subprocess overhead per call).
+        # This would require restructuring zdata_read.c into a shared library.
         cmd_full = [self._zdata_read_path, "--binary", "--block-rows", str(block_rows_val), str(file_path), rows_csv]
         blob = subprocess.check_output(
             cmd_full,
@@ -948,16 +977,15 @@ class ZData:
         """
         cols_data = self.read_cols_cm(global_cols)
         
-        row_indices: list[int] = []
-        col_indices: list[int] = []
-        values: list[float] = []
-        for csr_row_idx, (col_id, rows, vals) in enumerate(cols_data):
-            for row, val in zip(rows, vals):
-                row_indices.append(csr_row_idx)
-                col_indices.append(int(row))
-                values.append(float(val))
+        if not cols_data:
+            return csr_matrix((0, self.nrows), dtype=np.float64)
         
-        return csr_matrix((values, (row_indices, col_indices)), shape=(len(cols_data), self.nrows))
+        counts = np.array([len(rows) for _, rows, _ in cols_data], dtype=np.intp)
+        all_rows = np.repeat(np.arange(len(cols_data), dtype=np.int32), counts)
+        all_cols = np.concatenate([rows for _, rows, _ in cols_data]) if counts.sum() > 0 else np.array([], dtype=np.uint32)
+        all_vals = np.concatenate([vals for _, _, vals in cols_data]).astype(np.float64) if counts.sum() > 0 else np.array([], dtype=np.float64)
+        
+        return csr_matrix((all_vals, (all_rows, all_cols)), shape=(len(cols_data), self.nrows))
     
     def _rows_to_csr(
         self, 
@@ -980,15 +1008,14 @@ class ZData:
             Compressed Sparse Row matrix of shape (len(rows_data), ncols).
             Dtype is float64.
         """
-        row_indices: list[int] = []
-        col_indices: list[int] = []
-        values: list[float] = []
-        for csr_row_idx, (row_id, cols, vals) in enumerate(rows_data):
-            for col, val in zip(cols, vals):
-                row_indices.append(csr_row_idx)
-                col_indices.append(int(col))
-                values.append(float(val))
-        return csr_matrix((values, (row_indices, col_indices)), shape=(len(rows_data), self.ncols))
+        if not rows_data:
+            return csr_matrix((0, self.ncols), dtype=np.float64)
+        
+        counts = np.array([len(cols) for _, cols, _ in rows_data], dtype=np.intp)
+        all_rows = np.repeat(np.arange(len(rows_data), dtype=np.int32), counts)
+        all_cols = np.concatenate([cols for _, cols, _ in rows_data]) if counts.sum() > 0 else np.array([], dtype=np.uint32)
+        all_vals = np.concatenate([vals for _, _, vals in rows_data]).astype(np.float64) if counts.sum() > 0 else np.array([], dtype=np.float64)
+        return csr_matrix((all_vals, (all_rows, all_cols)), shape=(len(rows_data), self.ncols))
     
     @property
     def num_columns(self) -> int:
@@ -1048,9 +1075,8 @@ class ZData:
         >>> random_rows = zdata.get_random_rows(10, seed=42)
         >>> data = zdata.read_rows(random_rows)
         """
-        if seed is not None:
-            np.random.seed(seed)
-        return np.random.choice(self.nrows, size=min(n, self.nrows), replace=False).tolist()
+        rng = np.random.default_rng(seed)
+        return rng.choice(self.nrows, size=min(n, self.nrows), replace=False).tolist()
     
     def estimate_memory_requirements(
         self,
@@ -1173,9 +1199,6 @@ class ZData:
     @overload
     def __getitem__(self, key: str) -> csc_matrix: ...
     
-    @overload
-    def __getitem__(self, key: slice) -> csc_matrix: ...  # For gene name slices
-    
     def __getitem__(
         self, 
         key: slice | int | list[int] | list[str] | str | NDArray[np.integer] | NDArray[np.bool_]
@@ -1268,7 +1291,7 @@ class ZData:
         if len(row_indices) == 1:
             obs_df = self.obs[row_indices[0]:row_indices[0]+1, :]
         elif row_indices:
-            # Use slice if indices are consecutive, otherwise get individually
+            # Use slice if indices are consecutive, otherwise use gather
             is_consecutive = (
                 len(row_indices) == row_indices[-1] - row_indices[0] + 1
                 and all(row_indices[i] == row_indices[0] + i for i in range(len(row_indices)))
@@ -1276,8 +1299,7 @@ class ZData:
             if is_consecutive:
                 obs_df = self.obs[row_indices[0]:row_indices[-1]+1, :]
             else:
-                obs_dfs = [self.obs[idx:idx+1, :] for idx in row_indices]
-                obs_df = pd.concat(obs_dfs, ignore_index=True)
+                obs_df = self.obs.gather(row_indices)
         else:
             obs_df = self.obs[0:0, :].copy()
         
@@ -1303,3 +1325,28 @@ class ZData:
     def close(self):
         """Explicitly close and cleanup resources (no-op for now, kept for API compatibility)."""
         pass
+    
+    def __enter__(self):
+        """Support use as context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Close resources when exiting context manager."""
+        self.close()
+        return False
+    
+    @property
+    def var(self) -> pd.DataFrame:
+        """\
+        Access the variable (gene) metadata DataFrame.
+        
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame containing gene metadata (gene names, nnz counts, etc.).
+        """
+        return self._var_df
+    
+    def __repr__(self) -> str:
+        nnz_str = f", nnz={self.nnz_total}" if self.nnz_total is not None else ""
+        return f"ZData('{self.dir_path}', shape={self.shape}{nnz_str})"

@@ -335,7 +335,7 @@ def get_long_description():
 
 
 setup(
-    name="zdata",
+    name="zdata-py",
     version=get_version(),
     description="Efficient storage and access for large single-cell RNA datasets (supports Zarr and H5AD formats)",
     long_description=get_long_description(),
@@ -347,7 +347,7 @@ setup(
     packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
     package_dir={"zdata": "."},
     include_package_data=True,
-    python_requires=">=3.8",
+    python_requires=">=3.12",
     install_requires=[
         "numpy>=1.20.0",
         "scipy>=1.7.0",
@@ -377,11 +377,8 @@ setup(
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "License :: OSI Approved :: MIT License",  # Update if different
     ],
 )

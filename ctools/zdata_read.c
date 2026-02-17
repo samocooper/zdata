@@ -154,37 +154,40 @@ int main(int argc, char *argv[]) {
     int read_from_stdin = 0;  /* If true, read commands from stdin */
 
     /* Check if we should read from stdin (for persistent pool mode) */
-    if (argc == 2 && strcmp(argv[1], "--binary") == 0) {
-        binary = 1;
-        read_from_stdin = 1;
-    } else if (argc == 1) {
-        read_from_stdin = 1;
+    /* Requires explicit --stdin flag, e.g.: zdata_read --stdin --binary */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--stdin") == 0) {
+            read_from_stdin = 1;
+            for (int j = 1; j < argc; j++) {
+                if (strcmp(argv[j], "--binary") == 0) binary = 1;
+            }
+            break;
+        }
     }
 
     if (read_from_stdin) {
         /* Persistent pool mode: read commands from stdin */
-        char line[4096];
-        while (fgets(line, sizeof(line), stdin) != NULL) {
+        char path_buf[4096];
+        char rows_buf[65536];
+        char block_buf[64];
+        while (fgets(path_buf, sizeof(path_buf), stdin) != NULL) {
             /* Parse command: "file_path\nrows_csv\nblock_rows\n" */
-            char *path = line;
-            /* Remove newline */
-            size_t len = strlen(path);
-            if (len > 0 && path[len-1] == '\n') path[len-1] = '\0';
+            size_t len = strlen(path_buf);
+            if (len > 0 && path_buf[len-1] == '\n') path_buf[len-1] = '\0';
             
-            if (!fgets(line, sizeof(line), stdin)) break;
-            char *rows_csv = line;
-            len = strlen(rows_csv);
-            if (len > 0 && rows_csv[len-1] == '\n') rows_csv[len-1] = '\0';
+            if (!fgets(rows_buf, sizeof(rows_buf), stdin)) break;
+            len = strlen(rows_buf);
+            if (len > 0 && rows_buf[len-1] == '\n') rows_buf[len-1] = '\0';
             
-            if (!fgets(line, sizeof(line), stdin)) break;
-            block_rows_override = (uint32_t)atoi(line);
+            if (!fgets(block_buf, sizeof(block_buf), stdin)) break;
+            block_rows_override = (uint32_t)atoi(block_buf);
             if (block_rows_override == 0 || block_rows_override > MAX_BLOCK_ROWS) {
                 fprintf(stderr, "Error: invalid block_rows\n");
                 continue;
             }
             
             /* Process this command */
-            if (process_file(path, rows_csv, block_rows_override, binary, 1) != 0) {
+            if (process_file(path_buf, rows_buf, block_rows_override, binary, 1) != 0) {
                 return 1;
             }
             /* Flush stdout after each command to ensure output is available to reader */
@@ -195,7 +198,8 @@ int main(int argc, char *argv[]) {
 
     /* Normal mode: command-line arguments */
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s [--binary] [--block-rows N] <archive.zdata> <rows_csv>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--binary] [--block-rows N] <archive.zdata> <rows_csv>\n"
+                        "       %s --stdin [--binary]  (persistent mode, reads commands from stdin)\n", argv[0], argv[0]);
         return 1;
     }
 
@@ -224,19 +228,28 @@ int main(int argc, char *argv[]) {
 }
 
 static int process_file(const char *path, const char *rows_csv, uint32_t block_rows_override, int binary, int is_stdin_mode) {
-    uint32_t rows_req[4096];
-    int nreq = parse_rows_csv(rows_csv, rows_req, 4096);
-    if (nreq <= 0) { fprintf(stderr, "No rows parsed\n"); return 1; }
+    /* Count entries in CSV to allocate appropriately */
+    int est_count = 1;
+    for (const char *c = rows_csv; *c; c++) {
+        if (*c == ',') est_count++;
+    }
+    
+    uint32_t *rows_req = (uint32_t*)malloc((size_t)est_count * sizeof(uint32_t));
+    if (!rows_req) { fprintf(stderr, "OOM rows_req\n"); return 1; }
+    
+    int nreq = parse_rows_csv(rows_csv, rows_req, est_count);
+    if (nreq <= 0) { fprintf(stderr, "No rows parsed\n"); free(rows_req); return 1; }
 
     for (int i = 0; i < nreq; i++) {
-        if (rows_req[i] < 0 || rows_req[i] >= MAX_ROWS) {
-            fprintf(stderr, "Row out of range: %d\n", rows_req[i]);
+        if (rows_req[i] >= MAX_ROWS) {
+            fprintf(stderr, "Row out of range: %u\n", rows_req[i]);
+            free(rows_req);
             return 1;
         }
     }
 
     FILE *fp = fopen(path, "rb");
-    if (!fp) { perror("open archive"); return 1; }
+    if (!fp) { perror("open archive"); free(rows_req); return 1; }
     
     /* Set input file to fully buffered for better performance (reduces system calls) */
     /* Use larger buffer (256KB) for better I/O performance, especially for column queries */
@@ -253,13 +266,14 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     }
 
     ZSTD_seekable *zs = ZSTD_seekable_create();
-    if (!zs) { fprintf(stderr, "ZSTD_seekable_create failed\n"); fclose(fp); return 1; }
+    if (!zs) { fprintf(stderr, "ZSTD_seekable_create failed\n"); fclose(fp); free(rows_req); return 1; }
 
     size_t ir = ZSTD_seekable_initFile(zs, fp);
     if (ZSTD_isError(ir)) {
         fprintf(stderr, "seekable_initFile error: %s\n", ZSTD_getErrorName(ir));
         ZSTD_seekable_free(zs);
         fclose(fp);
+        free(rows_req);
         return 1;
     }
 
@@ -278,6 +292,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
             if (frameBuf) free(frameBuf);
             ZSTD_seekable_free(zs);
             fclose(fp);
+            free(rows_req);
             return 1;
         }
     } else {
@@ -304,6 +319,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
                     if (frameBuf) free(frameBuf);
                     ZSTD_seekable_free(zs);
                     fclose(fp);
+                    free(rows_req);
                     return 1;
                 }
             }
@@ -320,6 +336,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
         free(frameBuf);
         ZSTD_seekable_free(zs);
         fclose(fp);
+        free(rows_req);
         return 1;
     }
 
@@ -347,6 +364,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
                 if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
+                free(rows_req);
                 return 1;
             }
             if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, NULL)) {
@@ -354,6 +372,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
                 if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
+                free(rows_req);
                 return 1;
             }
             cached_block = block_id;
@@ -368,6 +387,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
             if (frameBuf) free(frameBuf);
             ZSTD_seekable_free(zs);
             fclose(fp);
+            free(rows_req);
             return 1;
         }
         
@@ -397,5 +417,6 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     if (frameBuf) free(frameBuf);
     ZSTD_seekable_free(zs);
     fclose(fp);
+    free(rows_req);
     return 0;
 }

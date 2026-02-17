@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from inspect import Parameter, signature
-from types import GenericAlias, NoneType
+from types import GenericAlias
 from typing import TYPE_CHECKING, Callable, NamedTuple, TypeGuard, cast
 
 if TYPE_CHECKING:
