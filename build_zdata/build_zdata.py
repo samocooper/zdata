@@ -38,7 +38,8 @@ def build_zdata_from_zarr(
     obs_output_filename: str = "obs.parquet",
     cleanup_temp: bool = True,
     mtx_chunk_size: int = 131072,
-    mtx_temp_dir: str = None
+    mtx_temp_dir: str = None,
+    min_nnz: int | None = 300
 ):
     """
     Build complete zdata object from directory of zarr or h5ad files.
@@ -62,6 +63,8 @@ def build_zdata_from_zarr(
                       - MTX files will be preserved (not cleaned up) even on failure
                       - Existing MTX files in this directory will be reused if manifest exists
                       - Allows rerunning pipeline from aligned MTX files
+        min_nnz: Minimum nnz threshold for cell filtering. Cells with fewer non-zeros
+                will be excluded from obs. Set to None or 0 to disable. Default: 300.
     
     Returns:
         Path to created zdata directory (as Path object)
@@ -244,7 +247,8 @@ def build_zdata_from_zarr(
                     join_on=obs_join_on,
                     output_filename=obs_output_filename,
                     zarr_files_filter=successfully_processed_zarrs,  # Only process these files
-                    row_nnz_files=row_nnz_files  # Add row nnz values
+                    row_nnz_files=row_nnz_files,  # Add row nnz values
+                    min_nnz=min_nnz
                 )
                 print(f"\n✓ Obs concatenation complete! Output: {obs_output_path}")
             else:
@@ -436,6 +440,14 @@ def main():
         action='store_true',
         help='Do not clean up temporary MTX files (only applies when --mtx-temp-dir is not specified)'
     )
+    parser.add_argument(
+        '--min-nnz',
+        type=int,
+        default=300,
+        help='Minimum nnz (non-zero count) threshold for cell filtering. '
+             'Cells with fewer non-zeros will be filtered out. '
+             'Set to 0 to disable filtering. Default: 300'
+    )
     
     args = parser.parse_args()
     
@@ -486,7 +498,8 @@ def main():
             obs_output_filename=args.obs_output_filename,
             cleanup_temp=not args.no_cleanup_temp,
             mtx_chunk_size=args.mtx_chunk_size,
-            mtx_temp_dir=args.mtx_temp_dir
+            mtx_temp_dir=args.mtx_temp_dir,
+            min_nnz=args.min_nnz if args.min_nnz > 0 else None
         )
         print(f"\n✓ Build complete! Output: {zdata_dir}")
         return 0

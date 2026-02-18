@@ -287,9 +287,6 @@ def process_zarr_file_chunks(zarr_path, gene_list_path, old_to_new_idx, n_new_co
         
     except Exception as e:
         raise RuntimeError(f"Failed to process zarr file {zarr_path}: {e}") from e
-        
-    except Exception as e:
-        raise RuntimeError(f"Failed to process zarr file {zarr_path}: {e}") from e
 
 def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=None, chunk_size=131072):
     """

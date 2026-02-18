@@ -204,6 +204,7 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
                 block_rows=16,
                 max_rows=8192,
                 obs_join_strategy="outer",
+                min_nnz=None,
             )
         finally:
             os.chdir(original_cwd)
@@ -298,6 +299,7 @@ def zdata_instance_h5ad(h5ad_test_dir: Path, tmp_path_factory) -> ZData:
                 block_rows=16,
                 max_rows=8192,
                 obs_join_strategy="outer",
+                min_nnz=None,
             )
         finally:
             os.chdir(original_cwd)

@@ -6,6 +6,7 @@ Reads obs data from all zarr files in a directory, converts to polars format,
 joins them according to specified strategy (inner, outer, or by specified columns),
 and saves the result as a parquet file in the zdata directory.
 """
+from __future__ import annotations
 
 import zarr
 import anndata as ad
@@ -15,7 +16,6 @@ import sys
 import os
 import argparse
 from pathlib import Path
-from typing import List, Optional
 
 
 def read_obs_from_h5ad(h5ad_path: str, h5ad_name: str) -> pl.DataFrame:
@@ -120,8 +120,31 @@ def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
                     except Exception as e:
                         raise RuntimeError(f"Failed to read categorical column '{col_name}' from {zarr_name}: {e}") from e
                 else:
-                    # Group but not standard categorical - skip with warning but don't fail
-                    skipped_columns.append(col_name)
+                    # Group but not standard categorical - try to read as array if possible
+                    # Some zarr files store data in Groups with different structures
+                    try:
+                        # Check if Group has any array-like children we can read
+                        group_keys = list(col_obj.keys())
+                        if len(group_keys) == 1:
+                            # Try reading the single child as the data
+                            child_key = group_keys[0]
+                            child_obj = col_obj[child_key]
+                            if isinstance(child_obj, zarr.Array):
+                                values = child_obj[:]
+                                if isinstance(values, np.ndarray):
+                                    values = values.tolist()
+                                column_data[col_name] = values
+                            else:
+                                skipped_columns.append(col_name)
+                        elif len(group_keys) == 0:
+                            # Empty group - skip
+                            skipped_columns.append(col_name)
+                        else:
+                            # Multiple children - don't know how to interpret, skip
+                            skipped_columns.append(col_name)
+                    except Exception as e:
+                        # If reading fails, skip this column
+                        skipped_columns.append(col_name)
             else:
                 # Simple array - read directly
                 try:
@@ -142,6 +165,11 @@ def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
         
         if skipped_columns:
             print(f"  WARNING: Skipped {len(skipped_columns)} non-standard columns: {', '.join(skipped_columns[:5])}")
+            if 'disease' in skipped_columns:
+                print(f"  ⚠️  CRITICAL WARNING: 'disease' column was skipped from {zarr_name}!")
+                print(f"     This will cause 'disease' to be missing from the final output.")
+                print(f"     The column exists in the zarr file but has a non-standard structure.")
+                print(f"     Please check the zarr structure for 'obs/disease' in this file.")
         
         # Determine number of rows from first column
         n_rows = len(list(column_data.values())[0])
@@ -153,6 +181,16 @@ def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
         
         # Create polars DataFrame
         df = pl.DataFrame(column_data)
+        
+        # Debug: show which columns were successfully read (always show, but more detail if some were skipped)
+        read_cols = sorted(column_data.keys())
+        if len(column_data) < len(obs_columns):
+            print(f"    Read {len(read_cols)}/{len(obs_columns)} columns: {', '.join(read_cols[:10])}" + 
+                  (f" ... ({len(read_cols)} total)" if len(read_cols) > 10 else ""))
+            missing = set(obs_columns) - set(read_cols)
+            if missing:
+                print(f"    Missing from read: {', '.join(sorted(missing)[:5])}" + 
+                      (f" ... ({len(missing)} total)" if len(missing) > 5 else ""))
         
         # Add source column to track which zarr file this came from
         df = df.with_columns([
@@ -166,9 +204,9 @@ def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
 
 
 def concat_obs_dataframes(
-    dataframes: List[pl.DataFrame],
+    dataframes: list[pl.DataFrame],
     join_strategy: str = "outer",
-    join_on: Optional[List[str]] = None
+    join_on: list[str] | None = None
 ) -> pl.DataFrame:
     """
     Concatenate multiple polars DataFrames using specified join strategy.
@@ -214,29 +252,31 @@ def concat_obs_dataframes(
     
     elif join_strategy == "inner":
         # Inner: only keep columns present in all dataframes
-        # Find common columns (excluding _source_zarr which we always keep)
+        # Find common columns (excluding _source_zarr and _source_file which we always keep)
         common_cols = set(dataframes[0].columns)
         for df in dataframes[1:]:
             common_cols = common_cols.intersection(set(df.columns))
         
-        # Always include _source_zarr if it exists
-        if "_source_zarr" not in common_cols:
-            # Check if any dataframe has it
-            if any("_source_zarr" in df.columns for df in dataframes):
-                # Add it to common columns if at least one has it
-                # But we'll handle it separately
-                pass
-        
-        # Remove _source_zarr from common columns for now
-        has_source = "_source_zarr" in common_cols
+        # Remove _source_zarr and _source_file from common columns check
+        # These are metadata columns that may differ between zarr and h5ad files
+        has_source_zarr = "_source_zarr" in common_cols
+        has_source_file = "_source_file" in common_cols
         common_cols.discard("_source_zarr")
+        common_cols.discard("_source_file")
         common_cols = sorted(list(common_cols))
         
-        if not common_cols and not has_source:
+        if not common_cols and not has_source_zarr and not has_source_file:
             raise ValueError("No common columns found for inner join")
         
+        # Debug: print common columns (helpful for diagnosing missing columns)
+        print(f"  Common columns found: {len(common_cols)} columns")
+        if len(common_cols) <= 20:
+            print(f"    Columns: {', '.join(common_cols)}")
+        else:
+            print(f"    Columns (first 20): {', '.join(common_cols[:20])} ...")
+        
         # Select only common columns from each dataframe
-        # Add _source_zarr if it exists in that dataframe
+        # Add _source_zarr or _source_file if they exist in that dataframe
         selected_dfs = []
         for df in dataframes:
             cols_to_select = common_cols.copy()
@@ -309,10 +349,11 @@ def concat_obs_from_zarr_directory(
     zarr_dir: str,
     output_dir: str,
     join_strategy: str = "outer",
-    join_on: Optional[List[str]] = None,
+    join_on: list[str] | None = None,
     output_filename: str = "obs.parquet",
-    zarr_files_filter: Optional[set] = None,
-    row_nnz_files: Optional[List[str]] = None
+    zarr_files_filter: set | None = None,
+    row_nnz_files: list[str] | None = None,
+    min_nnz: int | None = 300
 ):
     """
     Read obs data from all zarr or h5ad files in a directory, join them, and save to parquet.
@@ -327,6 +368,9 @@ def concat_obs_from_zarr_directory(
         zarr_files_filter: Optional set of file names to process (filters available files)
         row_nnz_files: Optional list of text files containing row stats (nnz and total_counts as two columns)
                       These will be merged into the obs DataFrame as 'nnz' and 'total_counts' columns
+        min_nnz: Minimum nnz (non-zero count) threshold for cell filtering. Cells with fewer
+                non-zeros will be filtered out. Set to None or 0 to disable filtering.
+                Default: 300.
     
     Returns:
         Path to created parquet file
@@ -452,14 +496,16 @@ def concat_obs_from_zarr_directory(
     # This prevents pandas from inferring string index and ensures alignment with x matrix
     combined_df = combined_df.with_row_index("_row_index")
 
-    # Filter cells with nnz < 300
-    nnz_threshold = 300
-    before_rows = combined_df.height
-    combined_df = combined_df.filter(pl.col("nnz") >= nnz_threshold)
-    after_rows = combined_df.height
-    removed = before_rows - after_rows
-    print(f"  ✓ Filtered cells with nnz < {nnz_threshold}: removed {removed}, kept {after_rows}")
-    print(f"  ✓ _row_index preserved original row indices (0 to {before_rows-1}) to match x matrix")
+    # Filter cells with low nnz (configurable threshold)
+    if min_nnz is not None and min_nnz > 0:
+        before_rows = combined_df.height
+        combined_df = combined_df.filter(pl.col("nnz") >= min_nnz)
+        after_rows = combined_df.height
+        removed = before_rows - after_rows
+        print(f"  ✓ Filtered cells with nnz < {min_nnz}: removed {removed}, kept {after_rows}")
+        print(f"  ✓ _row_index preserved original row indices (0 to {before_rows-1}) to match x matrix")
+    else:
+        print(f"  ✓ Cell filtering disabled (min_nnz={min_nnz})")
     
     # Show column summary
     print(f"  Columns: {', '.join(combined_df.columns[:10])}" + 

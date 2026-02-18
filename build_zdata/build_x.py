@@ -160,7 +160,7 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
                 "version": 1,
                 "format": "zdata",
                 "shape": rm_metadata['shape'],  # [cells, genes] from X_RM
-                "nnz_total": rm_metadata.get('nnz_total', 0) + cm_metadata.get('nnz_total', 0),
+                "nnz_total": rm_metadata.get('nnz_total', 0),
                 "num_chunks_rm": rm_metadata['num_chunks_rm'],
                 "num_chunks_cm": cm_metadata['num_chunks_cm'],
                 "total_blocks_rm": rm_metadata['total_blocks_rm'],
