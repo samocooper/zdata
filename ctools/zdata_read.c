@@ -7,8 +7,9 @@
 #include "zstd.h"
 #include "zstd_seekable.h"
 
-#define MAX_BLOCK_ROWS 256  /* Maximum supported block_rows */
-#define MAX_ROWS   1000000  /* Maximum supported max_rows */
+#define MAX_BLOCK_ROWS 256      /* Maximum supported block_rows */
+#define MAX_ROWS       1000000  /* Maximum supported max_rows */
+#define INITIAL_ROWS   8192     /* Initial capacity for row request buffer */
 
 static uint32_t read_le32(const uint8_t *p) {
     return ((uint32_t)p[0]) |
@@ -18,7 +19,6 @@ static uint32_t read_le32(const uint8_t *p) {
 }
 
 static void write_le32(FILE *out, uint32_t v) {
-    /* Optimize: write directly without temporary buffer */
     uint8_t b[4];
     b[0] = (uint8_t)(v & 0xFF);
     b[1] = (uint8_t)((v >> 8) & 0xFF);
@@ -32,23 +32,31 @@ typedef struct {
     uint32_t magic, version, start_row, nrows_in_block, ncols, nnz;
 } BlockHeader;
 
-static int parse_rows_csv(const char *s, uint32_t *out, int max_out) {
+static int parse_rows_csv(const char *s, uint32_t **out_ptr, int *capacity) {
     int n = 0;
     const char *p = s;
-    /* Optimize: single pass whitespace/comma skipping */
+    uint32_t *out = *out_ptr;
+    int cap = *capacity;
     while (*p) {
-        /* Skip whitespace and commas in one pass */
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
         if (!*p) break;
-        
+
         char *end = NULL;
         unsigned long v = strtoul(p, &end, 10);
         if (end == p) break;
-        if (n < max_out && v <= UINT32_MAX) {
+        if (v <= UINT32_MAX) {
+            if (n >= cap) {
+                cap = cap * 2;
+                uint32_t *tmp = (uint32_t *)realloc(out, (size_t)cap * sizeof(uint32_t));
+                if (!tmp) { fprintf(stderr, "OOM expanding row buffer to %d\n", cap); return -1; }
+                out = tmp;
+            }
             out[n++] = (uint32_t)v;
         }
         p = end;
     }
+    *out_ptr = out;
+    *capacity = cap;
     return n;
 }
 
@@ -71,32 +79,18 @@ static int parse_block(const uint8_t *buf, size_t sz,
         return 0;
     }
 
-    /* Determine block_rows from indptr size: indptr is always block_rows+1 elements */
-    /* We can infer block_rows by checking the size: (sz - 24 - indices - data) / 4 - 1 */
-    /* But simpler: use nrows_in_block as a hint, but indptr is allocated for full block */
-    /* Actually, we need to calculate: remaining bytes after header = sz - 24 */
-    /* indptr_bytes = (block_rows + 1) * 4, so we can solve for block_rows */
-    /* For now, we'll use a heuristic: check common sizes or infer from structure */
-    
-    /* Try to infer block_rows from the data structure */
-    /* The indptr array size is (block_rows + 1) * 4 */
-    /* After indptr comes indices (nnz * 4) and data (nnz * 2) */
-    /* So: sz = 24 + (block_rows+1)*4 + nnz*4 + nnz*2 */
-    /* Solving: (block_rows+1)*4 = sz - 24 - nnz*6 */
-    /* block_rows = (sz - 24 - nnz*6) / 4 - 1 */
-    
     size_t remaining = sz - 24;
     size_t data_indices_bytes = (size_t)hdr->nnz * (sizeof(uint32_t) + sizeof(uint16_t));
     if (remaining < data_indices_bytes) return 0;
-    
+
     size_t indptr_bytes = remaining - data_indices_bytes;
     if (indptr_bytes % 4 != 0 || indptr_bytes < 4) return 0;
-    
+
     uint32_t inferred_block_rows = (uint32_t)(indptr_bytes / 4) - 1;
     if (inferred_block_rows > MAX_BLOCK_ROWS || inferred_block_rows < hdr->nrows_in_block) {
         return 0;
     }
-    
+
     uint32_t block_rows = inferred_block_rows;
     if (block_rows_out) *block_rows_out = block_rows;
 
@@ -170,19 +164,19 @@ int main(int argc, char *argv[]) {
             /* Remove newline */
             size_t len = strlen(path);
             if (len > 0 && path[len-1] == '\n') path[len-1] = '\0';
-            
+
             if (!fgets(line, sizeof(line), stdin)) break;
             char *rows_csv = line;
             len = strlen(rows_csv);
             if (len > 0 && rows_csv[len-1] == '\n') rows_csv[len-1] = '\0';
-            
+
             if (!fgets(line, sizeof(line), stdin)) break;
             block_rows_override = (uint32_t)atoi(line);
             if (block_rows_override == 0 || block_rows_override > MAX_BLOCK_ROWS) {
                 fprintf(stderr, "Error: invalid block_rows\n");
                 continue;
             }
-            
+
             /* Process this command */
             if (process_file(path, rows_csv, block_rows_override, binary, 1) != 0) {
                 return 1;
@@ -219,25 +213,29 @@ int main(int argc, char *argv[]) {
 
     const char *path = argv[argi++];
     const char *rows_csv = argv[argi++];
-    
+
     return process_file(path, rows_csv, block_rows_override, binary, 0);
 }
 
 static int process_file(const char *path, const char *rows_csv, uint32_t block_rows_override, int binary, int is_stdin_mode) {
-    uint32_t rows_req[4096];
-    int nreq = parse_rows_csv(rows_csv, rows_req, 4096);
-    if (nreq <= 0) { fprintf(stderr, "No rows parsed\n"); return 1; }
+    int rows_cap = INITIAL_ROWS;
+    uint32_t *rows_req = (uint32_t *)malloc((size_t)rows_cap * sizeof(uint32_t));
+    if (!rows_req) { fprintf(stderr, "OOM allocating row buffer\n"); return 1; }
+
+    int nreq = parse_rows_csv(rows_csv, &rows_req, &rows_cap);
+    if (nreq <= 0) { fprintf(stderr, "No rows parsed\n"); free(rows_req); return 1; }
 
     for (int i = 0; i < nreq; i++) {
-        if (rows_req[i] < 0 || rows_req[i] >= MAX_ROWS) {
-            fprintf(stderr, "Row out of range: %d\n", rows_req[i]);
+        if (rows_req[i] >= MAX_ROWS) {
+            fprintf(stderr, "Row out of range: %u\n", rows_req[i]);
+            free(rows_req);
             return 1;
         }
     }
 
     FILE *fp = fopen(path, "rb");
-    if (!fp) { perror("open archive"); return 1; }
-    
+    if (!fp) { perror("open archive"); free(rows_req); return 1; }
+
     /* Set input file to fully buffered for better performance (reduces system calls) */
     /* Use larger buffer (256KB) for better I/O performance, especially for column queries */
     setvbuf(fp, NULL, _IOFBF, 262144);  /* 256KB buffer */
@@ -253,13 +251,14 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     }
 
     ZSTD_seekable *zs = ZSTD_seekable_create();
-    if (!zs) { fprintf(stderr, "ZSTD_seekable_create failed\n"); fclose(fp); return 1; }
+    if (!zs) { fprintf(stderr, "ZSTD_seekable_create failed\n"); fclose(fp); free(rows_req); return 1; }
 
     size_t ir = ZSTD_seekable_initFile(zs, fp);
     if (ZSTD_isError(ir)) {
         fprintf(stderr, "seekable_initFile error: %s\n", ZSTD_getErrorName(ir));
         ZSTD_seekable_free(zs);
         fclose(fp);
+        free(rows_req);
         return 1;
     }
 
@@ -278,23 +277,20 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
             if (frameBuf) free(frameBuf);
             ZSTD_seekable_free(zs);
             fclose(fp);
+            free(rows_req);
             return 1;
         }
     } else {
         /* Auto-detect: try common values: 1, 4, 16 */
-        /* For column queries (X_CM), block_rows is typically 1 (block_columns=1) */
-        /* For row queries (X_RM), block_rows is typically 4 or 16 */
-        block_rows = 1;  /* Start with 1 (most common for column queries) */
+        block_rows = 1;
         first_block = (unsigned)(rows_req[0] / block_rows);
         if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
-            /* If block_rows=1 fails, try block_rows=4 (common for row queries) */
             if (frameBuf) free(frameBuf);
             frameBuf = NULL;
             frameBufCapacity = 0;
             block_rows = 4;
             first_block = (unsigned)(rows_req[0] / block_rows);
             if (!decompress_frame(zs, first_block, &frameBuf, &frameSz, &frameBufCapacity)) {
-                /* If block_rows=4 fails, try block_rows=16 (default) */
                 if (frameBuf) free(frameBuf);
                 frameBuf = NULL;
                 frameBufCapacity = 0;
@@ -304,6 +300,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
                     if (frameBuf) free(frameBuf);
                     ZSTD_seekable_free(zs);
                     fclose(fp);
+                    free(rows_req);
                     return 1;
                 }
             }
@@ -320,6 +317,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
         free(frameBuf);
         ZSTD_seekable_free(zs);
         fclose(fp);
+        free(rows_req);
         return 1;
     }
 
@@ -333,20 +331,18 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     /* Process rows in order (already ascending, so naturally groups by block) */
     /* Cache one block at a time - each block is only decompressed once */
     unsigned cached_block = first_block;
-    
-    /* Pre-sort rows by block to maximize block reuse (rows are already sorted, but this groups by block) */
-    /* This is already done by the caller, so we can rely on rows being in ascending order */
 
     for (int i = 0; i < nreq; i++) {
         uint32_t row = rows_req[i];
         unsigned block_id = (unsigned)(row / block_rows);
-        
+
         /* Decompress block only if we haven't seen it yet */
         if (block_id != cached_block) {
             if (!decompress_frame(zs, block_id, &frameBuf, &frameSz, &frameBufCapacity)) {
                 if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
+                free(rows_req);
                 return 1;
             }
             if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, NULL)) {
@@ -354,28 +350,29 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
                 if (frameBuf) free(frameBuf);
                 ZSTD_seekable_free(zs);
                 fclose(fp);
+                free(rows_req);
                 return 1;
             }
             cached_block = block_id;
         }
 
-        /* Extract row data - optimize: compute r directly without block_start */
+        /* Extract row data */
         uint32_t r = row - (block_id * block_rows);
-        
+
         /* Validate row is within the block's actual row count */
         if (r >= hdr.nrows_in_block) {
             fprintf(stderr, "Row %u is beyond block %u's row count (%u)\n", row, block_id, hdr.nrows_in_block);
             if (frameBuf) free(frameBuf);
             ZSTD_seekable_free(zs);
             fclose(fp);
+            free(rows_req);
             return 1;
         }
-        
+
         uint32_t p0 = indptr[r];
         uint32_t p1 = indptr[r + 1];
         uint32_t nnz = p1 - p0;
 
-        /* Output immediately (rows are already in correct order) */
         if (!binary) {
             printf("row %u nnz %u:", row, nnz);
             for (uint32_t p = p0; p < p1; p++) {
@@ -383,10 +380,8 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
             }
             printf("\n");
         } else {
-            /* Write row header */
             write_le32(stdout, row);
             write_le32(stdout, nnz);
-            /* Write indices and data arrays in bulk (optimized: combine when possible) */
             if (nnz > 0) {
                 fwrite(indices + p0, sizeof(uint32_t), nnz, stdout);
                 fwrite(data + p0, sizeof(uint16_t), nnz, stdout);
@@ -397,5 +392,6 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     if (frameBuf) free(frameBuf);
     ZSTD_seekable_free(zs);
     fclose(fp);
+    free(rows_req);
     return 0;
 }

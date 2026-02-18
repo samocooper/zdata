@@ -405,6 +405,12 @@ class ZData:
         
         # Unpack header and process rows
         nreq, ncols = struct.unpack_from("<II", blob, 0)
+        if nreq != len(local_rows):
+            raise ValueError(
+                f"zdata_read returned {nreq} rows but {len(local_rows)} were requested "
+                f"for {file_path}. This usually indicates the C binary truncated the "
+                f"row list — rebuild zdata_read with the latest source."
+            )
         out = [None] * nreq
         blob_mv = memoryview(blob)
         off = 8
