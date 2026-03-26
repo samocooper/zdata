@@ -347,7 +347,7 @@ setup(
     packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
     package_dir={"zdata": "."},
     include_package_data=True,
-    python_requires=">=3.12",
+    python_requires=">=3.11",
     install_requires=[
         "numpy>=1.20.0",
         "scipy>=1.7.0",

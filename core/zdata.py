@@ -301,6 +301,12 @@ class ZData:
             # Check if obs shape matches expression shape
             obs_nrows = len(self._obs_df)
             self._obs_matches_expression_shape = (obs_nrows == self.nrows)
+            
+            # Cache mapping from obs-positional to expression-global row indices
+            if not self._obs_matches_expression_shape and '_row_index' in self._obs_df.columns:
+                self._obs_row_index_map: NDArray[np.integer] | None = self._obs_df['_row_index'].to_numpy()
+            else:
+                self._obs_row_index_map = None
                         
             # Cache var DataFrame for __getitem__ access
             var_polars = pl.read_parquet(var_file)
@@ -576,8 +582,13 @@ class ZData:
         >>> for row_id, cols, vals in rows:
         ...     print(f"Row {row_id}: {len(cols)} non-zero values")
         """
-        global_rows = normalize_row_indices(global_rows, self.nrows)
-        self._check_memory_requirements(row_indices=global_rows)
+        if self._obs_row_index_map is not None:
+            obs_indices = normalize_row_indices(global_rows, len(self._obs_df))
+            self._check_memory_requirements(row_indices=obs_indices)
+            global_rows = sorted(set(int(self._obs_row_index_map[i]) for i in obs_indices))
+        else:
+            global_rows = normalize_row_indices(global_rows, self.nrows)
+            self._check_memory_requirements(row_indices=global_rows)
         if settings.warn_on_large_queries and len(global_rows) > settings.large_query_threshold:
             warnings.warn(
                 f"Querying {len(global_rows)} rows, which exceeds the threshold "
