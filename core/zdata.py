@@ -435,38 +435,47 @@ class ZData:
             stderr=subprocess.DEVNULL
         )
         
-        if len(blob) < 8:
+        if len(blob) < 12:
             raise ValueError(f"Output too small: {len(blob)} bytes")
-        
-        # Unpack header and process rows
-        nreq, ncols = struct.unpack_from("<II", blob, 0)
+
+        # Unpack header: nreq, ncols, version
+        nreq, ncols, version = struct.unpack_from("<III", blob, 0)
         if nreq != len(local_rows):
             raise ValueError(
                 f"zdata_read returned {nreq} rows but {len(local_rows)} were requested "
                 f"for {file_path}. This usually indicates the C binary truncated the "
                 f"row list — rebuild zdata_read with the latest source."
             )
+
+        # Version 2 = uint16, Version 3 = float32
+        if version == 3:
+            val_dtype = np.float32
+            val_bytes = 4
+        else:
+            val_dtype = np.uint16
+            val_bytes = 2
+
         out = [None] * nreq
         blob_mv = memoryview(blob)
-        off = 8
-        
+        off = 12
+
         # Process rows - optimize by avoiding repeated array creation for empty rows
         empty_cols = np.array([], dtype=np.uint32)
-        empty_vals = np.array([], dtype=np.uint16)
-        
+        empty_vals = np.array([], dtype=val_dtype)
+
         for i in range(nreq):
             row_id, nnz = struct.unpack_from("<II", blob_mv, off)
             off += 8
-            
+
             if nnz > 0:
                 cols = np.frombuffer(blob_mv, dtype=np.uint32, count=nnz, offset=off).copy()
                 off += nnz * 4
-                vals = np.frombuffer(blob_mv, dtype=np.uint16, count=nnz, offset=off).copy()
-                off += nnz * 2
+                vals = np.frombuffer(blob_mv, dtype=val_dtype, count=nnz, offset=off).copy()
+                off += nnz * val_bytes
                 out[i] = (row_id, cols, vals)
             else:
                 out[i] = (row_id, empty_cols, empty_vals)
-        
+
         return ncols, out
     
     def _process_file_for_rows(

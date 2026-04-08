@@ -14,12 +14,16 @@
 #define DEFAULT_BLOCK_ROWS 16
 #define DEFAULT_MAX_ROWS   8192
 
+/* Global flag: 0 = uint16 (version 2), 1 = float32 (version 3) */
+static int g_use_float32 = 0;
+
 /* Simple block-CSR structure (variable number of rows per block) */
 typedef struct {
     uint32_t nnz;         /* total nnz in this block */
     uint32_t *indptr;     /* length block_rows+1 */
     uint32_t *indices;    /* length nnz */
-    uint16_t *data;       /* length nnz */
+    uint16_t *data;       /* length nnz (uint16 mode) */
+    float    *fdata;      /* length nnz (float32 mode) */
     uint32_t *write_pos;  /* length block_rows (allocated dynamically) */
 } BlockCSR;
 
@@ -27,7 +31,8 @@ typedef struct {
 typedef struct {
     uint32_t *indptr;     /* length nrows+1 */
     uint32_t *indices;    /* length nnz_total */
-    uint16_t *data;       /* length nnz_total */
+    uint16_t *data;       /* length nnz_total (uint16 mode) */
+    float    *fdata;      /* length nnz_total (float32 mode) */
     long long nnz_total;  /* total non-zeros */
 } FullCSR;
 
@@ -67,12 +72,15 @@ static uint8_t* serialize_block(
     size_t *out_size
 ) {
     const uint32_t magic = 0x5253435A; /* 'ZCSR' little-endian bytes */
-    const uint32_t version = 2;  /* Version 2: uint16_t data, uint32_t indices/indptr */
+    const uint32_t version = g_use_float32 ? 3 : 2;
+    /* Version 2: uint16_t data, Version 3: float32 data */
 
     size_t header_bytes = 6 * 4; /* 6 u32 */
     size_t indptr_bytes = (block_rows + 1) * sizeof(uint32_t);
     size_t indices_bytes = (size_t)b->nnz * sizeof(uint32_t);
-    size_t data_bytes = (size_t)b->nnz * sizeof(uint16_t);
+    size_t data_bytes = g_use_float32
+        ? (size_t)b->nnz * sizeof(float)
+        : (size_t)b->nnz * sizeof(uint16_t);
 
     size_t total = header_bytes + indptr_bytes + indices_bytes + data_bytes;
     uint8_t *buf = (uint8_t*)malloc(total);
@@ -95,7 +103,10 @@ static uint8_t* serialize_block(
     off += indices_bytes;
 
     /* data - copy directly (data is already in memory, assumes little-endian) */
-    memcpy(buf + off, b->data, data_bytes);
+    if (g_use_float32)
+        memcpy(buf + off, b->fdata, data_bytes);
+    else
+        memcpy(buf + off, b->data, data_bytes);
     off += data_bytes;
 
     *out_size = total;
@@ -172,7 +183,8 @@ static int end_stream_to_file(ZSTD_seekable_CStream *zcs, FILE *out) {
 /* Dynamic array structure for collecting entries per row */
 typedef struct {
     uint32_t *indices;
-    uint16_t *data;
+    uint16_t *data;       /* uint16 mode */
+    float    *fdata;      /* float32 mode */
     uint32_t size;
     uint32_t capacity;
 } RowEntries;
@@ -277,18 +289,28 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
     for (long long i = 0; i < nrows; i++) {
         rows[i].capacity = INITIAL_CAPACITY;
         rows[i].indices = (uint32_t*)malloc(INITIAL_CAPACITY * sizeof(uint32_t));
-        rows[i].data = (uint16_t*)malloc(INITIAL_CAPACITY * sizeof(uint16_t));
-        if (!rows[i].indices || !rows[i].data) {
+        if (g_use_float32) {
+            rows[i].fdata = (float*)malloc(INITIAL_CAPACITY * sizeof(float));
+            rows[i].data = NULL;
+            if (!rows[i].indices || !rows[i].fdata) goto oom_init;
+        } else {
+            rows[i].data = (uint16_t*)malloc(INITIAL_CAPACITY * sizeof(uint16_t));
+            rows[i].fdata = NULL;
+            if (!rows[i].indices || !rows[i].data) goto oom_init;
+        }
+        rows[i].size = 0;
+        continue;
+    oom_init:
+        {
             fprintf(stderr, "OOM initial row arrays\n");
-            /* Cleanup */
             for (long long j = 0; j <= i; j++) {
                 if (rows[j].indices) free(rows[j].indices);
                 if (rows[j].data) free(rows[j].data);
+                if (rows[j].fdata) free(rows[j].fdata);
             }
             free(rows);
             return NULL;
         }
-        rows[i].size = 0;
     }
 
     char line[8192];  /* Increased buffer size for longer lines */
@@ -327,33 +349,48 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
         if (r->size >= r->capacity) {
             uint32_t new_capacity = r->capacity * 2;
             uint32_t *new_indices = (uint32_t*)realloc(r->indices, new_capacity * sizeof(uint32_t));
-            uint16_t *new_data = (uint16_t*)realloc(r->data, new_capacity * sizeof(uint16_t));
-            if (!new_indices || !new_data) {
+            if (!new_indices) goto oom_realloc;
+            r->indices = new_indices;
+
+            if (g_use_float32) {
+                float *new_fdata = (float*)realloc(r->fdata, new_capacity * sizeof(float));
+                if (!new_fdata) goto oom_realloc;
+                r->fdata = new_fdata;
+            } else {
+                uint16_t *new_data = (uint16_t*)realloc(r->data, new_capacity * sizeof(uint16_t));
+                if (!new_data) goto oom_realloc;
+                r->data = new_data;
+            }
+            r->capacity = new_capacity;
+            if (0) {
+            oom_realloc:
                 fprintf(stderr, "OOM realloc row arrays\n");
-                /* Cleanup */
                 for (long long i = 0; i < nrows; i++) {
                     free(rows[i].indices);
-                    free(rows[i].data);
+                    if (rows[i].data) free(rows[i].data);
+                    if (rows[i].fdata) free(rows[i].fdata);
                 }
                 free(rows);
                 return NULL;
             }
-            r->indices = new_indices;
-            r->data = new_data;
-            r->capacity = new_capacity;
         }
-        
+
         /* Add entry */
         r->indices[r->size] = (uint32_t)col;
-        
-        /* Convert value to uint16_t with clamping */
-        if (n == 3) {
-            double clamped = value;
-            if (clamped < 0.0) clamped = 0.0;
-            if (clamped > (double)UINT16_MAX) clamped = (double)UINT16_MAX;
-            r->data[r->size] = (uint16_t)(clamped + 0.5);
+
+        if (g_use_float32) {
+            /* Store as float32 (preserve precision) */
+            r->fdata[r->size] = (n == 3) ? (float)value : 1.0f;
         } else {
-            r->data[r->size] = 1;  /* Default value when no value field */
+            /* Convert value to uint16_t with clamping */
+            if (n == 3) {
+                double clamped = value;
+                if (clamped < 0.0) clamped = 0.0;
+                if (clamped > (double)UINT16_MAX) clamped = (double)UINT16_MAX;
+                r->data[r->size] = (uint16_t)(clamped + 0.5);
+            } else {
+                r->data[r->size] = 1;  /* Default value when no value field */
+            }
         }
         r->size++;
     }
@@ -397,17 +434,25 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
 
     /* Allocate final CSR arrays */
     uint32_t *indices = (uint32_t*)malloc((size_t)nnz_total * sizeof(uint32_t));
-    uint16_t *data = (uint16_t*)malloc((size_t)nnz_total * sizeof(uint16_t));
-    if (!indices || !data) {
+    uint16_t *data = NULL;
+    float    *fdata = NULL;
+    if (g_use_float32)
+        fdata = (float*)malloc((size_t)nnz_total * sizeof(float));
+    else
+        data = (uint16_t*)malloc((size_t)nnz_total * sizeof(uint16_t));
+
+    if (!indices || (!data && !fdata)) {
         fprintf(stderr, "OOM indices/data\n");
         free(indptr);
         for (long long i = 0; i < nrows; i++) {
             free(rows[i].indices);
-            free(rows[i].data);
+            if (rows[i].data) free(rows[i].data);
+            if (rows[i].fdata) free(rows[i].fdata);
         }
         free(rows);
         if (indices) free(indices);
         if (data) free(data);
+        if (fdata) free(fdata);
         return NULL;
     }
 
@@ -416,27 +461,33 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
     for (long long i = 0; i < nrows; i++) {
         if (rows[i].size > 0) {
             memcpy(indices + pos, rows[i].indices, rows[i].size * sizeof(uint32_t));
-            memcpy(data + pos, rows[i].data, rows[i].size * sizeof(uint16_t));
+            if (g_use_float32)
+                memcpy(fdata + pos, rows[i].fdata, rows[i].size * sizeof(float));
+            else
+                memcpy(data + pos, rows[i].data, rows[i].size * sizeof(uint16_t));
             pos += rows[i].size;
         }
         /* Free row arrays as we go */
         free(rows[i].indices);
-        free(rows[i].data);
+        if (rows[i].data) free(rows[i].data);
+        if (rows[i].fdata) free(rows[i].fdata);
     }
     free(rows);
-    
+
     FullCSR *csr = (FullCSR*)malloc(sizeof(FullCSR));
     if (!csr) {
         fprintf(stderr, "OOM FullCSR\n");
         free(indptr);
         free(indices);
-        free(data);
+        if (data) free(data);
+        if (fdata) free(fdata);
         return NULL;
     }
-    
+
     csr->indptr = indptr;
     csr->indices = indices;
     csr->data = data;
+    csr->fdata = fdata;
     csr->nnz_total = nnz_total;
     
     printf("  CSR structure complete (%lld nnz)\n", nnz_total);
@@ -450,6 +501,7 @@ static void free_full_csr(FullCSR *csr) {
         if (csr->indptr) free(csr->indptr);
         if (csr->indices) free(csr->indices);
         if (csr->data) free(csr->data);
+        if (csr->fdata) free(csr->fdata);
         free(csr);
     }
 }
@@ -502,10 +554,14 @@ static int process_chunk_from_csr(
         blocks[b].nnz = blocks[b].indptr[block_rows];
         if (blocks[b].nnz > 0) {
             blocks[b].indices = (uint32_t*)malloc((size_t)blocks[b].nnz * sizeof(uint32_t));
-            blocks[b].data    = (uint16_t*)malloc((size_t)blocks[b].nnz * sizeof(uint16_t));
-            if (!blocks[b].indices || !blocks[b].data) {
-                fprintf(stderr, "OOM indices/data\n");
-                return 0;
+            if (g_use_float32) {
+                blocks[b].fdata = (float*)malloc((size_t)blocks[b].nnz * sizeof(float));
+                blocks[b].data = NULL;
+                if (!blocks[b].indices || !blocks[b].fdata) { fprintf(stderr, "OOM\n"); return 0; }
+            } else {
+                blocks[b].data = (uint16_t*)malloc((size_t)blocks[b].nnz * sizeof(uint16_t));
+                blocks[b].fdata = NULL;
+                if (!blocks[b].indices || !blocks[b].data) { fprintf(stderr, "OOM\n"); return 0; }
             }
         }
 
@@ -528,7 +584,10 @@ static int process_chunk_from_csr(
         for (uint32_t j = 0; j < row_nnz; j++) {
             uint32_t pos = blocks[b].write_pos[r]++;
             blocks[b].indices[pos] = csr->indices[row_start + j];
-            blocks[b].data[pos] = csr->data[row_start + j];
+            if (g_use_float32)
+                blocks[b].fdata[pos] = csr->fdata[row_start + j];
+            else
+                blocks[b].data[pos] = csr->data[row_start + j];
         }
     }
 
@@ -605,7 +664,8 @@ static int process_chunk_from_csr(
     for (uint32_t b = 0; b < nblocks; b++) {
         free(blocks[b].indptr);
         free(blocks[b].indices);
-        free(blocks[b].data);
+        if (blocks[b].data) free(blocks[b].data);
+        if (blocks[b].fdata) free(blocks[b].fdata);
         free(blocks[b].write_pos);
     }
     free(blocks);
@@ -616,17 +676,29 @@ static int process_chunk_from_csr(
 
 
 int main(int argc, char *argv[]) {
+    /* Check for --float32 flag before positional args */
+    int argi = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--float32") == 0) {
+            g_use_float32 = 1;
+            /* Shift remaining args down */
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            break;
+        }
+    }
+
     if (argc < 3 || argc > 7) {
-        fprintf(stderr, "Usage: %s <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset] [subdir]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--float32] <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset] [subdir]\n", argv[0]);
+        fprintf(stderr, "  --float32: Store values as float32 (version 3) instead of uint16 (version 2)\n");
         fprintf(stderr, "  Example: %s matrix.mtx andrews\n", argv[0]);
-        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192\n", argv[0]);
-        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 131072\n", argv[0]);
-        fprintf(stderr, "  Example: %s matrix.mtx andrews 16 8192 0 X_CM\n", argv[0]);
-        fprintf(stderr, "  Output: andrews/X_RM/0.bin, andrews/X_RM/1.bin, ... (or andrews/X_CM/0.bin, ...)\n");
+        fprintf(stderr, "  Example: %s --float32 matrix.mtx andrews 16 8192\n", argv[0]);
         fprintf(stderr, "  Default: block_rows=16, max_rows=8192, row_offset=0, subdir=X_RM\n");
-        fprintf(stderr, "  row_offset: Add this value to row indices from MTX file (for globally contiguous numbering)\n");
-        fprintf(stderr, "  subdir: Subdirectory name for .bin files (default: X_RM, use X_CM for column-major)\n");
         return 1;
+    }
+
+    if (g_use_float32) {
+        printf("Mode: float32 (version 3)\n");
     }
 
     const char *mtx_path = argv[1];

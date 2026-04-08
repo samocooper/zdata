@@ -64,7 +64,7 @@ static int parse_block(const uint8_t *buf, size_t sz,
                        BlockHeader *hdr,
                        const uint32_t **indptr,
                        const uint32_t **indices,
-                       const uint16_t **data,
+                       const void **data,        /* uint16_t* or float* depending on version */
                        uint32_t *block_rows_out) {
     if (sz < 24 + 4) return 0;  /* Minimum header size */
 
@@ -75,12 +75,16 @@ static int parse_block(const uint8_t *buf, size_t sz,
     hdr->ncols = read_le32(buf + 16);
     hdr->nnz = read_le32(buf + 20);
 
-    if (hdr->magic != 0x5253435A || hdr->version != 2 || hdr->nrows_in_block == 0 || hdr->nrows_in_block > MAX_BLOCK_ROWS) {
+    if (hdr->magic != 0x5253435A || (hdr->version != 2 && hdr->version != 3) ||
+        hdr->nrows_in_block == 0 || hdr->nrows_in_block > MAX_BLOCK_ROWS) {
         return 0;
     }
 
+    /* Version 2: uint16 data (2 bytes), Version 3: float32 data (4 bytes) */
+    size_t val_size = (hdr->version == 3) ? sizeof(float) : sizeof(uint16_t);
+
     size_t remaining = sz - 24;
-    size_t data_indices_bytes = (size_t)hdr->nnz * (sizeof(uint32_t) + sizeof(uint16_t));
+    size_t data_indices_bytes = (size_t)hdr->nnz * (sizeof(uint32_t) + val_size);
     if (remaining < data_indices_bytes) return 0;
 
     size_t indptr_bytes = remaining - data_indices_bytes;
@@ -98,14 +102,13 @@ static int parse_block(const uint8_t *buf, size_t sz,
     *indptr = (const uint32_t*)(buf + off);
     off += (block_rows + 1) * sizeof(uint32_t);
 
-    /* Version 2: uint32_t indices, uint16_t data */
     size_t idx_bytes = (size_t)hdr->nnz * sizeof(uint32_t);
-    size_t data_bytes = (size_t)hdr->nnz * sizeof(uint16_t);
+    size_t data_bytes = (size_t)hdr->nnz * val_size;
     if (off + idx_bytes + data_bytes > sz) return 0;
 
     *indices = (const uint32_t*)(buf + off);
     off += idx_bytes;
-    *data = (const uint16_t*)(buf + off);
+    *data = (const void*)(buf + off);
     return 1;
 }
 
@@ -315,7 +318,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
     BlockHeader hdr;
     const uint32_t *indptr = NULL;
     const uint32_t *indices = NULL;
-    const uint16_t *data = NULL;
+    const void *data = NULL;
 
     if (!parse_block(frameBuf, frameSz, &hdr, &indptr, &indices, &data, &block_rows)) {
         fprintf(stderr, "Failed to parse first block\n");
@@ -328,9 +331,15 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
 
     uint32_t ncols_out = hdr.ncols;
 
+    /* Determine value size from version detected in first block */
+    uint32_t detected_version = hdr.version;
+    size_t val_size = (detected_version == 3) ? sizeof(float) : sizeof(uint16_t);
+
     if (binary) {
         write_le32(stdout, (uint32_t)nreq);
         write_le32(stdout, ncols_out);
+        /* Write version so Python knows which dtype to use */
+        write_le32(stdout, detected_version);
     }
 
     /* Process rows in order (already ascending, so naturally groups by block) */
@@ -381,7 +390,10 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
         if (!binary) {
             printf("row %u nnz %u:", row, nnz);
             for (uint32_t p = p0; p < p1; p++) {
-                printf(" %u:%u", indices[p], data[p]);
+                if (detected_version == 3)
+                    printf(" %u:%.6g", indices[p], ((const float*)data)[p]);
+                else
+                    printf(" %u:%u", indices[p], ((const uint16_t*)data)[p]);
             }
             printf("\n");
         } else {
@@ -389,7 +401,7 @@ static int process_file(const char *path, const char *rows_csv, uint32_t block_r
             write_le32(stdout, nnz);
             if (nnz > 0) {
                 fwrite(indices + p0, sizeof(uint32_t), nnz, stdout);
-                fwrite(data + p0, sizeof(uint16_t), nnz, stdout);
+                fwrite((const uint8_t*)data + p0 * val_size, val_size, nnz, stdout);
             }
         }
     }
