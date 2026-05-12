@@ -26,8 +26,8 @@ import polars as pl
 
 
 def build_zdata_from_zarr(
-    zarr_dir: str,
-    output_name: str,
+    input_dir: str = None,
+    output_name: str = None,
     gene_list_path: str = None,
     block_rows: int = 16,
     block_columns: int = None,
@@ -39,14 +39,17 @@ def build_zdata_from_zarr(
     cleanup_temp: bool = True,
     mtx_chunk_size: int = 131072,
     mtx_temp_dir: str = None,
-    min_nnz: int | None = 300
+    min_nnz: int | None = 300,
+    # Backward-compatible alias
+    zarr_dir: str = None,
 ):
     """
     Build complete zdata object from directory of zarr or h5ad files.
     Auto-detects file type based on extensions: .zarr (directories) or .h5/.hdf5 (h5ad files).
-    
+
     Args:
-        zarr_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)
+        input_dir: Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format).
+                   (Also accepts ``zarr_dir`` as a backward-compatible alias.)
         output_name: Output directory name (can include .zdata suffix, e.g., "atlas.zdata")
         gene_list_path: Path to standard gene list file (default: uses package default)
         block_rows: Number of rows per block for row-major (X_RM) files (default: 16)
@@ -56,7 +59,7 @@ def build_zdata_from_zarr(
         obs_join_strategy: Strategy for joining obs data ("inner", "outer", or "columns")
         obs_join_on: If obs_join_strategy is "columns", list of column names to join on
         obs_output_filename: Name of obs parquet file (default: "obs.parquet")
-        cleanup_temp: Whether to clean up temporary MTX files (default: True). 
+        cleanup_temp: Whether to clean up temporary MTX files (default: True).
                       Ignored if mtx_temp_dir is specified (files are always preserved).
         mtx_chunk_size: Maximum rows per MTX file during alignment (default: 131072)
         mtx_temp_dir: Optional path to directory for MTX files. If specified:
@@ -65,16 +68,21 @@ def build_zdata_from_zarr(
                       - Allows rerunning pipeline from aligned MTX files
         min_nnz: Minimum nnz threshold for cell filtering. Cells with fewer non-zeros
                 will be excluded from obs. Set to None or 0 to disable. Default: 300.
-    
+
     Returns:
         Path to created zdata directory (as Path object)
     """
-    zarr_dir_path = Path(zarr_dir)
+    # Support both input_dir and zarr_dir (backward compat)
+    if input_dir is None and zarr_dir is not None:
+        input_dir = zarr_dir
+    if input_dir is None:
+        raise ValueError("input_dir is required")
+    zarr_dir_path = Path(input_dir)
     if not zarr_dir_path.exists():
-        raise FileNotFoundError(f"Zarr directory not found: {zarr_dir}")
-    
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
     if not zarr_dir_path.is_dir():
-        raise ValueError(f"Path is not a directory: {zarr_dir}")
+        raise ValueError(f"Path is not a directory: {input_dir}")
     
     # Auto-detect and check for files (zarr directories and h5ad files)
     zarr_files = sorted([f for f in zarr_dir_path.glob("*.zarr") if f.is_dir()])
@@ -82,12 +90,12 @@ def build_zdata_from_zarr(
                          if f.is_file() and (f.suffix in ['.h5', '.hdf5'] or f.name.endswith('.h5ad'))])
     
     if not zarr_files and not h5ad_files:
-        raise ValueError(f"No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {zarr_dir}")
-    
+        raise ValueError(f"No .zarr files (directories) or .h5/.hdf5 files (h5ad) found in {input_dir}")
+
     print("=" * 70)
     print("Building zdata from files")
     print("=" * 70)
-    print(f"Input directory: {zarr_dir}")
+    print(f"Input directory: {input_dir}")
     print(f"Output zdata directory: {output_name}")
     print(f"Found {len(zarr_files)} zarr file(s) and {len(h5ad_files)} h5ad file(s)")
     
@@ -362,7 +370,7 @@ def main():
                     'This orchestrates the full pipeline: alignment, zdata build, and obs concatenation.'
     )
     parser.add_argument(
-        'zarr_dir',
+        'input_dir',
         type=str,
         help='Directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format) to process'
     )
@@ -452,13 +460,13 @@ def main():
     args = parser.parse_args()
     
     # Validate inputs
-    zarr_dir_path = Path(args.zarr_dir)
+    zarr_dir_path = Path(args.input_dir)
     if not zarr_dir_path.exists():
-        print(f"ERROR: Zarr directory not found: {args.zarr_dir}")
+        print(f"ERROR: Input directory not found: {args.input_dir}")
         sys.exit(1)
-    
+
     if not zarr_dir_path.is_dir():
-        print(f"ERROR: Path is not a directory: {args.zarr_dir}")
+        print(f"ERROR: Path is not a directory: {args.input_dir}")
         sys.exit(1)
     
     # Validate obs join strategy
@@ -486,8 +494,8 @@ def main():
     
     try:
         zdata_dir = build_zdata_from_zarr(
-            str(zarr_dir_path),
-            args.output_name,
+            input_dir=str(zarr_dir_path),
+            output_name=args.output_name,
             gene_list_path=args.gene_list,
             block_rows=args.block_rows,
             block_columns=block_columns,

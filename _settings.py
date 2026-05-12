@@ -468,14 +468,6 @@ settings.register(
 )
 
 settings.register(
-    "chunk_cache_size",
-    default_value=10,
-    description="Number of chunk files to cache in memory for faster access",
-    validate=validate_positive_int,
-    get_from_env=check_and_get_int,
-)
-
-settings.register(
     "warn_on_large_queries",
     default_value=True,
     description="Whether to warn when querying a large number of rows (>50000)",

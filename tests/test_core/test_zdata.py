@@ -41,14 +41,8 @@ class TestZDataInitialization:
         """Test obs property access."""
         obs = zdata_instance.obs
         assert obs is not None
-        # Obs may have fewer rows than expression data if it's a filtered subset
-        # In that case, _obs_matches_expression_shape will be False
-        if zdata_instance._obs_matches_expression_shape:
-            assert len(obs) == zdata_instance.nrows
-        else:
-            # If shapes don't match, obs should have _row_index column for subsetting
-            assert len(obs) <= zdata_instance.nrows
-            assert '_row_index' in zdata_instance._obs_df.columns
+        # With default init (no obs_index_col), obs must match matrix rows
+        assert len(obs) == zdata_instance.nrows
 
 
 class TestReadRows:

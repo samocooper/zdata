@@ -14,6 +14,13 @@ _MODULE_DIR = Path(__file__).parent  # zdata/build_zdata/
 _PROJECT_ROOT = _MODULE_DIR.parent   # zdata/
 _MTX_TO_ZDATA = _PROJECT_ROOT / "ctools" / "mtx_to_zdata"
 
+# All numpy numerical dtypes supported by the C tools
+SUPPORTED_DTYPES = frozenset({
+    "uint8", "uint16", "uint32", "uint64",
+    "int8", "int16", "int32", "int64",
+    "float32", "float64",
+})
+
 def _get_mtx_to_zdata_path():
     """Get the path to mtx_to_zdata executable, with validation."""
     bin_path = _MTX_TO_ZDATA.absolute()
@@ -70,7 +77,8 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
         block_columns: Number of rows per block for column-major (X_CM) files (default: None, uses block_rows)
         max_rows: Maximum rows per chunk for row-major files (default: 8192)
         max_columns: Maximum rows per chunk for column-major files (default: 256)
-        dtype: Data type for values - "uint16" (default, for scRNA) or "float32" (for bulk RNA/isoforms)
+        dtype: Data type for values. Supported: uint8, uint16, uint32, uint64,
+               int8, int16, int32, int64, float32, float64. Default: "uint16".
 
     Returns:
         Path to the created zdata directory
@@ -78,11 +86,14 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
     input_path = Path(mtx_file_or_dir)
     if not input_path.exists():
         raise FileNotFoundError(f"Input path not found: {mtx_file_or_dir}")
-    
+
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype '{dtype}'. Supported: {sorted(SUPPORTED_DTYPES)}")
+
     # Use block_rows for block_columns if not specified
     if block_columns is None:
         block_columns = block_rows
-    
+
     # Validate parameters
     if block_rows < 1 or block_rows > 256:
         raise ValueError(f"block_rows must be between 1 and 256, got {block_rows}")
@@ -118,8 +129,7 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
             mtx_files = _sort_mtx_files_numerically(list(rm_mtx_dir.glob("*.mtx")))
             if mtx_files:
                 print(f"Found {len(mtx_files)} row-major MTX files in rm_mtx_files")
-                use_float32 = (dtype == "float32")
-                zdata_dir, rm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=True, use_float32=use_float32)
+                zdata_dir, rm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=True, dtype=dtype)
         
         # Process column-major MTX files if they exist
         cm_metadata = None
@@ -132,7 +142,7 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
                     zdata_dir = Path(output_name)
                     zdata_dir.mkdir(parents=True, exist_ok=True)
                 # Use block_columns and max_columns for column-major files
-                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_columns, max_columns, subdir="X_CM", return_metadata=True, use_float32=use_float32)
+                _, cm_metadata = _build_zdata_from_multiple_files(mtx_files, output_name, block_columns, max_columns, subdir="X_CM", return_metadata=True, dtype=dtype)
         
         # Combine metadata if both exist
         if rm_metadata is not None and cm_metadata is not None:
@@ -226,33 +236,33 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
             if not mtx_files:
                 raise ValueError(f"No .mtx files found in directory: {mtx_file_or_dir}")
             print(f"Found {len(mtx_files)} MTX files in directory")
-            return _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM")
+            return _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", dtype=dtype)
         
         return zdata_dir
     else:
         # Single file
-        return _build_zdata_from_single_file(input_path, output_name, block_rows, max_rows)
+        return _build_zdata_from_single_file(input_path, output_name, block_rows, max_rows, dtype=dtype)
 
 
-def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, row_offset=0, subdir="X_RM", use_float32=False):
+def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, row_offset=0, subdir="X_RM", dtype="uint16"):
     """Build zdata from a single MTX file.
-    
+
     Args:
         mtx_path: Path to MTX file
         output_name: Output directory name
         block_rows: Number of rows per block
         max_rows: Maximum rows per chunk
         row_offset: Offset to add to row indices from MTX file (for globally contiguous numbering)
+        dtype: Data type string (e.g. "uint16", "float32", "int32", etc.)
     """
     if not mtx_path.exists():
         raise FileNotFoundError(f"MTX file not found: {mtx_path}")
-    
+
     # Call the C tool with optional parameters
-    # Stream output in real-time while also capturing for metadata parsing
     bin_path = _get_mtx_to_zdata_path()
     cmd = [bin_path]
-    if use_float32:
-        cmd.append("--float32")
+    if dtype != "uint16":
+        cmd.extend(["--dtype", dtype])
     cmd.extend([str(mtx_path), output_name, str(block_rows), str(max_rows)])
     if row_offset > 0:
         cmd.append(str(row_offset))
@@ -364,7 +374,7 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
     metadata = {
         "version": 1,
         "format": "zdata",
-        "dtype": "float32" if use_float32 else "uint16",
+        "dtype": dtype,
         "shape": [nrows, ncols],
         "nnz_total": nnz_total,
         f"num_chunks{suffix}": num_chunks,
@@ -387,7 +397,7 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
     return zdata_dir
 
 
-def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=False, use_float32=False):
+def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_rows, subdir="X_RM", return_metadata=False, dtype="uint16"):
     """
     Build zdata from multiple MTX files, combining them into a single contiguous dataset.
     
@@ -480,7 +490,7 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             # The C code will add this offset to row indices from the MTX file
             # For X_CM: total_rows tracks genes (rows in X_CM)
             # For X_RM: total_rows tracks cells (rows in X_RM)
-            _build_zdata_from_single_file(mtx_file, str(temp_output), block_rows, max_rows, row_offset=total_rows, subdir=subdir, use_float32=use_float32)
+            _build_zdata_from_single_file(mtx_file, str(temp_output), block_rows, max_rows, row_offset=total_rows, subdir=subdir, dtype=dtype)
             
             # Get chunk files from temp directory (they're in subdirectory: X_RM or X_CM)
             temp_chunk_dir = temp_output / subdir
@@ -556,7 +566,7 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
     metadata = {
         "version": 1,
         "format": "zdata",
-        "dtype": "float32" if use_float32 else "uint16",
+        "dtype": dtype,
         "shape": [total_rows, ncols],
         "nnz_total": total_nnz,
         f"num_chunks{suffix}": num_chunks,

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
 import anndata as ad
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -209,24 +210,39 @@ class ZData:
     >>> matrix = zdata[['GAPDH', 'PCNA', 'COL1A1']]
     """
     
-    def __init__(self, dir_name: str | Path) -> None:
+    def __init__(
+        self,
+        dir_name: str | Path,
+        obs_index_col: str | None = None,
+        var_index_col: str | None = None,
+    ) -> None:
         """\
         Initialize the reader for a zdata directory.
-        
+
         Parameters
         ----------
         dir_name
             Name or path of the zdata directory.
-            Can be a relative path (e.g., "atlas.zdata") or absolute path
-            (e.g., "/path/to/atlas.zdata").
-        
+        obs_index_col
+            Optional column name (integer-typed) in obs.parquet to use as
+            a mapping from obs row positions to expression-matrix row indices.
+            When ``None`` (default), obs rows and matrix rows are assumed to
+            be aligned 1-to-1, and ``len(obs)`` must equal ``nrows``.
+            When set (e.g. ``"_row_index"``), queries index into obs first,
+            then the named column translates to the actual matrix row.
+        var_index_col
+            Same concept for var.parquet → expression-matrix column indices.
+            When ``None`` (default), var rows and matrix columns are aligned.
+            When set, the named column translates var positions to matrix
+            column indices.
+
         Raises
         ------
         FileNotFoundError
-            If the directory or required files (metadata.json, obs.parquet, var.parquet)
-            are not found.
+            If the directory or required files are not found.
         ValueError
-            If the path is not a directory or metadata is missing required fields.
+            If the path is not a directory, metadata is missing required fields,
+            or a requested index column does not exist / has wrong type.
         RuntimeError
             If parquet files cannot be loaded.
         """
@@ -262,8 +278,9 @@ class ZData:
             'max_rows_per_chunk', settings.max_rows_per_chunk
         )
         
-        # Initialize obs shape matching flag early (will be updated after loading obs_df)
-        self._obs_matches_expression_shape = False
+        # Store user-specified index mapping columns
+        self._obs_index_col: str | None = obs_index_col
+        self._var_index_col: str | None = var_index_col
         
         self.chunk_files: dict[int, str] = {}
         self.chunk_info: dict[int, dict[str, Any]] = {}
@@ -297,24 +314,66 @@ class ZData:
         try:
             self._obs_df: PolarsDataFrame = pl.read_parquet(obs_file)
             self._obs_wrapper: ObsWrapper = ObsWrapper(self._obs_df)
-            
-            # Check if obs shape matches expression shape
-            obs_nrows = len(self._obs_df)
-            self._obs_matches_expression_shape = (obs_nrows == self.nrows)
-            
-            # Cache mapping from obs-positional to expression-global row indices
-            if not self._obs_matches_expression_shape and '_row_index' in self._obs_df.columns:
-                self._obs_row_index_map: NDArray[np.integer] | None = self._obs_df['_row_index'].to_numpy()
-            else:
-                self._obs_row_index_map = None
-                        
-            # Cache var DataFrame for __getitem__ access
+
             var_polars = pl.read_parquet(var_file)
             var_dict = var_polars.to_dict(as_series=False)
             self._var_df: pd.DataFrame = pd.DataFrame(var_dict)
             self._var_df.index = pd.RangeIndex(start=0, stop=len(self._var_df))
         except Exception as e:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
+
+        # --- obs index mapping ---------------------------------------------------
+        obs_nrows = len(self._obs_df)
+        if obs_index_col is not None:
+            if obs_index_col not in self._obs_df.columns:
+                raise ValueError(
+                    f"obs_index_col '{obs_index_col}' not found in obs.parquet. "
+                    f"Available columns: {self._obs_df.columns}"
+                )
+            col_dtype = self._obs_df[obs_index_col].dtype
+            if col_dtype not in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                                 pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                raise ValueError(
+                    f"obs_index_col '{obs_index_col}' must be an integer column, "
+                    f"got {col_dtype}"
+                )
+            self._obs_row_index_map: NDArray[np.integer] | None = (
+                self._obs_df[obs_index_col].to_numpy()
+            )
+        else:
+            if obs_nrows != self.nrows:
+                raise ValueError(
+                    f"obs.parquet has {obs_nrows} rows but the expression matrix "
+                    f"has {self.nrows} rows. Dimensions must match when no "
+                    f"obs_index_col is specified. To use a mapping column, pass "
+                    f"obs_index_col='<column_name>' (e.g. obs_index_col='_row_index')."
+                )
+            self._obs_row_index_map = None
+
+        # --- var index mapping ---------------------------------------------------
+        var_nrows = len(self._var_df)
+        if var_index_col is not None:
+            if var_index_col not in self._var_df.columns:
+                raise ValueError(
+                    f"var_index_col '{var_index_col}' not found in var.parquet. "
+                    f"Available columns: {list(self._var_df.columns)}"
+                )
+            col = self._var_df[var_index_col]
+            if not np.issubdtype(col.dtype, np.integer):
+                raise ValueError(
+                    f"var_index_col '{var_index_col}' must be an integer column, "
+                    f"got {col.dtype}"
+                )
+            self._var_col_index_map: NDArray[np.integer] | None = col.to_numpy()
+        else:
+            if var_nrows != self.ncols:
+                raise ValueError(
+                    f"var.parquet has {var_nrows} rows but the expression matrix "
+                    f"has {self.ncols} columns. Dimensions must match when no "
+                    f"var_index_col is specified. To use a mapping column, pass "
+                    f"var_index_col='<column_name>'."
+                )
+            self._var_col_index_map = None
         
         # Cache zdata_read executable path (resolved once at init for thread safety)
         self._zdata_read_path: str = _get_zdata_read_path()
@@ -421,7 +480,7 @@ class ZData:
             (ncols, results) where results is a list of (local_row_id, cols, vals) tuples
         """
         # Build CSV string (list comprehension for large lists, map for small)
-        rows_csv = ",".join([str(r) for r in local_rows] if len(local_rows) > 50 else map(str, local_rows))
+        rows_csv = ",".join(map(str, local_rows))
         
         block_rows_val = block_rows if block_rows is not None else self.block_rows
         
@@ -447,10 +506,21 @@ class ZData:
                 f"row list — rebuild zdata_read with the latest source."
             )
 
-        # Version 2 = uint16, Version 3 = float32
-        if version == 3:
-            val_dtype = np.float32
-            val_bytes = 4
+        # Map version number to numpy dtype
+        _VERSION_DTYPE = {
+            2:  (np.uint16,  2),
+            3:  (np.float32, 4),
+            4:  (np.uint8,   1),
+            5:  (np.uint32,  4),
+            6:  (np.uint64,  8),
+            7:  (np.int8,    1),
+            8:  (np.int16,   2),
+            9:  (np.int32,   4),
+            10: (np.int64,   8),
+            11: (np.float64, 8),
+        }
+        if version in _VERSION_DTYPE:
+            val_dtype, val_bytes = _VERSION_DTYPE[version]
         else:
             val_dtype = np.uint16
             val_bytes = 2
@@ -478,59 +548,93 @@ class ZData:
 
         return ncols, out
     
-    def _process_file_for_rows(
+    def _process_file(
         self,
         file_path: str,
-        row_info_list: list[tuple[int, int, int]],
-        file_to_chunk: dict[str, int]
-    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]:
+        info_list: list[tuple[int, int, int]],
+        file_to_chunk: dict[str, int],
+        block_size: int,
+    ) -> tuple[list[tuple[int, int, int]], list, int]:
         """
-        Process a single file for row reading (used in parallel processing).
-        
-        Args:
-            file_path: Path to the chunk file
-            row_info_list: List of (local_row, orig_idx, global_row) tuples
-            file_to_chunk: Mapping from file path to chunk number
-        
+        Process a single chunk file: sort by local row, read, return results.
+
+        Used by both row-major and column-major read paths.
+
         Returns:
-            (file_path, chunk_num, file_results, file_ncols)
+            (info_list_sorted, file_results, file_ncols)
         """
-        chunk_num = file_to_chunk[file_path]
-        
-        row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
-        local_rows = [info[0] for info in row_info_list_sorted]
-        
-        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_rows)
-        
-        return file_path, chunk_num, file_results, file_ncols
-    
-    def _process_file_for_cols(
+        info_list_sorted = sorted(info_list, key=lambda x: x[0])
+        local_rows = [t[0] for t in info_list_sorted]
+        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, block_size)
+        return info_list_sorted, file_results, file_ncols
+
+    def _dispatch_file_reads(
         self,
-        file_path: str,
-        col_info_list: list[tuple[int, int, int]],
-        file_to_chunk: dict[str, int]
-    ) -> tuple[str, int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int, list[tuple[int, int, int]]]:
+        items_by_file: dict[str, list[tuple[int, int, int]]],
+        file_to_chunk: dict[str, int],
+        block_size: int,
+        all_results: list,
+        check_ncols: bool = True,
+    ) -> None:
         """
-        Process a single file for column reading (used in parallel processing).
-        
-        Args:
-            file_path: Path to the chunk file
-            col_info_list: List of (local_row, orig_idx, global_col) tuples
-            file_to_chunk: Mapping from file path to chunk number
-        
-        Returns:
-            (file_path, chunk_num, file_results, file_ncols, col_info_list_sorted)
+        Shared parallel/sequential file dispatch for both read_rows and read_cols_cm.
+
+        Reads from chunk files, fills *all_results* in-place.
+
+        Parameters
+        ----------
+        items_by_file
+            ``{file_path: [(local_row, orig_idx, global_id), ...]}``
+        file_to_chunk
+            Mapping from file path to chunk number.
+        block_size
+            ``block_rows`` or ``block_columns``.
+        all_results
+            Pre-allocated list; results written at ``orig_idx`` positions.
+        check_ncols
+            Whether to validate that file ncols matches self.ncols.
+            Set to False for column-major reads (transposed semantics).
         """
-        chunk_num = file_to_chunk[file_path]
-        
-        # Sort once and reuse
-        col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
-        local_rows = [info[0] for info in col_info_list_sorted]
-        
-        file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_columns)
-        
-        return file_path, chunk_num, file_results, file_ncols, col_info_list_sorted
-    
+        num_files = len(items_by_file)
+        max_workers = settings.max_workers
+        if max_workers is None:
+            max_workers = min(num_files, min(8, (os.cpu_count() or 1)))
+        else:
+            max_workers = min(max_workers, num_files)
+
+        def _assemble(info_sorted, file_results, file_ncols, file_path):
+            if check_ncols and self.ncols != file_ncols:
+                raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
+            for info_tuple, (returned_local_row, data_cols, data_vals) in zip(info_sorted, file_results):
+                local_row, orig_idx, global_id = info_tuple
+                if returned_local_row != local_row:
+                    raise ValueError(f"Row mismatch: expected {local_row}, got {returned_local_row}")
+                all_results[orig_idx] = (global_id, data_cols, data_vals)
+
+        if num_files > 1 and max_workers > 1:
+            files_per_batch = max(1, min(10, num_files // max_workers + 1))
+            file_items = list(items_by_file.items())
+            file_batches = [file_items[i:i + files_per_batch] for i in range(0, len(file_items), files_per_batch)]
+
+            def process_batch(batch):
+                results = {}
+                for fp, info_list in batch:
+                    results[fp] = self._process_file(fp, info_list, file_to_chunk, block_size)
+                return results
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_batch, b): b for b in file_batches}
+                for future in as_completed(futures):
+                    batch_results = future.result()
+                    for fp, (info_sorted, file_results, file_ncols) in batch_results.items():
+                        _assemble(info_sorted, file_results, file_ncols, fp)
+        else:
+            for fp, info_list in items_by_file.items():
+                info_sorted, file_results, file_ncols = self._process_file(
+                    fp, info_list, file_to_chunk, block_size
+                )
+                _assemble(info_sorted, file_results, file_ncols, fp)
+
     def read_rows(
         self, 
         global_rows: int | np.integer | Sequence[int] | NDArray[np.integer] | NDArray[np.bool_] | slice
@@ -592,10 +696,12 @@ class ZData:
         ...     print(f"Row {row_id}: {len(cols)} non-zero values")
         """
         if self._obs_row_index_map is not None:
+            # Indices are into obs; translate via the mapping column to matrix rows
             obs_indices = normalize_row_indices(global_rows, len(self._obs_df))
             self._check_memory_requirements(row_indices=obs_indices)
             global_rows = sorted(set(int(self._obs_row_index_map[i]) for i in obs_indices))
         else:
+            # Direct: indices are matrix rows
             global_rows = normalize_row_indices(global_rows, self.nrows)
             self._check_memory_requirements(row_indices=global_rows)
         if settings.warn_on_large_queries and len(global_rows) > settings.large_query_threshold:
@@ -622,68 +728,10 @@ class ZData:
             rows_by_file[self.chunk_files[chunk_num]].append((local_row, idx, global_row))
         
         all_results = [None] * len(global_rows)
-        
-        num_files = len(rows_by_file)
-        
-        # Determine optimal number of workers
-        max_workers = settings.max_workers
-        if max_workers is None:
-            max_workers = min(num_files, min(8, (os.cpu_count() or 1)))
-        else:
-            max_workers = min(max_workers, num_files)
-        
-        if num_files > 1 and max_workers > 1:
-            # Batch files to reduce subprocess startup overhead
-            # Each worker processes multiple files sequentially (up to 10 files per batch)
-            files_per_batch = max(1, min(10, num_files // max_workers + 1))
-            file_items = list(rows_by_file.items())
-            file_batches = [file_items[i:i + files_per_batch] for i in range(0, len(file_items), files_per_batch)]
-            
-            def process_batch(batch: list[tuple[str, list[tuple[int, int, int]]]]) -> dict[str, tuple[int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int]]:
-                """Process a batch of files sequentially in a single worker thread."""
-                results = {}
-                for file_path, row_info_list in batch:
-                    _, chunk_num, file_results, file_ncols = self._process_file_for_rows(
-                        file_path, row_info_list, self.file_to_chunk
-                    )
-                    results[file_path] = (chunk_num, file_results, file_ncols)
-                return results
-            
-            # Process batches in parallel
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_batch, batch): batch for batch in file_batches}
-                
-                for future in as_completed(futures):
-                    try:
-                        batch_results = future.result()
-                        for file_path, (chunk_num, file_results, file_ncols) in batch_results.items():
-                            if self.ncols != file_ncols:
-                                raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
-                            
-                            row_info_list_sorted = sorted(rows_by_file[file_path], key=lambda x: x[0])
-                            for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
-                                if returned_local_row != local_row:
-                                    raise ValueError(f"Row mismatch: expected {local_row}, got {returned_local_row}")
-                                all_results[orig_idx] = (global_row, cols, vals)
-                    except Exception as e:
-                        raise RuntimeError(f"Error processing batch: {e}") from e
-        else:
-            # Sequential processing (single file or max_workers <= 1)
-            for file_path, row_info_list in rows_by_file.items():
-                chunk_num = self.file_to_chunk[file_path]
-                
-                row_info_list_sorted = sorted(row_info_list, key=lambda x: x[0])
-                local_rows = [info[0] for info in row_info_list_sorted]
-                
-                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_rows)
-                if self.ncols != file_ncols:
-                    raise ValueError(f"Inconsistent ncols: {self.ncols} vs {file_ncols} in {file_path}")
-                
-                for (local_row, orig_idx, global_row), (returned_local_row, cols, vals) in zip(row_info_list_sorted, file_results):
-                    if returned_local_row != local_row:
-                        raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                    all_results[orig_idx] = (global_row, cols, vals)
-        
+        self._dispatch_file_reads(
+            rows_by_file, self.file_to_chunk, self.block_rows, all_results
+        )
+
         return all_results
     
     def read_rows_csr(
@@ -878,11 +926,17 @@ class ZData:
         gene_names = None
         if hasattr(self, '_var_df') and 'gene' in self._var_df.columns:
             gene_names = pd.Index(self._var_df['gene'])
-        
-        global_cols = normalize_column_indices(global_cols, self.ncols, gene_names)
-        
+
+        # When var_index_col is set, normalize against var length then map
+        n_queryable_cols = len(self._var_df) if self._var_col_index_map is not None else self.ncols
+        global_cols = normalize_column_indices(global_cols, n_queryable_cols, gene_names)
+
         if not global_cols:
             raise ValueError("Empty selection: no columns selected")
+
+        # Translate var-positional indices to actual matrix column indices
+        if self._var_col_index_map is not None:
+            global_cols = sorted(set(int(self._var_col_index_map[c]) for c in global_cols))
         
         self._check_memory_requirements(column_indices=global_cols)
         cm_chunk_files, cm_chunk_info, cm_file_to_chunk, cm_chunk_ranges = self._build_cm_chunk_mapping()
@@ -910,62 +964,11 @@ class ZData:
         
         all_results = [None] * len(global_cols)
         
-        # Determine number of unique files that need to be processed
-        num_files = len(cols_by_file)
-        
-        # Determine optimal number of workers
-        max_workers = settings.max_workers
-        if max_workers is None:
-            max_workers = min(num_files, min(8, (os.cpu_count() or 1)))
-        else:
-            max_workers = min(max_workers, num_files)
-        
-        if num_files > 1 and max_workers > 1:
-            # Batch files to reduce subprocess startup overhead
-            # Each worker processes multiple files sequentially (up to 10 files per batch)
-            files_per_batch = max(1, min(10, num_files // max_workers + 1))
-            file_items = list(cols_by_file.items())
-            file_batches = [file_items[i:i + files_per_batch] for i in range(0, len(file_items), files_per_batch)]
-            
-            def process_batch(batch: list[tuple[str, list[tuple[int, int, int]]]]) -> dict[str, tuple[int, list[tuple[int, NDArray[np.uint32], NDArray[np.uint16]]], int, list[tuple[int, int, int]]]]:
-                """Process a batch of files sequentially in a single worker thread."""
-                results = {}
-                for file_path, col_info_list in batch:
-                    _, chunk_num, file_results, file_ncols, col_info_list_sorted = self._process_file_for_cols(
-                        file_path, col_info_list, cm_file_to_chunk
-                    )
-                    results[file_path] = (chunk_num, file_results, file_ncols, col_info_list_sorted)
-                return results
-            
-            # Process batches in parallel
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_batch, batch): batch for batch in file_batches}
-                
-                for future in as_completed(futures):
-                    try:
-                        batch_results = future.result()
-                        for file_path, (chunk_num, file_results, file_ncols, col_info_list_sorted) in batch_results.items():
-                            for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
-                                if returned_local_row != local_row:
-                                    raise ValueError(f"Row mismatch: expected {local_row}, got {returned_local_row}")
-                                all_results[orig_idx] = (global_col, rows, vals)
-                    except Exception as e:
-                        raise RuntimeError(f"Error processing batch: {e}") from e
-        else:
-            # Sequential processing (single file or max_workers <= 1)
-            for file_path, col_info_list in cols_by_file.items():
-                chunk_num = cm_file_to_chunk[file_path]
-                
-                col_info_list_sorted = sorted(col_info_list, key=lambda x: x[0])
-                local_rows = [info[0] for info in col_info_list_sorted]
-                
-                file_ncols, file_results = self._read_rows_from_file(file_path, local_rows, self.block_columns)
-                
-                for (local_row, orig_idx, global_col), (returned_local_row, rows, vals) in zip(col_info_list_sorted, file_results):
-                    if returned_local_row != local_row:
-                        raise ValueError(f"Row mismatch: expected local row {local_row}, got {returned_local_row}")
-                    all_results[orig_idx] = (global_col, rows, vals)
-        
+        self._dispatch_file_reads(
+            cols_by_file, cm_file_to_chunk, self.block_columns, all_results,
+            check_ncols=False,
+        )
+
         return all_results
     
     def read_cols_cm_csr(
@@ -1309,19 +1312,21 @@ class ZData:
         if is_column_query:
             csr_result = self.read_cols_cm_csr(key)
             csc_result = csr_result.T
-            
-            if not self._obs_matches_expression_shape:
-                row_indices = self._obs_df['_row_index'].to_numpy()
-                csr_subset = csc_result.tocsr()[row_indices, :]
+
+            # If obs uses a mapping column, filter to only the obs-represented rows
+            if self._obs_row_index_map is not None:
+                csr_subset = csc_result.tocsr()[self._obs_row_index_map, :]
                 csc_result = csr_subset.tocsc()
-            
+
             return csc_result
         
-        row_indices = normalize_row_indices(key, self.nrows)
-        
+        # When obs_index_col is set, indices are into obs (not matrix rows)
+        n_queryable = len(self._obs_df) if self._obs_row_index_map is not None else self.nrows
+        row_indices = normalize_row_indices(key, n_queryable)
+
         if not row_indices:
             raise ValueError("Empty selection: no rows selected")
-        
+
         X_csr = self.read_rows_csr(row_indices)
         
         # Get obs data for selected rows (already sorted and deduplicated)
@@ -1338,7 +1343,7 @@ class ZData:
             else:
                 obs_df = self.obs.gather(row_indices)
         else:
-            obs_df = self.obs[0:0, :].copy()
+            obs_df = self.obs[0:0, :]
         
         obs_df.index = pd.RangeIndex(start=0, stop=len(obs_df))
         
@@ -1350,7 +1355,7 @@ class ZData:
                 warnings.filterwarnings("ignore", category=AnnDataWarning)
             except ImportError:
                 warnings.filterwarnings("ignore", message=".*Transforming to str index.*")
-            
+
             adata = ad.AnnData(
                 X=X_csr,
                 obs=obs_df,

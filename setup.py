@@ -337,7 +337,7 @@ def get_long_description():
 setup(
     name="zdata-py",
     version=get_version(),
-    description="Efficient storage and access for large single-cell RNA datasets (supports Zarr and H5AD formats)",
+    description="Efficient sparse matrix storage and retrieval using seekable Zstandard compression",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
     author="Sam Cooper",
@@ -355,6 +355,8 @@ setup(
         "pandas>=1.3.0",
         "anndata>=0.8.0",
         "zarr>=2.10.0",
+        "pyarrow>=10.0.0",
+        "h5py>=3.0.0",
     ],
     extras_require={
         "dev": [
@@ -366,6 +368,14 @@ setup(
             "pytest>=7.0.0",
             "pytest-cov>=4.0.0",
             "pytest-xdist>=3.0.0",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "zdata-build=zdata.build_zdata.build_zdata:main",
+            "zdata-build-mtx=zdata.build_zdata.build_from_mtx_csv:main",
+            "zdata-check=zdata.build_zdata.check_directory:main",
+            "zdata-align=zdata.build_zdata.align_mtx:main",
         ],
     },
     cmdclass={
