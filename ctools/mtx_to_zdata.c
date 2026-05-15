@@ -44,6 +44,16 @@ static const DTypeInfo DTYPE_TABLE[] = {
 /* Currently selected dtype (default: uint16, version 2) */
 static const DTypeInfo *g_dtype = &DTYPE_TABLE[0];
 
+/* When set, the COO payload after the size line is raw binary (struct-of-
+   arrays): nnz int32 row indices, nnz int32 col indices, nnz values of the
+   selected dtype – all 0-based, little-endian.  Used by the Python streaming
+   pipeline to avoid materialising text MTX files on disk. */
+static int g_binary_input = 0;
+
+/* zstd compression level for the seekable archives (1 = fastest/largest).
+   Overridable with --level; the format is seekable at any level. */
+static int g_zstd_level = 1;
+
 static const DTypeInfo *dtype_by_name(const char *name) {
     for (size_t i = 0; i < NUM_DTYPES; i++)
         if (strcmp(DTYPE_TABLE[i].name, name) == 0) return &DTYPE_TABLE[i];
@@ -146,7 +156,11 @@ typedef struct {
 } BlockCSR;
 
 typedef struct {
-    uint32_t  *indptr;
+    /* indptr is uint64 because the *total* nnz of a full matrix passed to the
+       compressor (a streamed X_CM gene slab can hold billions) routinely
+       exceeds 2^32. Per-block indptrs in the on-disk format stay uint32 –
+       blocks are bounded to (block_rows * ncols) entries. */
+    uint64_t  *indptr;
     uint32_t  *indices;
     void      *data;      /* length nnz_total * val_size */
     long long  nnz_total;
@@ -315,8 +329,10 @@ static int parse_line_fast(const char *line, long long *row, long long *col, dou
 /* -----------------------------------------------------------------------
    Build FullCSR from MTX file – type-agnostic
    ----------------------------------------------------------------------- */
-static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, long long ncols) {
-    setvbuf(f, NULL, _IOFBF, 1024 * 1024);
+static FullCSR* build_full_csr(FILE *f, long long nrows, long long ncols) {
+    /* Reads sequentially from the current file position (just past the size
+       line).  Works on regular files and on non-seekable streams (stdin/FIFO)
+       alike – no fseek, so COO triplets can be piped straight in. */
     size_t vs = g_dtype->val_size;
 
     RowEntries *rows = (RowEntries*)calloc((size_t)nrows, sizeof(RowEntries));
@@ -343,7 +359,6 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
 
     printf("  Building CSR structure (single pass, optimized)...\n");
     fflush(stdout);
-    fseek(f, data_start_pos, SEEK_SET);
 
     while (fgets(line, sizeof(line), f)) {
         int n = parse_line_fast(line, &row, &col, &value);
@@ -395,14 +410,14 @@ static FullCSR* build_full_csr(FILE *f, long data_start_pos, long long nrows, lo
     printf("  Converting to CSR format...\n");
     fflush(stdout);
 
-    uint32_t *indptr = (uint32_t*)malloc((size_t)(nrows + 1) * sizeof(uint32_t));
+    uint64_t *indptr = (uint64_t*)malloc((size_t)(nrows + 1) * sizeof(uint64_t));
     if (!indptr) { fprintf(stderr, "OOM indptr\n"); goto fail_rows; }
 
     indptr[0] = 0;
     long long nnz_total = 0;
     for (long long i = 0; i < nrows; i++) {
         nnz_total += rows[i].size;
-        indptr[i + 1] = (uint32_t)nnz_total;
+        indptr[i + 1] = (uint64_t)nnz_total;
     }
 
     if (nnz_total == 0) {
@@ -447,6 +462,80 @@ fail_rows:
     return NULL;
 }
 
+/* -----------------------------------------------------------------------
+   Build FullCSR from a raw binary COO stream (struct-of-arrays):
+     int32 row[nnz], int32 col[nnz], <dtype> val[nnz]   – all 0-based.
+   Uses a counting sort straight into CSR (no per-row realloc growth).
+   ----------------------------------------------------------------------- */
+static FullCSR* build_full_csr_binary(FILE *f, long long nrows, long long ncols,
+                                      long long nnz_in) {
+    size_t vs = g_dtype->val_size;
+    if (nnz_in <= 0) { fprintf(stderr, "Error: nnz must be > 0\n"); return NULL; }
+
+    int32_t *all_r = (int32_t*)malloc((size_t)nnz_in * sizeof(int32_t));
+    int32_t *all_c = (int32_t*)malloc((size_t)nnz_in * sizeof(int32_t));
+    void    *all_v = malloc((size_t)nnz_in * vs);
+    if (!all_r || !all_c || !all_v) {
+        fprintf(stderr, "OOM reading binary COO stream\n");
+        free(all_r); free(all_c); free(all_v); return NULL;
+    }
+
+    printf("  Reading binary COO stream (%lld triplets)...\n", nnz_in);
+    fflush(stdout);
+    if (fread(all_r, sizeof(int32_t), (size_t)nnz_in, f) != (size_t)nnz_in ||
+        fread(all_c, sizeof(int32_t), (size_t)nnz_in, f) != (size_t)nnz_in ||
+        fread(all_v, vs,              (size_t)nnz_in, f) != (size_t)nnz_in) {
+        fprintf(stderr, "Short read on binary COO stream\n");
+        free(all_r); free(all_c); free(all_v); return NULL;
+    }
+
+    /* Count nnz per row (skipping out-of-range entries).  64-bit indptr is
+       required: a streamed CM gene-slab routinely holds >2^32 nnz. */
+    uint64_t *indptr = (uint64_t*)calloc((size_t)(nrows + 1), sizeof(uint64_t));
+    if (!indptr) { fprintf(stderr, "OOM indptr\n"); free(all_r); free(all_c); free(all_v); return NULL; }
+    for (long long i = 0; i < nnz_in; i++) {
+        int32_t r = all_r[i], c = all_c[i];
+        if (r >= 0 && r < nrows && c >= 0 && (long long)c < ncols) indptr[r + 1]++;
+    }
+    for (long long i = 0; i < nrows; i++) indptr[i + 1] += indptr[i];
+    long long nnz_total = (long long)indptr[nrows];
+    if (nnz_total == 0) {
+        fprintf(stderr, "Error: matrix has no in-range non-zero elements\n");
+        free(indptr); free(all_r); free(all_c); free(all_v); return NULL;
+    }
+
+    uint32_t *indices = (uint32_t*)malloc((size_t)nnz_total * sizeof(uint32_t));
+    void     *data    = malloc((size_t)nnz_total * vs);
+    uint64_t *wpos    = (uint64_t*)malloc((size_t)nrows * sizeof(uint64_t));
+    if (!indices || !data || !wpos) {
+        fprintf(stderr, "OOM CSR arrays\n");
+        free(indptr); free(indices); free(data); free(wpos);
+        free(all_r); free(all_c); free(all_v); return NULL;
+    }
+    for (long long i = 0; i < nrows; i++) wpos[i] = indptr[i];
+
+    /* Place entries (input order is row-major / col-sorted within row) */
+    for (long long i = 0; i < nnz_in; i++) {
+        int32_t r = all_r[i], c = all_c[i];
+        if (r < 0 || r >= nrows || c < 0 || (long long)c >= ncols) continue;
+        uint64_t p = wpos[r]++;
+        indices[p] = (uint32_t)c;
+        memcpy((uint8_t*)data + (size_t)p * vs, (uint8_t*)all_v + (size_t)i * vs, vs);
+    }
+
+    free(all_r); free(all_c); free(all_v); free(wpos);
+
+    FullCSR *csr = (FullCSR*)malloc(sizeof(FullCSR));
+    if (!csr) { fprintf(stderr, "OOM FullCSR\n"); free(indptr); free(indices); free(data); return NULL; }
+    csr->indptr = indptr;
+    csr->indices = indices;
+    csr->data = data;
+    csr->nnz_total = nnz_total;
+    printf("  CSR structure complete (%lld nnz)\n", nnz_total);
+    fflush(stdout);
+    return csr;
+}
+
 static void free_full_csr(FullCSR *csr) {
     if (csr) {
         free(csr->indptr);
@@ -480,7 +569,7 @@ static int process_chunk_from_csr(
     if (!row_counts) { fprintf(stderr, "OOM row_counts\n"); return 0; }
     for (uint32_t i = 0; i < chunk_size; i++) {
         long long ri = start_row_local + i;
-        row_counts[i] = csr->indptr[ri + 1] - csr->indptr[ri];
+        row_counts[i] = (uint32_t)(csr->indptr[ri + 1] - csr->indptr[ri]);
     }
 
     uint32_t nblocks = (chunk_size + block_rows - 1) / block_rows;
@@ -508,15 +597,18 @@ static int process_chunk_from_csr(
             blocks[b].write_pos[r] = blocks[b].indptr[r];
     }
 
-    /* Fill blocks */
+    /* Fill blocks (uint64 rs/re because the global FullCSR can hold >2^32 nnz;
+       per-block write_pos stays uint32 since one block holds <= block_rows*ncols
+       entries) */
     for (uint32_t i = 0; i < chunk_size; i++) {
         long long ri = start_row_local + i;
-        uint32_t rs = csr->indptr[ri], re = csr->indptr[ri + 1];
+        uint64_t rs = csr->indptr[ri], re = csr->indptr[ri + 1];
         uint32_t b = i / block_rows, r = i % block_rows;
-        for (uint32_t j = 0; j < re - rs; j++) {
+        uint32_t row_nnz = (uint32_t)(re - rs);
+        for (uint32_t j = 0; j < row_nnz; j++) {
             uint32_t p = blocks[b].write_pos[r]++;
             blocks[b].indices[p] = csr->indices[rs + j];
-            memcpy((uint8_t*)blocks[b].data + p * vs,
+            memcpy((uint8_t*)blocks[b].data + (size_t)p * vs,
                    (uint8_t*)csr->data + (rs + j) * vs, vs);
         }
     }
@@ -528,7 +620,7 @@ static int process_chunk_from_csr(
 
     ZSTD_seekable_CStream *zcs = ZSTD_seekable_createCStream();
     if (!zcs) { fprintf(stderr, "createCStream failed\n"); fclose(out); return 0; }
-    size_t initR = ZSTD_seekable_initCStream(zcs, 1, 0, 0);
+    size_t initR = ZSTD_seekable_initCStream(zcs, g_zstd_level, 0, 0);
     if (ZSTD_isError(initR)) {
         fprintf(stderr, "initCStream error: %s\n", ZSTD_getErrorName(initR));
         ZSTD_seekable_freeCStream(zcs); fclose(out); return 0;
@@ -570,6 +662,16 @@ int main(int argc, char *argv[]) {
             g_dtype = dtype_by_name("float32");
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
+        } else if (strcmp(argv[i], "--binary") == 0) {
+            g_binary_input = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        } else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
+            g_zstd_level = atoi(argv[i + 1]);
+            if (g_zstd_level < 1) g_zstd_level = 1;
+            if (g_zstd_level > 22) g_zstd_level = 22;
+            for (int j = i; j < argc - 2; j++) argv[j] = argv[j + 2];
+            argc -= 2; i--;
         } else if (strcmp(argv[i], "--dtype") == 0 && i + 1 < argc) {
             const DTypeInfo *dt = dtype_by_name(argv[i + 1]);
             if (!dt) {
@@ -586,7 +688,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 3 || argc > 7) {
-        fprintf(stderr, "Usage: %s [--dtype <type>] <matrix.mtx> <out_name> [block_rows] [max_rows] [row_offset] [subdir]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--dtype <type>] <matrix.mtx|-> <out_name> [block_rows] [max_rows] [row_offset] [subdir]\n", argv[0]);
+        fprintf(stderr, "  <matrix.mtx|->: MatrixMarket file path, or '-' to stream from stdin\n");
+        fprintf(stderr, "  --binary: COO payload after the size line is raw binary (SoA: int32 rows,\n");
+        fprintf(stderr, "            int32 cols, <dtype> vals; all 0-based). Requires input '-'.\n");
+        fprintf(stderr, "  --level <1-22>: zstd compression level (default: 1).\n");
         fprintf(stderr, "  --dtype <type>: Data type (default: uint16). Supported:");
         for (size_t k = 0; k < NUM_DTYPES; k++) fprintf(stderr, " %s", DTYPE_TABLE[k].name);
         fprintf(stderr, "\n  --float32: Shorthand for --dtype float32\n");
@@ -594,7 +700,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Mode: %s (version %u, %zu bytes/value)\n", g_dtype->name, g_dtype->version, g_dtype->val_size);
+    printf("Mode: %s (version %u, %zu bytes/value), zstd level %d\n",
+           g_dtype->name, g_dtype->version, g_dtype->val_size, g_zstd_level);
 
     const char *mtx_path = argv[1];
     const char *out_name = argv[2];
@@ -620,9 +727,12 @@ int main(int argc, char *argv[]) {
     if (argc >= 6) { row_offset = atoll(argv[5]); if (row_offset < 0) { fprintf(stderr, "row_offset must be >= 0\n"); return 1; } }
     if (argc >= 7) { subdir = argv[6]; }
 
-    FILE *f = fopen(mtx_path, "r");
+    /* "-" means read the MatrixMarket stream from stdin (no intermediate
+       file on disk).  Otherwise open the named file. */
+    int from_stdin = (strcmp(mtx_path, "-") == 0);
+    FILE *f = from_stdin ? stdin : fopen(mtx_path, "r");
     if (!f) { perror("open mtx"); return 1; }
-    setvbuf(f, NULL, _IOFBF, 256 * 1024);
+    setvbuf(f, NULL, _IOFBF, 1024 * 1024);
 
     char line[4096];
     if (!fgets(line, sizeof(line), f)) { fprintf(stderr, "Failed to read header\n"); fclose(f); return 1; }
@@ -635,7 +745,6 @@ int main(int argc, char *argv[]) {
     }
     if (ncols_ll > UINT32_MAX) { fprintf(stderr, "ncols too large\n"); fclose(f); return 1; }
     const uint32_t ncols = (uint32_t)ncols_ll;
-    long data_start_pos = ftell(f);
 
     printf("Matrix: %lld rows, %lld cols, %lld nnz (global)\n", nrows_ll, ncols_ll, nnz_total_ll);
     printf("Processing in chunks of %u rows, %u rows per block\n", max_rows, block_rows);
@@ -657,9 +766,11 @@ int main(int argc, char *argv[]) {
     /* Build CSR and process chunks */
     printf("Building CSR structure from MTX file...\n");
     fflush(stdout);
-    FullCSR *csr = build_full_csr(f, data_start_pos, nrows_ll, ncols);
-    if (!csr) { fclose(f); return 1; }
-    fclose(f);
+    FullCSR *csr = g_binary_input
+        ? build_full_csr_binary(f, nrows_ll, ncols, nnz_total_ll)
+        : build_full_csr(f, nrows_ll, ncols);
+    if (!csr) { if (!from_stdin) fclose(f); return 1; }
+    if (!from_stdin) fclose(f);
 
     int chunk_num = 0;
     for (long long sr = 0; sr < nrows_ll; sr += max_rows) {

@@ -193,6 +193,41 @@ class TestIndexing:
         assert isinstance(matrix, csc_matrix)
         assert matrix.shape[1] == 1
 
+    def test_index_by_gene_names_preserves_input_order(self, zdata_instance: ZData):
+        """zd[gene_list] columns must come back in the input order, not sorted
+        by matrix index. Without this, callers can silently correlate the wrong
+        genes when their list is not already in matrix-index order."""
+        if not hasattr(zdata_instance, "_var_df") or "gene" not in zdata_instance._var_df.columns:
+            pytest.skip("Gene names not available in var.parquet")
+
+        all_genes = zdata_instance._var_df["gene"].tolist()
+        if len(all_genes) < 5:
+            pytest.skip("Need at least 5 genes to test ordering")
+
+        # Pick 4 genes and shuffle them so input order != matrix-index order
+        picks = [all_genes[10], all_genes[2], all_genes[7], all_genes[4]]
+        combined = zdata_instance[picks]
+        # Compare each input-position column to the same gene fetched on its own
+        for i, gene in enumerate(picks):
+            single = zdata_instance[gene]
+            # Both have shape (n_obs, 1); compare as dense
+            assert (combined[:, i].toarray().ravel()
+                    == single[:, 0].toarray().ravel()).all(), (
+                f"column {i} (gene {gene!r}) does not match the single-gene fetch"
+            )
+
+    def test_index_by_gene_names_handles_duplicates(self, zdata_instance: ZData):
+        """Duplicate gene names in the input list should produce duplicate columns."""
+        if not hasattr(zdata_instance, "_var_df") or "gene" not in zdata_instance._var_df.columns:
+            pytest.skip("Gene names not available in var.parquet")
+
+        first_gene = zdata_instance._var_df["gene"].iloc[0]
+        result = zdata_instance[[first_gene, first_gene, first_gene]]
+        assert result.shape[1] == 3
+        col0 = result[:, 0].toarray()
+        assert (result[:, 1].toarray() == col0).all()
+        assert (result[:, 2].toarray() == col0).all()
+
     def test_get_random_rows(self, zdata_instance: ZData):
         """Test get_random_rows method."""
         n_rows = min(5, zdata_instance.nrows)

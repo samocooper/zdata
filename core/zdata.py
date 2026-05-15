@@ -1232,8 +1232,19 @@ class ZData:
     @overload
     def __getitem__(self, key: str) -> csc_matrix: ...
     
+    def _resolve_gene_names_to_matrix_cols(self, names: Sequence[str]) -> list[int]:
+        """Map gene names to matrix column indices, honouring var_index_col."""
+        gene_to_var_pos = {g: i for i, g in enumerate(self._var_df["gene"])}
+        try:
+            var_positions = [gene_to_var_pos[n] for n in names]
+        except KeyError as e:
+            raise IndexError(f"Gene name not found in var: {e.args[0]}") from None
+        if self._var_col_index_map is not None:
+            return [int(self._var_col_index_map[p]) for p in var_positions]
+        return var_positions
+
     def __getitem__(
-        self, 
+        self,
         key: slice | int | list[int] | list[str] | str | NDArray[np.integer] | NDArray[np.bool_]
     ) -> ad.AnnData | csc_matrix:
         """\
@@ -1284,7 +1295,9 @@ class ZData:
         - zdata uses disk-based storage, so arbitrary 2D indexing is not supported.
           You can either query rows OR columns, not both simultaneously.
         - Row queries preserve the original query order (unlike read_rows() which sorts).
-        - Column queries return results in sorted order.
+        - Column queries by gene name (or list of names) preserve the input order;
+          duplicate gene names are returned as duplicate columns. Slice queries
+          return columns in slice order.
         - Negative indices are supported for row queries (e.g., zdata[-1] for last row).
         
         Examples
@@ -1312,6 +1325,20 @@ class ZData:
         if is_column_query:
             csr_result = self.read_cols_cm_csr(key)
             csc_result = csr_result.T
+
+            # read_cols_cm_csr sorts and dedupes for efficient chunk access, so
+            # the output columns are in sorted-by-matrix-index order. For
+            # gene-name inputs the user expects columns back in the order they
+            # asked, with duplicates preserved -- restore that here.
+            if isinstance(key, str) or (
+                isinstance(key, list) and len(key) > 0 and isinstance(key[0], str)
+            ):
+                names = [key] if isinstance(key, str) else key
+                input_matrix_cols = self._resolve_gene_names_to_matrix_cols(names)
+                sorted_unique = sorted(set(input_matrix_cols))
+                sorted_pos = {c: i for i, c in enumerate(sorted_unique)}
+                permutation = [sorted_pos[c] for c in input_matrix_cols]
+                csc_result = csc_result[:, permutation]
 
             # If obs uses a mapping column, filter to only the obs-represented rows
             if self._obs_row_index_map is not None:

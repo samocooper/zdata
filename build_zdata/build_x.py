@@ -7,7 +7,10 @@ import os
 import re
 import tempfile
 import shutil
+import threading
 from pathlib import Path
+
+import numpy as np
 
 # Get the path to the mtx_to_zdata executable
 _MODULE_DIR = Path(__file__).parent  # zdata/build_zdata/
@@ -20,6 +23,119 @@ SUPPORTED_DTYPES = frozenset({
     "int8", "int16", "int32", "int64",
     "float32", "float64",
 })
+
+# Map dtype name -> numpy scalar type (for the binary streaming protocol)
+_DTYPE_NP = {
+    "uint8": np.uint8, "uint16": np.uint16, "uint32": np.uint32, "uint64": np.uint64,
+    "int8": np.int8, "int16": np.int16, "int32": np.int32, "int64": np.int64,
+    "float32": np.float32, "float64": np.float64,
+}
+
+
+def _coo_values_for_dtype(data, dtype):
+    """Cast COO values to the target dtype, clamping integer overflow exactly
+    like the C tool's store_value() does (so streamed builds stay bit-identical
+    to file-based builds)."""
+    np_dtype = _DTYPE_NP[dtype]
+    if dtype.startswith(("int", "uint")):
+        info = np.iinfo(np_dtype)
+        # Round floats toward nearest before clamping (matches C's c + 0.5).
+        if not np.issubdtype(data.dtype, np.integer):
+            data = np.where(data < 0, data - 0.5, data + 0.5)
+        return np.clip(data, info.min, info.max).astype(np_dtype, copy=False)
+    return data.astype(np_dtype, copy=False)
+
+
+def _stream_csr_to_zdata(csr, out_dir, subdir, block_rows, max_rows, row_offset,
+                         dtype="uint16", zstd_level=1):
+    """Stream a CSR matrix straight into mtx_to_zdata over a binary COO pipe.
+
+    No intermediate .mtx file ever touches disk. The C tool writes
+    ``{out_dir}/{subdir}/{N}.bin`` for local chunk indices N = 0, 1, ...
+    (numbered from 0 within this invocation). ``row_offset`` is baked into the
+    block headers so chunk start-rows are globally correct.
+
+    Args:
+        csr: scipy CSR matrix (one super-chunk of aligned rows).
+        out_dir: zdata output directory (created if needed).
+        subdir: "X_RM" or "X_CM".
+        block_rows: rows per compressed block.
+        max_rows: rows per chunk file.
+        row_offset: global index of this super-chunk's first row.
+        dtype: value dtype name.
+        zstd_level: zstd compression level (1-22; 1 = fastest/largest).
+
+    Returns:
+        Sorted list of produced .bin Path objects (local numbering).
+    """
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype '{dtype}'. Supported: {sorted(SUPPORTED_DTYPES)}")
+
+    bin_path = _get_mtx_to_zdata_path()
+
+    csr = csr.tocsr()
+    csr.sort_indices()
+    nrows, ncols = csr.shape
+    nnz = int(csr.nnz)
+    coo = csr.tocoo()
+
+    rows_i32 = np.ascontiguousarray(coo.row, dtype="<i4")
+    cols_i32 = np.ascontiguousarray(coo.col, dtype="<i4")
+    vals = np.ascontiguousarray(_coo_values_for_dtype(coo.data, dtype))
+
+    cmd = [bin_path, "--binary"]
+    if zstd_level != 1:
+        cmd += ["--level", str(int(zstd_level))]
+    if dtype != "uint16":
+        cmd += ["--dtype", dtype]
+    cmd += ["-", str(out_dir), str(block_rows), str(max_rows), str(int(row_offset)), subdir]
+
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+
+    err_box = {}
+
+    def _feed():
+        w = proc.stdin
+        try:
+            w.write(b"%%MatrixMarket matrix coordinate integer general\n")
+            w.write(f"{nrows} {ncols} {nnz}\n".encode())
+            # write each SoA array in slices to keep transient buffers small
+            for arr in (rows_i32, cols_i32, vals):
+                view = memoryview(arr).cast("B")
+                step = 64 * 1024 * 1024  # 64 MB
+                for off in range(0, len(view), step):
+                    w.write(view[off:off + step])
+        except BrokenPipeError as e:
+            err_box["e"] = e
+        except Exception as e:  # noqa: BLE001 - surfaced to caller below
+            err_box["e"] = e
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=_feed, daemon=True)
+    feeder.start()
+    tool_output = proc.stdout.read()
+    proc.stdout.close()
+    rc = proc.wait()
+    feeder.join()
+
+    if rc != 0:
+        raise RuntimeError(
+            f"mtx_to_zdata (streaming) failed with return code {rc}\n"
+            f"{tool_output.decode(errors='replace')}"
+        )
+    if "e" in err_box:
+        raise RuntimeError(
+            f"streaming writer failed: {err_box['e']}\n{tool_output.decode(errors='replace')}"
+        )
+
+    chunk_dir = Path(out_dir) / subdir
+    return sorted(chunk_dir.glob("*.bin"), key=lambda p: int(p.stem))
 
 def _get_mtx_to_zdata_path():
     """Get the path to mtx_to_zdata executable, with validation."""
