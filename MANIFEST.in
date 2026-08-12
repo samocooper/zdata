@@ -4,6 +4,14 @@
 include ctools/*.c
 include ctools/*.h
 
+# Bundled Zstandard sources (official single-file amalgamation + the
+# seekable-format code from zstd's contrib/, which no system libzstd ships).
+# These make the package build with only a C compiler -- no ZSTD_BASE, no
+# system packages -- so the sdist is genuinely installable everywhere.
+recursive-include ctools/vendor *.c
+recursive-include ctools/vendor *.h
+include build_ctools.py
+
 # Include README, LICENSE and changelog
 include README.md
 include LICENSE

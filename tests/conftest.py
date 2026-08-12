@@ -51,47 +51,25 @@ def _ensure_fixtures() -> None:
 def _ensure_ctools() -> None:
     """Compile the C tools if they are not already present.
 
-    The binaries are build artifacts and are not committed, so a fresh clone has
-    only the sources. Building them here means ``git clone && pytest`` works
-    without a separate install step. Requires ``ZSTD_BASE``; without it the
-    tests that need the tools skip with a clear message rather than erroring.
+    The binaries are build artifacts and are not committed, so a fresh clone
+    has only sources. zstd is bundled under ctools/vendor, so this needs
+    nothing but a C compiler -- ``git clone && pytest`` works with no setup.
     """
-    import subprocess
+    from build_ctools import binary_name, compile_c_tools
 
     ctools = _project_root / "ctools"
-    mtx_bin, read_bin = ctools / "mtx_to_zdata", ctools / "zdata_read"
-    if mtx_bin.exists() and read_bin.exists():
+    if all((ctools / binary_name(s)).exists()
+           for s in ("mtx_to_zdata", "zdata_read")):
         return
 
-    zstd = os.environ.get("ZSTD_BASE")
-    if not zstd or not Path(zstd).exists():
-        print("\n[conftest] C tools not built and ZSTD_BASE is unset -- tests "
-              "needing them will skip. See tests/README.md.", flush=True)
-        return
-
-    zstd = Path(zstd)
-    common = ["gcc", "-O2", "-Wall", f"-I{ctools}", f"-I{zstd / 'lib'}",
-              f"-I{zstd / 'lib' / 'common'}",
-              f"-I{zstd / 'contrib' / 'seekable_format'}"]
-    xxhash = str(zstd / "lib" / "common" / "xxhash.c")
-    libzstd = str(zstd / "lib" / "libzstd.a")
-    seekable = zstd / "contrib" / "seekable_format"
-
-    print("\n[conftest] compiling C tools (one-off)...", flush=True)
-    for out, src, extra in (
-        (mtx_bin, ctools / "mtx_to_zdata.c", seekable / "zstdseek_compress.c"),
-        (read_bin, ctools / "zdata_read.c", seekable / "zstdseek_decompress.c"),
-    ):
-        r = subprocess.run(common + ["-o", str(out), str(src), str(extra),
-                                     xxhash, libzstd],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"[conftest] failed to build {out.name}:\n{r.stderr[:800]}",
-                  flush=True)
-            return
+    print("\n[conftest] compiling bundled C tools (one-off)...", flush=True)
+    if not compile_c_tools(ctools, verbose=False):
+        print("[conftest] C tool build failed -- tests needing them will skip. "
+              "A C compiler (gcc/clang) is required.", flush=True)
 
 
 sys.path.insert(0, str(_test_dir))
+sys.path.insert(0, str(_project_root))
 _ensure_ctools()
 _ensure_fixtures()
 

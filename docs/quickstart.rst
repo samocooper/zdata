@@ -16,11 +16,11 @@ compiling the C tools)::
 
     git clone <repository-url> zdata
     cd zdata
-    export ZSTD_BASE=/path/to/zstd
     pip install -e .
 
 The C tools (``mtx_to_zdata``, ``zdata_read``) are compiled automatically during
-installation when ``ZSTD_BASE`` is set. Pre-compiled binaries are included in PyPI
+installation from the bundled Zstandard sources; only a C compiler is
+required. Pre-compiled binaries are included in PyPI
 wheels.
 
 

@@ -58,83 +58,25 @@ def zdata_read_src(ctools_dir: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
-def compiled_tools(zstd_base: Path | None, mtx_to_zdata_src: Path, zdata_read_src: Path, tmp_path_factory):
-    """Compile C tools and return paths to binaries."""
-    if zstd_base is None:
-        pytest.skip("ZSTD base directory not found. Set ZSTD_BASE environment variable.")
+def compiled_tools(tmp_path_factory):
+    """Compile the C tools into a temp dir and return their paths.
 
-    # Create temporary directory for compiled binaries
+    Uses build_ctools, which builds against the bundled zstd sources, so this
+    no longer needs an external zstd tree (these tests used to skip whenever
+    ZSTD_BASE was unset -- a silent hole in coverage of the compression layer).
+    """
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).parent.parent.parent))
+    from build_ctools import binary_name, compile_c_tools
+
     bin_dir = tmp_path_factory.mktemp("ctools_bin")
-    mtx_bin = bin_dir / "mtx_to_zdata"
-    read_bin = bin_dir / "zdata_read"
-
-    zstd_include = zstd_base / "lib"
-    zstd_common = zstd_base / "lib" / "common"
-    zstd_seekable = zstd_base / "contrib" / "seekable_format"
-    zstd_lib = zstd_base / "lib" / "libzstd.a"
-
-    # Check required files exist
-    required_files = [
-        zstd_lib,
-        zstd_seekable / "zstdseek_compress.c",
-        zstd_seekable / "zstdseek_decompress.c",
-        zstd_base / "lib" / "common" / "xxhash.c",
-    ]
-
-    for req_file in required_files:
-        if not req_file.exists():
-            pytest.skip(f"Required ZSTD file not found: {req_file}")
-
-    # Compile mtx_to_zdata
-    mtx_compile_cmd = [
-        "gcc",
-        "-O2",
-        "-Wall",
-        f"-I{zstd_include}",
-        f"-I{zstd_common}",
-        f"-I{zstd_seekable}",
-        "-o",
-        str(mtx_bin),
-        str(mtx_to_zdata_src),
-        str(zstd_seekable / "zstdseek_compress.c"),
-        str(zstd_base / "lib" / "common" / "xxhash.c"),
-        str(zstd_lib),
-    ]
-
-    result = subprocess.run(mtx_compile_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        pytest.fail(
-            f"Failed to compile mtx_to_zdata:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
-
-    # Compile zdata_read
-    read_compile_cmd = [
-        "gcc",
-        "-O2",
-        "-Wall",
-        f"-I{zstd_include}",
-        f"-I{zstd_common}",
-        f"-I{zstd_seekable}",
-        "-o",
-        str(read_bin),
-        str(zdata_read_src),
-        str(zstd_seekable / "zstdseek_decompress.c"),
-        str(zstd_base / "lib" / "common" / "xxhash.c"),
-        str(zstd_lib),
-    ]
-
-    result = subprocess.run(read_compile_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        pytest.fail(
-            f"Failed to compile zdata_read:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
-
-    # Make executables
-    os.chmod(mtx_bin, 0o755)
-    os.chmod(read_bin, 0o755)
-
-    return {"mtx_to_zdata": mtx_bin, "zdata_read": read_bin}
-
+    if not compile_c_tools(bin_dir, verbose=False):
+        pytest.skip("could not compile the bundled C tools (needs gcc/clang)")
+    return {
+        "mtx_to_zdata": bin_dir / binary_name("mtx_to_zdata"),
+        "zdata_read": bin_dir / binary_name("zdata_read"),
+    }
 
 @pytest.fixture(scope="module")
 def sample_mtx_file(tmp_path_factory) -> Path:

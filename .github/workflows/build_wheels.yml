@@ -10,6 +10,10 @@ on:
 env:
   CIBW_BEFORE_BUILD: "pip install -U pip setuptools wheel"
   CIBW_BUILD_VERBOSITY: 1
+  # The wheel tag is py3-none-<platform>: the bundled tools are standalone
+  # executables with no Python ABI dependency, so one wheel per platform covers
+  # every supported interpreter. Building more would just collide on filename.
+  CIBW_BUILD: "cp312-*"
 
 jobs:
   build_wheels:
@@ -28,61 +32,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.12'
 
       - name: Install cibuildwheel
         run: |
           python -m pip install cibuildwheel
 
-      - name: Set up ZSTD for Linux
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          # Install ZSTD development libraries
-          sudo apt-get update
-          sudo apt-get install -y libzstd-dev zstd
-          
-          # Clone and build ZSTD from source (needed for static linking)
-          git clone https://github.com/facebook/zstd.git /tmp/zstd
-          cd /tmp/zstd
-          make -j$(nproc)
-          echo "ZSTD_BASE=/tmp/zstd" >> $GITHUB_ENV
 
-      - name: Set up ZSTD for macOS
-        if: matrix.os == 'macos-latest'
-        run: |
-          # Install ZSTD via Homebrew
-          brew install zstd
-          
-          # Clone and build ZSTD from source
-          git clone https://github.com/facebook/zstd.git /tmp/zstd
-          cd /tmp/zstd
-          make -j$(sysctl -n hw.ncpu)
-          echo "ZSTD_BASE=/tmp/zstd" >> $GITHUB_ENV
 
-      - name: Set up ZSTD for Windows
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          # Install Git for Windows if not already available
-          # Clone and build ZSTD from source
-          git clone https://github.com/facebook/zstd.git C:\zstd
-          cd C:\zstd
-          # Build using Visual Studio or MinGW
-          # For now, we'll use a pre-built approach or MSBuild
-          # This may need adjustment based on your Windows build environment
-          echo "ZSTD_BASE=C:\zstd" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build wheels
         env:
           CIBW_BEFORE_BUILD: "pip install -U pip setuptools wheel"
         run: |
-          # Pass ZSTD_BASE to cibuildwheel (set in previous step via GITHUB_ENV)
-          if [ "${{ matrix.os }}" == "ubuntu-latest" ] || [ "${{ matrix.os }}" == "macos-latest" ]; then
-            export CIBW_ENVIRONMENT_LINUX="ZSTD_BASE=${ZSTD_BASE}"
-            export CIBW_ENVIRONMENT_MACOS="ZSTD_BASE=${ZSTD_BASE}"
-          elif [ "${{ matrix.os }}" == "windows-latest" ]; then
-            export CIBW_ENVIRONMENT_WINDOWS="ZSTD_BASE=${ZSTD_BASE}"
-          fi
+
           python -m cibuildwheel --output-dir wheelhouse
 
       - name: Upload wheels
@@ -100,24 +63,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.12'
 
       - name: Install build dependencies
         run: |
           python -m pip install build
 
-      - name: Set up ZSTD
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libzstd-dev zstd
-          git clone https://github.com/facebook/zstd.git /tmp/zstd
-          cd /tmp/zstd
-          make -j$(nproc)
-          echo "ZSTD_BASE=/tmp/zstd" >> $GITHUB_ENV
-
       - name: Build source distribution
-        env:
-          ZSTD_BASE: /tmp/zstd
         run: |
           python -m build --sdist --outdir dist
 

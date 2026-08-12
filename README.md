@@ -35,19 +35,15 @@ pip install zdata-py
 
 ### From source
 
-Requires the [Zstandard](https://github.com/facebook/zstd) library for compiling the C tools:
+Requires only a C compiler (gcc or clang) — the Zstandard sources are bundled:
 
 ```bash
-git clone https://github.com/facebook/zstd.git
-cd zstd && make lib && cd ..
-
 git clone <repository-url> zdata
 cd zdata
-export ZSTD_BASE=/path/to/zstd
 pip install -e .
 ```
 
-The C tools (`mtx_to_zdata`, `zdata_read`) are compiled automatically during installation when `ZSTD_BASE` is set. Pre-compiled binaries are included in PyPI wheels.
+The C tools (`mtx_to_zdata`, `zdata_read`) are compiled automatically during installation from the bundled Zstandard sources — only a C compiler is required. PyPI wheels ship them pre-built, so most users need no compiler at all.
 
 ---
 
@@ -273,9 +269,8 @@ my_dataset.zdata/
 
 ## Troubleshooting
 
-**C tools not found**: Set `ZSTD_BASE` to your zstd source directory and reinstall:
+**C tools not found**: the build needs a C compiler (gcc or clang). Install one and reinstall:
 ```bash
-export ZSTD_BASE=/path/to/zstd
 pip install -e . --force-reinstall
 ```
 
@@ -289,9 +284,10 @@ pip install -e . --force-reinstall
 
 ```bash
 pip install pytest pytest-xdist
-export ZSTD_BASE=/path/to/zstd
 pytest tests/ -v
 ```
+
+Test fixtures and the C tools are generated/compiled automatically on first run.
 
 ---
 

@@ -152,7 +152,7 @@ Some tests may be skipped if required dependencies are not available:
 The `test_ctools.py` module tests the C tools (`mtx_to_zdata.c` and `zdata_read.c`):
 
 ### Requirements
-- ZSTD library installed (set `ZSTD_BASE` environment variable to point to ZSTD source directory)
+- A C compiler (gcc or clang). Zstandard sources are bundled; no `ZSTD_BASE` needed.
 - GCC compiler available
 - ZSTD source files in expected locations
 
@@ -173,7 +173,7 @@ pytest tests/test_core/test_ctools.py
 # Run specific test class
 pytest tests/test_core/test_ctools.py::TestCToolsCompilation
 
-# Run with ZSTD_BASE environment variable
+# Optional: build against your own zstd tree instead of the bundled sources
 ZSTD_BASE=/path/to/zstd pytest tests/test_core/test_ctools.py
 ```
 
@@ -216,15 +216,10 @@ Two constraints are worth knowing before editing the generator:
   to the lowest value that keeps every slab populated; it is the dominant driver
   of fixture size.
 
-## Running the C tool tests
+## C tools
 
-The 11 tests in `test_core/test_ctools.py` compile the C tools from source and
-**skip silently** unless a Zstandard source tree is available:
+The C tools are compiled automatically on the first test run, using the
+Zstandard sources bundled under `ctools/vendor/`. Only a C compiler is needed —
+there is no `ZSTD_BASE` to set and no system package to install.
 
-```bash
-export ZSTD_BASE=/path/to/zstd     # see scripts/build_zstd.sh
-pytest tests/
-```
-
-Without it you will see `11 skipped` and a green run that has not exercised the
-compression layer at all.
+Set `ZSTD_BASE` only if you want to build against your own zstd tree instead.

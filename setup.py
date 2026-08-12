@@ -6,10 +6,19 @@ import subprocess
 import sys
 import warnings
 from pathlib import Path
+# The build backend runs setup.py from an isolated environment where the
+# project root is not on sys.path, so make our own helper importable.
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
 from setuptools import setup, find_packages
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
 from setuptools.dist import Distribution
+
+try:  # setuptools >= 70 vendors bdist_wheel; older installs use the wheel pkg
+    from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:  # pragma: no cover
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 class BinaryDistribution(Distribution):
@@ -17,18 +26,39 @@ class BinaryDistribution(Distribution):
 
     This package ships compiled C tools but declares no ext_modules, so
     setuptools would otherwise consider it pure Python and tag every wheel
-    ``py3-none-any``. That tag claims the wheel works on any platform, while
-    the wheel actually contains a binary for whichever platform built it --
-    so a macOS or Windows user would receive a Linux executable and hit
-    "Exec format error" at runtime.
-
-    Returning True here gives wheels a platform tag (e.g.
-    ``py3-none-linux_x86_64``), so each platform's wheel is a distinct file
-    and pip resolves the right one.
+    ``py3-none-any``. That tag claims the wheel works everywhere, while the
+    wheel actually contains a binary for whichever platform built it -- a macOS
+    or Windows user would receive a Linux executable and hit "Exec format
+    error" at runtime. Worse, all three platform builds would share one
+    filename, so only the first upload to an index survives.
     """
 
     def has_ext_modules(self):  # noqa: D102
         return True
+
+
+class BdistWheelPlatform(_bdist_wheel):
+    """Tag wheels platform-specific but Python-agnostic: ``py3-none-<plat>``.
+
+    The compiled tools are standalone executables invoked as subprocesses, not
+    CPython extension modules -- they link against no Python ABI. So the wheel
+    must vary by *platform* but not by Python version.
+
+    Without this, ``has_ext_modules`` alone yields ``cp312-cp312-<plat>``,
+    which pins each wheel to one interpreter version: a 3.11 or 3.13 user would
+    miss the wheel entirely and fall back to building the sdist from source
+    (requiring gcc and a ZSTD tree). One wheel per platform covers every
+    supported Python instead, which is how other packages shipping standalone
+    binaries (ruff, cmake, ninja) tag theirs.
+    """
+
+    def finalize_options(self):  # noqa: D102
+        super().finalize_options()
+        self.root_is_pure = False  # platform-specific, not a pure-Python wheel
+
+    def get_tag(self):  # noqa: D102
+        _python, _abi, plat = super().get_tag()
+        return "py3", "none", plat
 
 
 def find_zstd_base():
@@ -196,16 +226,15 @@ class BuildPyWithCTools(build_py):
         ctools_dir = project_root / "ctools"
         bin_dir = project_root / "ctools"
         
-        # Compile C tools (required)
-        zstd_base = find_zstd_base()
-        if not zstd_base:
+        # Compile C tools. zstd sources are bundled under ctools/vendor, so a
+        # C compiler is the only requirement; ZSTD_BASE remains an optional
+        # override for building against an external zstd tree.
+        from build_ctools import compile_c_tools as _compile
+        if not _compile(bin_dir):
             raise RuntimeError(
-                "ZSTD base directory not found. C tools are required for this package.\n"
-                "Set ZSTD_BASE environment variable to point to ZSTD source directory."
+                "Failed to compile the bundled C tools. A C compiler (gcc or "
+                "clang) is required."
             )
-        
-        print(f"Found ZSTD at: {zstd_base}")
-        compile_c_tools(zstd_base, ctools_dir, bin_dir)
         
         # Run standard build
         super().run()
@@ -267,13 +296,8 @@ class InstallWithCTools(install):
             bin_dir.mkdir(parents=True, exist_ok=True)
         
         # Try to compile C tools
-        zstd_base = find_zstd_base()
-        compiled = False
-        
-        if zstd_base:
-            print(f"Found ZSTD at: {zstd_base}")
-            print("Compiling C tools from source...")
-            compiled = compile_c_tools(zstd_base, project_root / "ctools", bin_dir, raise_on_error=False)
+        from build_ctools import compile_c_tools as _compile
+        compiled = _compile(bin_dir, verbose=True)
         
         # If compilation failed or ZSTD not found, try to use pre-compiled binaries
         if not compiled:
@@ -365,6 +389,7 @@ setup(
     url="",  # Add project URL if desired (e.g., GitHub repository)
     license="MIT",
     packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
+    py_modules=["build_ctools"],
     package_dir={"zdata": "."},
     distclass=BinaryDistribution,
     include_package_data=True,
@@ -415,6 +440,7 @@ setup(
     },
     cmdclass={
         "build_py": BuildPyWithCTools,
+        "bdist_wheel": BdistWheelPlatform,
         "install": InstallWithCTools,
     },
     classifiers=[

@@ -16,10 +16,20 @@
 
 - The compiled C tools (`ctools/mtx_to_zdata`, `ctools/zdata_read`) are no
   longer tracked in git. They are build artifacts; `setup.py` compiles them on
-  install, and the test-suite compiles them on demand when `ZSTD_BASE` is set.
+  install and the test-suite compiles them on demand.
 
 ### Added
 
+- **Zstandard sources are now bundled** (`ctools/vendor/`): the official
+  single-file amalgamation plus the seekable-format code from zstd's
+  `contrib/`, which no system libzstd ships. Building needs only a C compiler
+  — `ZSTD_BASE` is no longer required (it remains an optional override for
+  building against your own zstd tree).
+
+  This makes the sdist genuinely installable anywhere, removes the zstd build
+  step from CI, and closes a silent coverage hole: the 11 C-tool tests used to
+  skip whenever `ZSTD_BASE` was unset, so a green run could mean the
+  compression layer was never exercised.
 - **`float16`** support (on-disk version 12), giving full `float16`/`float32`/
   `float64` coverage alongside all eight integer widths. The C implementation
   uses native `_Float16` where available with a portable bit-level fallback;
@@ -43,6 +53,13 @@
 
 - `MANIFEST.in` now ships `ctools/*.h`; without it the generated header was
   missing from an sdist and compilation failed.
+- Wheels are tagged `py3-none-<platform>` rather than `py3-none-any`. The
+  package ships compiled tools but declares no `ext_modules`, so setuptools
+  treated it as pure Python — every platform's wheel would have carried the
+  same name while containing a different binary, so only one could exist on an
+  index and the other platforms would receive an executable they cannot run.
+- Compiled binaries are no longer bundled into the sdist, where a
+  cross-platform install could pick one up and report success.
 - Python 3.11 compatibility: replaced PEP 695 generic syntax, which is 3.12+
   only, while the package declares `python_requires=">=3.11"`.
 
