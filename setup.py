@@ -347,6 +347,20 @@ setup(
     packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
     package_dir={"zdata": "."},
     include_package_data=True,
+    # Never ship compiled binaries in an sdist. include_package_data sweeps in
+    # whatever sits under a package directory, so a maintainer who has run the
+    # test-suite (which compiles the tools) would otherwise bundle their local
+    # binaries into the source distribution. On another platform setup.py's
+    # pre-compiled fallback would then install a binary that cannot execute
+    # there, reporting success and failing later with "Exec format error"
+    # instead of a clear "install ZSTD" message.
+    #
+    # Platform wheels, built and tagged per-platform by cibuildwheel, are where
+    # pre-built binaries belong.
+    exclude_package_data={
+        "": ["ctools/mtx_to_zdata", "ctools/zdata_read",
+             "ctools/mtx_to_zdata.exe", "ctools/zdata_read.exe"],
+    },
     python_requires=">=3.11",
     install_requires=[
         "numpy>=1.20.0",

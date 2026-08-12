@@ -37,11 +37,8 @@ global-exclude *.so
 global-exclude *.dylib
 global-exclude *.dll
 
-# NOTE: `exclude ctools/mtx_to_zdata` does NOT work here -- include_package_data
-# sweeps the file in regardless. The real guard is that the binaries are
-# untracked and gitignored, so a clean checkout (as CI uses) has none to sweep.
-#
-# Caveat for maintainers: building an sdist in a working tree where you have
-# already run the tests WILL bundle your local binaries. Build releases from a
-# clean checkout, and check with:
+# NOTE: MANIFEST `exclude` directives do NOT keep the binaries out --
+# include_package_data sweeps them in from the package directory regardless.
+# The working mechanism is exclude_package_data in setup.py; see the comment
+# there. Verify a release with:
 #     tar tzf dist/*.tar.gz | grep -E 'ctools/(mtx_to_zdata|zdata_read)$'
