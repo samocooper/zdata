@@ -16,8 +16,10 @@ tests/
 ├── test_index/              # Indexing tests
 │   └── test_normalize_indices.py  # Index normalization tests
 ├── test_full_pipeline_at_scale.py  # Large-scale pipeline tests (external data)
-├── zarr_test_dir/           # Test zarr data files
-└── h5ad_test_dir/           # Test h5ad data files (.h5/.hdf5)
+├── make_fixtures.py         # Generates the synthetic fixtures below
+├── zarr_test_dir/           # GENERATED - not committed
+├── mtx_test_dir/            # GENERATED - not committed
+└── h5ad_test_dir/           # GENERATED - not committed
 ```
 
 ## H5AD File Support
@@ -181,3 +183,48 @@ Tests should be runnable in CI environments. Ensure:
 - All required dependencies are in `pyproject.toml`
 - Tests don't require external data unless explicitly marked
 - Tests are deterministic (use seeds for random operations)
+
+## Test fixtures
+
+The fixture directories (`zarr_test_dir/`, `mtx_test_dir/`, `h5ad_test_dir/`)
+are **generated, not committed**. `conftest.py` builds them automatically on the
+first test run, so no setup is needed:
+
+```bash
+pytest tests/          # fixtures are created if missing
+```
+
+To regenerate them explicitly (after changing `make_fixtures.py`):
+
+```bash
+python tests/make_fixtures.py
+```
+
+The data is entirely synthetic — random counts with generated barcodes, study
+names and sample identifiers. Nothing derives from a real dataset, so the
+repository carries no third-party expression data and a clone stays small
+(~1.7 MB tracked, versus ~93 MB when fixtures were committed).
+
+Two constraints are worth knowing before editing the generator:
+
+- **Gene symbols must be real**, taken from `files/2ks10c_genes.txt`. The build
+  pipeline aligns every dataset to that reference and drops unknown symbols, so
+  invented names produce an all-zero matrix and the build fails with
+  `matrix has no non-zero elements`.
+- **Genes must span the whole reference**, not a prefix. The column-major build
+  processes fixed-width gene slabs and errors on an empty one. `DENSITY` is set
+  to the lowest value that keeps every slab populated; it is the dominant driver
+  of fixture size.
+
+## Running the C tool tests
+
+The 11 tests in `test_core/test_ctools.py` compile the C tools from source and
+**skip silently** unless a Zstandard source tree is available:
+
+```bash
+export ZSTD_BASE=/path/to/zstd     # see scripts/build_zstd.sh
+pytest tests/
+```
+
+Without it you will see `11 skipped` and a green run that has not exercised the
+compression layer at all.

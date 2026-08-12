@@ -26,6 +26,76 @@ sys.path.insert(0, str(_parent_dir))
 from zdata.core import ZData
 
 
+def _ensure_fixtures() -> None:
+    """Generate the synthetic test fixtures if they are not present.
+
+    Fixtures are **not** committed: they are ~17 MB of generated data that would
+    otherwise be carried by every clone, and regenerating them is deterministic
+    (fixed seed) and takes a few seconds. See ``tests/make_fixtures.py``.
+    """
+    needed = [
+        (_test_dir / "zarr_test_dir", "*.zarr"),
+        (_test_dir / "h5ad_test_dir", "*.h5"),
+        (_test_dir / "mtx_test_dir", "*"),
+    ]
+    if all(d.exists() and any(d.glob(pat)) for d, pat in needed):
+        return
+
+    print("\n[conftest] generating synthetic test fixtures "
+          "(one-off; see tests/make_fixtures.py)...", flush=True)
+    import make_fixtures  # same directory, added to sys.path below
+
+    make_fixtures.main()
+
+
+def _ensure_ctools() -> None:
+    """Compile the C tools if they are not already present.
+
+    The binaries are build artifacts and are not committed, so a fresh clone has
+    only the sources. Building them here means ``git clone && pytest`` works
+    without a separate install step. Requires ``ZSTD_BASE``; without it the
+    tests that need the tools skip with a clear message rather than erroring.
+    """
+    import subprocess
+
+    ctools = _project_root / "ctools"
+    mtx_bin, read_bin = ctools / "mtx_to_zdata", ctools / "zdata_read"
+    if mtx_bin.exists() and read_bin.exists():
+        return
+
+    zstd = os.environ.get("ZSTD_BASE")
+    if not zstd or not Path(zstd).exists():
+        print("\n[conftest] C tools not built and ZSTD_BASE is unset -- tests "
+              "needing them will skip. See tests/README.md.", flush=True)
+        return
+
+    zstd = Path(zstd)
+    common = ["gcc", "-O2", "-Wall", f"-I{ctools}", f"-I{zstd / 'lib'}",
+              f"-I{zstd / 'lib' / 'common'}",
+              f"-I{zstd / 'contrib' / 'seekable_format'}"]
+    xxhash = str(zstd / "lib" / "common" / "xxhash.c")
+    libzstd = str(zstd / "lib" / "libzstd.a")
+    seekable = zstd / "contrib" / "seekable_format"
+
+    print("\n[conftest] compiling C tools (one-off)...", flush=True)
+    for out, src, extra in (
+        (mtx_bin, ctools / "mtx_to_zdata.c", seekable / "zstdseek_compress.c"),
+        (read_bin, ctools / "zdata_read.c", seekable / "zstdseek_decompress.c"),
+    ):
+        r = subprocess.run(common + ["-o", str(out), str(src), str(extra),
+                                     xxhash, libzstd],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[conftest] failed to build {out.name}:\n{r.stderr[:800]}",
+                  flush=True)
+            return
+
+
+sys.path.insert(0, str(_test_dir))
+_ensure_ctools()
+_ensure_fixtures()
+
+
 @pytest.fixture(scope="session")
 def test_data_dir() -> Path:
     """Get the test data directory path."""
@@ -182,10 +252,12 @@ def zdata_instance(zarr_test_dir: Path, tmp_path_factory) -> ZData:
     read_bin = project_root / "ctools" / "zdata_read"
     
     if not mtx_bin.exists() or not read_bin.exists():
-        pytest.fail(
-            f"C tools not found. Expected: {mtx_bin}, {read_bin}. "
-            f"Please compile the C tools first. "
-            f"Run: cd {project_root} && export ZSTD_BASE=/path/to/zstd && python setup.py build_py"
+        # Missing build tools are an environment gap, not a test failure: skip
+        # so a fresh clone without ZSTD reports honestly instead of erroring.
+        pytest.skip(
+            "C tools not built. Set ZSTD_BASE=/path/to/zstd and re-run "
+            "(conftest compiles them automatically), or run "
+            "`python setup.py build_py`. See tests/README.md."
         )
     
     from zdata.build_zdata.build_zdata import build_zdata_from_zarr
@@ -277,10 +349,12 @@ def zdata_instance_h5ad(h5ad_test_dir: Path, tmp_path_factory) -> ZData:
     read_bin = project_root / "ctools" / "zdata_read"
     
     if not mtx_bin.exists() or not read_bin.exists():
-        pytest.fail(
-            f"C tools not found. Expected: {mtx_bin}, {read_bin}. "
-            f"Please compile the C tools first. "
-            f"Run: cd {project_root} && export ZSTD_BASE=/path/to/zstd && python setup.py build_py"
+        # Missing build tools are an environment gap, not a test failure: skip
+        # so a fresh clone without ZSTD reports honestly instead of erroring.
+        pytest.skip(
+            "C tools not built. Set ZSTD_BASE=/path/to/zstd and re-run "
+            "(conftest compiles them automatically), or run "
+            "`python setup.py build_py`. See tests/README.md."
         )
     
     from zdata.build_zdata.build_zdata import build_zdata_from_zarr

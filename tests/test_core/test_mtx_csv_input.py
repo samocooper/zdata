@@ -41,9 +41,10 @@ def zdata_instance_mtx_csv(mtx_test_dir: Path, tmp_path_factory) -> ZData:
     read_bin = project_root / "ctools" / "zdata_read"
 
     if not mtx_bin.exists() or not read_bin.exists():
-        pytest.fail(
-            f"C tools not found at {mtx_bin} / {read_bin}. "
-            f"Please compile C tools first."
+        # Environment gap, not a test failure -- see conftest._ensure_ctools.
+        pytest.skip(
+            "C tools not built. Set ZSTD_BASE=/path/to/zstd and re-run "
+            "(conftest compiles them automatically). See tests/README.md."
         )
 
     tmp_path = tmp_path_factory.mktemp("zdata_test_mtx_csv")
@@ -97,8 +98,8 @@ class TestDiscovery:
     def test_discover_directory_names(self, mtx_test_dir: Path):
         dirs = discover_mtx_csv_directories(str(mtx_test_dir))
         names = [d.name for d in dirs]
-        assert "31273297_test" in names
-        assert "35504286_test" in names
+        assert "synthetic_00_test" in names
+        assert "synthetic_04_test" in names
 
     def test_discover_nonexistent_raises(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):
