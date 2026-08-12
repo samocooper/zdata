@@ -18,12 +18,16 @@ recursive-include build_zdata *.py
 recursive-include ctools *.c
 recursive-include ctools *.h
 
-# Include pre-compiled binaries if they exist (for fallback)
-# Platform-specific binaries
-include ctools/mtx_to_zdata
-include ctools/mtx_to_zdata.exe
-include ctools/zdata_read
-include ctools/zdata_read.exe
+# Compiled binaries are deliberately NOT shipped in the sdist.
+#
+# An sdist is compiled on the target platform, so a bundled binary is at best
+# redundant and at worst harmful: setup.py falls back to a pre-compiled binary
+# when ZSTD is unavailable, and on a different platform that fallback would
+# happily install a binary that cannot execute there ("Exec format error"),
+# instead of failing with a clear "install ZSTD" message.
+#
+# Platform wheels (built by cibuildwheel, correctly tagged per platform) are
+# where pre-built binaries belong.
 
 # Exclude compiled binaries from git (but include in distribution)
 global-exclude *.pyc
