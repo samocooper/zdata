@@ -10,6 +10,8 @@ include ctools/*.h
 # system packages -- so the sdist is genuinely installable everywhere.
 recursive-include ctools/vendor *.c
 recursive-include ctools/vendor *.h
+include ctools/vendor/LICENSE-zstd
+include ctools/vendor/README.md
 include build_ctools.py
 
 # Include README, LICENSE and changelog

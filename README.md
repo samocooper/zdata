@@ -293,4 +293,10 @@ Test fixtures and the C tools are generated/compiled automatically on first run.
 
 ## License
 
+zdata is MIT licensed. It bundles [Zstandard](https://github.com/facebook/zstd)
+sources under `ctools/vendor/` (BSD-3-Clause; see `ctools/vendor/LICENSE-zstd`),
+so that building requires only a C compiler.
+
+### zdata licence
+
 MIT. See the [LICENSE](LICENSE) file for details.
