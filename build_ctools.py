@@ -64,6 +64,12 @@ def compile_c_tools(bin_dir: Path, cc: str | None = None,
     bin_dir.mkdir(parents=True, exist_ok=True)
     cc = cc or os.environ.get("CC") or "gcc"
 
+    # zstd's amalgamation includes its thread pool (POOL_create/pthread_create).
+    # glibc >= 2.34 folds pthread into libc so this links without a flag, but
+    # older glibc (manylinux_2_28) and other libcs need it explicitly. Harmless
+    # where it is already implied.
+    thread_flags = [] if sys.platform == "win32" else ["-pthread"]
+
     zstd_base = os.environ.get("ZSTD_BASE")
     use_external = bool(zstd_base) and (Path(zstd_base) / "lib" / "libzstd.a").exists()
 
@@ -85,7 +91,7 @@ def compile_c_tools(bin_dir: Path, cc: str | None = None,
 
     for stem, tool_src, seek_src in TOOLS:
         out = bin_dir / binary_name(stem)
-        cmd = ([cc, "-O2", "-Wall"] + includes + ["-o", str(out)]
+        cmd = ([cc, "-O2", "-Wall"] + thread_flags + includes + ["-o", str(out)]
                + [str(CTOOLS_DIR / tool_src), str(seek_dir / seek_src)]
                + common_extra)
         if verbose:

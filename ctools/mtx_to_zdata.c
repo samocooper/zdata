@@ -5,6 +5,16 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/stat.h>
+
+/* Portable directory creation. POSIX mkdir() takes a mode; the Windows CRT
+   _mkdir() takes only the path, so calling mkdir(path, 0755) fails to compile
+   there ("too many arguments to function 'mkdir'"). */
+#ifdef _WIN32
+#  include <direct.h>
+#  define ZDATA_MKDIR(path) _mkdir(path)
+#else
+#  define ZDATA_MKDIR(path) mkdir((path), 0755)
+#endif
 #include <sys/types.h>
 #include <float.h>
 #include <math.h>
@@ -791,12 +801,12 @@ int main(int argc, char *argv[]) {
     /* Create output directories */
     char out_dir[1024];
     snprintf(out_dir, sizeof(out_dir), "%s", out_name);
-    if (mkdir(out_dir, 0755) != 0 && errno != EEXIST) { perror("mkdir"); fclose(f); return 1; }
+    if (ZDATA_MKDIR(out_dir) != 0 && errno != EEXIST) { perror("mkdir"); fclose(f); return 1; }
 
     char chunk_dir[2048];
     int n = snprintf(chunk_dir, sizeof(chunk_dir), "%s/%s", out_dir, subdir);
     if (n < 0 || n >= (int)sizeof(chunk_dir)) { fprintf(stderr, "Path too long\n"); fclose(f); return 1; }
-    if (mkdir(chunk_dir, 0755) != 0 && errno != EEXIST) { perror("mkdir subdir"); fclose(f); return 1; }
+    if (ZDATA_MKDIR(chunk_dir) != 0 && errno != EEXIST) { perror("mkdir subdir"); fclose(f); return 1; }
     printf("Output %s directory: %s\n", subdir, chunk_dir);
     printf("Output directory: %s\n", out_dir);
     fflush(stdout);

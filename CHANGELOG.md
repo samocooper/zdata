@@ -51,6 +51,12 @@
 
 ### Fixed
 
+- **Windows builds now compile.** `mtx_to_zdata.c` called POSIX
+  `mkdir(path, mode)`, but the Windows CRT `_mkdir` takes only a path, so the
+  file had never compiled there. Wrapped in a `ZDATA_MKDIR` macro.
+- **Linux builds link against pthread.** zstd's amalgamation includes its
+  thread pool; glibc >= 2.34 folds pthread into libc, but older glibc (as used
+  by manylinux) needs `-pthread` explicitly.
 - `MANIFEST.in` now ships `ctools/*.h`; without it the generated header was
   missing from an sdist and compilation failed.
 - Wheels are tagged `py3-none-<platform>` rather than `py3-none-any`. The
