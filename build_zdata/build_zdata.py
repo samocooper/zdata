@@ -40,6 +40,12 @@ def build_zdata_from_zarr(
     mtx_chunk_size: int = 131072,
     mtx_temp_dir: str = None,
     min_nnz: int | None = 300,
+    generate_sample_id: bool = True,
+    optimize_obs: bool = True,
+    generate_feature_presence: bool = True,
+    feature_presence_sample_col: str = "sample_id",
+    feature_presence_var_dirs: list = None,
+    strict_post_build: bool = False,
     # Backward-compatible alias
     zarr_dir: str = None,
 ):
@@ -358,7 +364,22 @@ def build_zdata_from_zarr(
         print(f"  ✓ {obs_output_filename}")
     if var_file.exists():
         print(f"  ✓ var.parquet")
-    
+
+    # Optional post-build steps (sample_id, obs dtype optimisation, feature
+    # presence). Shared with the MTX+CSV builder so the two cannot drift.
+    from zdata.build_zdata.post_build import run_post_build_steps
+    run_post_build_steps(
+        zdata_path,
+        obs_filename=obs_output_filename,
+        generate_sample_id=generate_sample_id,
+        optimize_obs=optimize_obs,
+        generate_feature_presence=generate_feature_presence,
+        feature_presence_sample_col=feature_presence_sample_col,
+        # zarr inputs carry no var.csv, so this must be supplied by the caller.
+        feature_presence_var_dirs=feature_presence_var_dirs,
+        strict=strict_post_build,
+    )
+
     return zdata_dir
 
 

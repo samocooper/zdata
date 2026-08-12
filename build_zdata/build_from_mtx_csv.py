@@ -573,6 +573,11 @@ def build_zdata_from_mtx_csv(
     min_nnz: int | None = 300,
     cm_slab_genes: int | None = None,
     zstd_level: int = 3,
+    generate_sample_id: bool = True,
+    optimize_obs: bool = True,
+    generate_feature_presence: bool = True,
+    feature_presence_sample_col: str = "sample_id",
+    strict_post_build: bool = False,
 ) -> Path:
     """
     Build a complete zdata object from a directory of MTX+CSV subdirectories.
@@ -701,6 +706,20 @@ def build_zdata_from_mtx_csv(
         d = zdata_dir / sub
         if d.exists():
             print(f"  ok {sub}/ ({len(list(d.glob('*.bin')))} chunk files)")
+
+    # Optional post-build steps, shared with the zarr builder. Unlike that path,
+    # the MTX input dirs are themselves the per-study var.csv source.
+    from zdata.build_zdata.post_build import run_post_build_steps
+    run_post_build_steps(
+        zdata_dir,
+        obs_filename=obs_output_filename,
+        generate_sample_id=generate_sample_id,
+        optimize_obs=optimize_obs,
+        generate_feature_presence=generate_feature_presence,
+        feature_presence_sample_col=feature_presence_sample_col,
+        feature_presence_var_dirs=[input_dir],
+        strict=strict_post_build,
+    )
 
     return zdata_dir
 
