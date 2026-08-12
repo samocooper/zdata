@@ -181,11 +181,11 @@ def compile_c_tools(zstd_base: Path, ctools_dir: Path, bin_dir: Path, raise_on_e
     try:
         print(f"Compiling mtx_to_zdata...")
         result = subprocess.run(mtx_cmd, capture_output=True, text=True, check=True)
-        print(f"✓ mtx_to_zdata compiled successfully")
+        print(f"[ok] mtx_to_zdata compiled successfully")
         
         print(f"Compiling zdata_read...")
         result = subprocess.run(read_cmd, capture_output=True, text=True, check=True)
-        print(f"✓ zdata_read compiled successfully")
+        print(f"[ok] zdata_read compiled successfully")
         
         # Verify binaries were created
         if not mtx_bin.exists():
@@ -341,7 +341,7 @@ class InstallWithCTools(install):
                     "2. Install from a distribution that includes pre-compiled binaries."
                 )
         else:
-            print("✓ C tools compiled successfully from source")
+            print("[ok] C tools compiled successfully from source")
         
         # Print warning at end if using pre-compiled binaries
         if self._using_precompiled:

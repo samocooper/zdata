@@ -63,9 +63,9 @@ def cleanup_created_files():
         if path.exists():
             try:
                 shutil.rmtree(path)
-                print(f"✓ Cleaned up: {path}")
+                print(f"[ok] Cleaned up: {path}")
             except Exception as e:
-                print(f"⚠ Warning: Could not clean up {path}: {e}")
+                print(f"[warn] Warning: Could not clean up {path}: {e}")
 
 
 def signal_handler(signum, frame):
@@ -168,7 +168,7 @@ def compile_c_tools():
     os.chmod(MTX_TO_ZDATA_BIN, 0o755)
     os.chmod(ZDATA_READ_BIN, 0o755)
     
-    print("\n✓ Both C tools compiled successfully!")
+    print("\n[ok] Both C tools compiled successfully!")
     return True
 
 def build_zdata_directory(input_dir, output_name, output_dir, file_type="auto"):
@@ -305,8 +305,8 @@ def build_zdata_directory(input_dir, output_name, output_dir, file_type="auto"):
             num_rows = metadata.get('nrows', 'unknown')
             num_cols = metadata.get('ncols', 'unknown')
         
-        print(f"\n✓ Successfully built {output_name_only}!")
-        print(f"  Matrix: {num_rows} rows × {num_cols} columns")
+        print(f"\n[ok] Successfully built {output_name_only}!")
+        print(f"  Matrix: {num_rows} rows x {num_cols} columns")
         
         if xrm_bin_files:
             print(f"  Row-major (X_RM): {len(xrm_bin_files)} chunk file(s)")
@@ -323,7 +323,7 @@ def build_zdata_directory(input_dir, output_name, output_dir, file_type="auto"):
         else:
             print(f"  WARNING: Obs/metadata file not found")
     except Exception as e:
-        print(f"\n✓ Successfully built {output_name_only}!")
+        print(f"\n[ok] Successfully built {output_name_only}!")
         if xrm_bin_files:
             print(f"  Row-major (X_RM): {len(xrm_bin_files)} chunk file(s)")
         if xcm_bin_files:
@@ -350,14 +350,14 @@ def run_tests(zdata_path):
     
     print(f"\nAvailable data:")
     if has_xrm:
-        print(f"  ✓ Row-major (X_RM): {len(list(xrm_dir.glob('*.bin')))} chunk file(s)")
+        print(f"  [ok] Row-major (X_RM): {len(list(xrm_dir.glob('*.bin')))} chunk file(s)")
     else:
-        print(f"  ✗ Row-major (X_RM): Not available")
+        print(f"  [error] Row-major (X_RM): Not available")
     
     if has_xcm:
-        print(f"  ✓ Column-major (X_CM): {len(list(xcm_dir.glob('*.bin')))} chunk file(s)")
+        print(f"  [ok] Column-major (X_CM): {len(list(xcm_dir.glob('*.bin')))} chunk file(s)")
     else:
-        print(f"  ✗ Column-major (X_CM): Not available (column-major tests will be skipped)")
+        print(f"  [error] Column-major (X_CM): Not available (column-major tests will be skipped)")
     
     all_passed = True
     
@@ -378,10 +378,10 @@ def run_tests(zdata_path):
         ]
         
         if not run_command(test_cmd, f"Running {test_file}", check=False):
-            print(f"✗ {test_file} failed!")
+            print(f"[error] {test_file} failed!")
             all_passed = False
         else:
-            print(f"✓ {test_file} passed!")
+            print(f"[ok] {test_file} passed!")
     
     return all_passed
 
@@ -433,19 +433,19 @@ def main():
     
     try:
         if not compile_c_tools():
-            print("\n✗ Pipeline failed at compilation step")
+            print("\n[error] Pipeline failed at compilation step")
             return 1
         
         build_success, actual_output_dir = build_zdata_directory(input_dir, output_name, output_dir, file_type)
         if not build_success:
-            print("\n✗ Pipeline failed at build step")
+            print("\n[error] Pipeline failed at build step")
             return 1
         
         if actual_output_dir is None:
             actual_output_dir = output_dir
         
         if not run_tests(str(actual_output_dir)):
-            print("\n✗ Pipeline failed at test step")
+            print("\n[error] Pipeline failed at test step")
             return 1
     except KeyboardInterrupt:
         print("\n\nPipeline interrupted by user")
@@ -457,9 +457,9 @@ def main():
         raise
     
     print_section("Pipeline Complete - All Steps Passed!")
-    print(f"\n✓ Compiled C tools")
-    print(f"✓ Built {actual_output_dir}")
-    print(f"✓ All tests passed (row-major and column-major)")
+    print(f"\n[ok] Compiled C tools")
+    print(f"[ok] Built {actual_output_dir}")
+    print(f"[ok] All tests passed (row-major and column-major)")
     
     if keep_output:
         print(f"\nYou can now use the .zdata directory:")

@@ -162,19 +162,19 @@ def build_zdata_from_zarr(
                     tmp_dir=None,
                     chunk_size=mtx_chunk_size
                 )
-                print(f"\n✓ Alignment complete! Manifest: {manifest_path}")
+                print(f"\n[ok] Alignment complete! Manifest: {manifest_path}")
             except Exception as e:
-                print(f"\n✗ ERROR in alignment step: {e}")
+                print(f"\n[error] ERROR in alignment step: {e}")
                 import traceback
                 traceback.print_exc()
                 if use_custom_mtx_dir:
-                    print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                    print(f"\n[warn] MTX files preserved in: {temp_mtx_dir}")
                     print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
                 raise
         else:
             # Reusing existing MTX files
             manifest_path = str(temp_mtx_dir / "manifest.json")
-            print(f"\n✓ Reusing existing MTX files from: {temp_mtx_dir}")
+            print(f"\n[ok] Reusing existing MTX files from: {temp_mtx_dir}")
             print(f"  Manifest: {manifest_path}")
         
         # Step 2: Build zdata from MTX files
@@ -193,13 +193,13 @@ def build_zdata_from_zarr(
             )
             # Convert to Path if not already
             zdata_dir = Path(zdata_dir)
-            print(f"\n✓ Zdata build complete! Output: {zdata_dir}")
+            print(f"\n[ok] Zdata build complete! Output: {zdata_dir}")
         except Exception as e:
-            print(f"\n✗ ERROR in zdata build step: {e}")
+            print(f"\n[error] ERROR in zdata build step: {e}")
             import traceback
             traceback.print_exc()
             if use_custom_mtx_dir:
-                print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                print(f"\n[warn] MTX files preserved in: {temp_mtx_dir}")
                 print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
             raise
         
@@ -264,11 +264,11 @@ def build_zdata_from_zarr(
                     row_nnz_files=row_nnz_files,  # Add row nnz values
                     min_nnz=min_nnz
                 )
-                print(f"\n✓ Obs concatenation complete! Output: {obs_output_path}")
+                print(f"\n[ok] Obs concatenation complete! Output: {obs_output_path}")
             else:
                 raise RuntimeError("No source files found in manifest. This indicates a problem with the alignment step.")
         except Exception as e:
-            print(f"\n✗ ERROR: Obs concatenation failed: {e}")
+            print(f"\n[error] ERROR: Obs concatenation failed: {e}")
             import traceback
             traceback.print_exc()
             raise  # Fail the build if obs concatenation fails
@@ -304,7 +304,7 @@ def build_zdata_from_zarr(
                     f"This indicates a mismatch in the alignment process."
                 )
             
-            print(f"  ✓ Loaded nnz for {len(column_nnz)} columns")
+            print(f"  [ok] Loaded nnz for {len(column_nnz)} columns")
             
             # Create var DataFrame with gene list and nnz column
             var_df = pl.DataFrame({
@@ -315,16 +315,16 @@ def build_zdata_from_zarr(
             
             var_output_path = zdata_dir / "var.parquet"
             var_df.write_parquet(str(var_output_path), compression="zstd")
-            print(f"\n✓ Gene list saved to var.parquet")
+            print(f"\n[ok] Gene list saved to var.parquet")
             print(f"  Output: {var_output_path}")
             print(f"  Genes: {len(genes)}")
             print(f"  Column nnz: included")
         except Exception as e:
-            print(f"\n✗ ERROR: Failed to save var.parquet: {e}")
+            print(f"\n[error] ERROR: Failed to save var.parquet: {e}")
             import traceback
             traceback.print_exc()
             if use_custom_mtx_dir:
-                print(f"\n⚠ MTX files preserved in: {temp_mtx_dir}")
+                print(f"\n[warn] MTX files preserved in: {temp_mtx_dir}")
                 print(f"  You can rerun the pipeline with --mtx-temp-dir {temp_mtx_dir} to continue from MTX files")
             raise
     
@@ -339,7 +339,7 @@ def build_zdata_from_zarr(
                 pass
     
     print("\n" + "=" * 70)
-    print("✓ Complete zdata object built successfully!")
+    print("[ok] Complete zdata object built successfully!")
     print("=" * 70)
     # Ensure zdata_dir is a Path object
     zdata_dir = Path(zdata_dir)
@@ -355,15 +355,15 @@ def build_zdata_from_zarr(
     
     print(f"\nOutput structure:")
     if metadata_file.exists():
-        print(f"  ✓ metadata.json")
+        print(f"  [ok] metadata.json")
     if xrm_dir.exists() and list(xrm_dir.glob("*.bin")):
-        print(f"  ✓ X_RM/ ({len(list(xrm_dir.glob('*.bin')))} chunk files)")
+        print(f"  [ok] X_RM/ ({len(list(xrm_dir.glob('*.bin')))} chunk files)")
     if xcm_dir.exists() and list(xcm_dir.glob("*.bin")):
-        print(f"  ✓ X_CM/ ({len(list(xcm_dir.glob('*.bin')))} chunk files)")
+        print(f"  [ok] X_CM/ ({len(list(xcm_dir.glob('*.bin')))} chunk files)")
     if obs_file.exists():
-        print(f"  ✓ {obs_output_filename}")
+        print(f"  [ok] {obs_output_filename}")
     if var_file.exists():
-        print(f"  ✓ var.parquet")
+        print(f"  [ok] var.parquet")
 
     # Optional post-build steps (sample_id, obs dtype optimisation, feature
     # presence). Shared with the MTX+CSV builder so the two cannot drift.
@@ -530,10 +530,10 @@ def main():
             mtx_temp_dir=args.mtx_temp_dir,
             min_nnz=args.min_nnz if args.min_nnz > 0 else None
         )
-        print(f"\n✓ Build complete! Output: {zdata_dir}")
+        print(f"\n[ok] Build complete! Output: {zdata_dir}")
         return 0
     except Exception as e:
-        print(f"\n✗ ERROR: {e}")
+        print(f"\n[error] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return 1

@@ -157,7 +157,7 @@ def check_zarr_directory(zarr_dir: str):
         for dataset in missing_barcode_datasets:
             print(f"  - {dataset}")
     else:
-        print("\n✓ 'barcode' column found in all datasets")
+        print("\n[ok] 'barcode' column found in all datasets")
     
     if obs_columns_dict:
         common_columns = obs_columns_dict[list(obs_columns_dict.keys())[0]].copy()
@@ -186,7 +186,7 @@ def check_zarr_directory(zarr_dir: str):
                 
                 writer.writerow([zarr_file_name, common_str, unique_str])
         
-        print(f"\n✓ CSV report saved to: {csv_path}")
+        print(f"\n[ok] CSV report saved to: {csv_path}")
     else:
         print("\nWARNING: No datasets found with 'obs' structure")
 
@@ -208,7 +208,7 @@ def main():
         check_zarr_directory(args.zarr_dir)
         return 0
     except Exception as e:
-        print(f"\n✗ ERROR: {e}")
+        print(f"\n[error] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return 1

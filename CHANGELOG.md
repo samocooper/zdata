@@ -54,6 +54,9 @@
 - **Windows builds now compile.** `mtx_to_zdata.c` called POSIX
   `mkdir(path, mode)`, but the Windows CRT `_mkdir` takes only a path, so the
   file had never compiled there. Wrapped in a `ZDATA_MKDIR` macro.
+- **Console output is ASCII-only.** Progress markers used `✓`/`✗`/`⚠`, which
+  raise `UnicodeEncodeError` on a Windows console using the cp1252 code page —
+  crashing the build and any user-facing command that printed one.
 - **Linux builds link against pthread.** zstd's amalgamation includes its
   thread pool; glibc >= 2.34 folds pthread into libc, but older glibc (as used
   by manylinux) needs `-pthread` explicitly.

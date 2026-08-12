@@ -383,7 +383,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
         
         print(f"  Writing MTX file: {os.path.basename(chunk_output_path)}")
         mmwrite(chunk_output_path, combined_matrix)
-        print(f"  ✓ {combined_matrix.shape[0]} rows × {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
+        print(f"  [ok] {combined_matrix.shape[0]} rows x {n_new_cols} cols, {combined_matrix.nnz} non-zeros")
         
         # Save both nnz and total counts to the same file as two columns
         row_stats_path = os.path.join(mtx_output_dir, f"rows_{row_start}_{row_end}_stats.txt")
@@ -615,7 +615,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     # Write column nnz to file (accumulated across all MTX files)
     column_nnz_path = os.path.join(output_dir, "column_nnz.txt")
     np.savetxt(column_nnz_path, column_nnz_accumulator, fmt='%u', delimiter='\n')
-    print(f"  ✓ Column nnz saved to {os.path.basename(column_nnz_path)}")
+    print(f"  [ok] Column nnz saved to {os.path.basename(column_nnz_path)}")
     
     # Write manifest file
     manifest_path = os.path.join(output_dir, "manifest.json")
@@ -637,7 +637,7 @@ def align_zarr_directory_to_mtx(zarr_dir, gene_list_path, output_dir, tmp_dir=No
     # Calculate total rows processed
     total_rows = sum(entry['n_rows'] for entry in manifest_data)
     
-    print(f"\n✓ Successfully wrote {len(output_files)} aligned MTX file(s)")
+    print(f"\n[ok] Successfully wrote {len(output_files)} aligned MTX file(s)")
     print(f"  Total rows processed: {total_rows}")
     print(f"  Total columns: {n_new_cols}")
     print(f"  Output directory: {output_dir}")
@@ -731,7 +731,7 @@ def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols)
         del matrix
         gc.collect()  # Force garbage collection after processing each MTX file
     
-    print(f"  ✓ Created {sum(len(frags) for frags in fragment_map.values())} transposed fragments in tmp directory")
+    print(f"  [ok] Created {sum(len(frags) for frags in fragment_map.values())} transposed fragments in tmp directory")
     
     # Step 2: Combine fragments covering the same column range
     # Process incrementally to avoid loading all fragments at once
@@ -798,20 +798,20 @@ def create_column_major_fragments(output_dir, mtx_output_dir, mtx_files, n_cols)
             cm_path = os.path.join(cm_mtx_dir, cm_filename)
             mmwrite(cm_path, combined_matrix)
             
-            print(f"      ✓ Combined {len(frag_list)} fragments -> {combined_matrix.shape[0]} rows × {combined_matrix.shape[1]} cols")
+            print(f"      [ok] Combined {len(frag_list)} fragments -> {combined_matrix.shape[0]} rows x {combined_matrix.shape[1]} cols")
             
             # Free memory immediately
             del combined_matrix
             gc.collect()
     
-    print(f"\n  ✓ Created {num_fragments} column-major MTX files in {cm_mtx_dir}")
-    print(f"  ✓ Column-major fragments allow efficient access to gene columns")
+    print(f"\n  [ok] Created {num_fragments} column-major MTX files in {cm_mtx_dir}")
+    print(f"  [ok] Column-major fragments allow efficient access to gene columns")
     
     # Clean up temporary fragments
     print(f"\n  Cleaning up temporary fragments...")
     try:
         shutil.rmtree(tmp_dir)
-        print(f"  ✓ Removed temporary directory: {tmp_dir}")
+        print(f"  [ok] Removed temporary directory: {tmp_dir}")
     except Exception as e:
         print(f"  WARNING: Could not remove temporary directory {tmp_dir}: {e}")
 
@@ -902,10 +902,10 @@ def main():
         else:
             print(f"ERROR: Input must be a directory containing .zarr files (directories) or .h5/.hdf5 files (h5ad format)")
             sys.exit(1)
-        print("\n✓ Alignment complete!")
+        print("\n[ok] Alignment complete!")
         return 0
     except Exception as e:
-        print(f"\n✗ ERROR: {e}")
+        print(f"\n[error] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return 1

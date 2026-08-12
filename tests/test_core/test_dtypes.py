@@ -1,8 +1,8 @@
 """
 Tests for all supported numpy numerical dtypes through the full pipeline.
 
-For each dtype: create an MTX file with known values → compress via
-mtx_to_zdata → read back via zdata_read (through ZData) → verify values.
+For each dtype: create an MTX file with known values -> compress via
+mtx_to_zdata -> read back via zdata_read (through ZData) -> verify values.
 """
 
 from __future__ import annotations

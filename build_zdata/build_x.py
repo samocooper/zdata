@@ -304,7 +304,7 @@ def build_zdata(mtx_file_or_dir, output_name, zstd_base=None, block_rows=16, blo
             metadata_file = zdata_dir / "metadata.json"
             with open(metadata_file, 'w') as f:
                 json.dump(combined_metadata, f, indent=2)
-            print(f"\n✓ Combined metadata written to {metadata_file}")
+            print(f"\n[ok] Combined metadata written to {metadata_file}")
         elif rm_metadata is not None:
             # Only RM metadata - already in new format
             metadata_file = zdata_dir / "metadata.json"
@@ -503,8 +503,8 @@ def _build_zdata_from_single_file(mtx_path, output_name, block_rows, max_rows, r
         json.dump(metadata, f, indent=2)
     
     # Suppress verbose output - only print if there's an issue
-    # print(f"✓ Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
-    # print(f"✓ Metadata written to {metadata_file}")
+    # print(f"[ok] Created {zdata_dir} with {num_chunks} chunks, {total_blocks} blocks")
+    # print(f"[ok] Metadata written to {metadata_file}")
     
     return zdata_dir
 
@@ -665,9 +665,9 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
             total_nnz += file_nnz
             
             # Suppress per-file verbose output
-            # print(f"  ✓ Processed {file_rows} rows, {file_nnz} nnz")
+            # print(f"  [ok] Processed {file_rows} rows, {file_nnz} nnz")
             # if chunk_nums_created:
-            #     print(f"  ✓ Copied {num_chunks_copied} chunks (chunks {min(chunk_nums_created)}-{max(chunk_nums_created)})")
+            #     print(f"  [ok] Copied {num_chunks_copied} chunks (chunks {min(chunk_nums_created)}-{max(chunk_nums_created)})")
     
     # Sort chunks by chunk_num to ensure metadata is in order
     all_chunk_metadata.sort(key=lambda c: c['chunk_num'])
@@ -697,12 +697,12 @@ def _build_zdata_from_multiple_files(mtx_files, output_name, block_rows, max_row
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
         # Suppress verbose output
-        # print(f"✓ Metadata written to {metadata_file}")
+        # print(f"[ok] Metadata written to {metadata_file}")
     
     # Reduced verbosity - single summary line
     if len(mtx_files) > 1:
         print()  # Newline after progress indicator
-    print(f"✓ {num_chunks} chunks, {total_rows} rows, {ncols} cols")
+    print(f"[ok] {num_chunks} chunks, {total_rows} rows, {ncols} cols")
     
     if return_metadata:
         return zdata_dir, metadata

@@ -166,7 +166,7 @@ def read_obs_from_zarr(zarr_path: str, zarr_name: str) -> pl.DataFrame:
         if skipped_columns:
             print(f"  WARNING: Skipped {len(skipped_columns)} non-standard columns: {', '.join(skipped_columns[:5])}")
             if 'disease' in skipped_columns:
-                print(f"  ⚠️  CRITICAL WARNING: 'disease' column was skipped from {zarr_name}!")
+                print(f"  [warn]  CRITICAL WARNING: 'disease' column was skipped from {zarr_name}!")
                 print(f"     This will cause 'disease' to be missing from the final output.")
                 print(f"     The column exists in the zarr file but has a non-standard structure.")
                 print(f"     Please check the zarr structure for 'obs/disease' in this file.")
@@ -434,7 +434,7 @@ def concat_obs_from_zarr_directory(
         if df is None:
             raise RuntimeError(f"Failed to read obs data from {file_name}. This file must be processed successfully - skipping is not allowed.")
         
-        print(f"    ✓ Read {df.height} rows, {len(df.columns)} columns")
+        print(f"    [ok] Read {df.height} rows, {len(df.columns)} columns")
         dataframes.append(df)
     
     if not dataframes:
@@ -446,7 +446,7 @@ def concat_obs_from_zarr_directory(
     print(f"\nJoining dataframes...")
     combined_df = concat_obs_dataframes(dataframes, join_strategy, join_on)
     
-    print(f"  ✓ Combined DataFrame: {combined_df.height} rows × {len(combined_df.columns)} columns")
+    print(f"  [ok] Combined DataFrame: {combined_df.height} rows x {len(combined_df.columns)} columns")
     
     # Add row nnz (number of non-zeros per row/cell) and total_counts - required
     if not row_nnz_files:
@@ -470,7 +470,7 @@ def concat_obs_from_zarr_directory(
         
         all_row_nnz.extend(nnz_values.tolist())
         all_row_total_counts.extend(total_counts_values.tolist())
-        print(f"  ✓ Loaded {len(nnz_values)} stats values from {os.path.basename(stats_file)}")
+        print(f"  [ok] Loaded {len(nnz_values)} stats values from {os.path.basename(stats_file)}")
     
     if len(all_row_nnz) != combined_df.height:
         raise ValueError(
@@ -489,7 +489,7 @@ def concat_obs_from_zarr_directory(
         .otherwise(None)
         .alias("scaling_factor")
     )
-    print(f"  ✓ Added nnz, total_counts, scaling_factor columns to obs DataFrame ({len(all_row_nnz)} values)")
+    print(f"  [ok] Added nnz, total_counts, scaling_factor columns to obs DataFrame ({len(all_row_nnz)} values)")
 
     # Add explicit integer index column BEFORE filtering
     # This ensures _row_index corresponds to the original row indices in the x matrix
@@ -502,10 +502,10 @@ def concat_obs_from_zarr_directory(
         combined_df = combined_df.filter(pl.col("nnz") >= min_nnz)
         after_rows = combined_df.height
         removed = before_rows - after_rows
-        print(f"  ✓ Filtered cells with nnz < {min_nnz}: removed {removed}, kept {after_rows}")
-        print(f"  ✓ _row_index preserved original row indices (0 to {before_rows-1}) to match x matrix")
+        print(f"  [ok] Filtered cells with nnz < {min_nnz}: removed {removed}, kept {after_rows}")
+        print(f"  [ok] _row_index preserved original row indices (0 to {before_rows-1}) to match x matrix")
     else:
-        print(f"  ✓ Cell filtering disabled (min_nnz={min_nnz})")
+        print(f"  [ok] Cell filtering disabled (min_nnz={min_nnz})")
     
     # Show column summary
     print(f"  Columns: {', '.join(combined_df.columns[:10])}" + 
@@ -521,7 +521,7 @@ def concat_obs_from_zarr_directory(
     
     combined_df.write_parquet(str(output_path), compression="zstd")
     
-    print(f"  ✓ Successfully wrote {combined_df.height} rows to {output_path}")
+    print(f"  [ok] Successfully wrote {combined_df.height} rows to {output_path}")
     print(f"  File size: {output_path.stat().st_size / (1024*1024):.2f} MB")
     
     return str(output_path)
@@ -596,11 +596,11 @@ def main():
             args.output_filename,
             row_nnz_files=args.row_nnz_files
         )
-        print(f"\n✓ Concatenation complete!")
+        print(f"\n[ok] Concatenation complete!")
         print(f"  Output file: {output_path}")
         return 0
     except Exception as e:
-        print(f"\n✗ ERROR: {e}")
+        print(f"\n[error] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return 1

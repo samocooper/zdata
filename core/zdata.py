@@ -534,7 +534,7 @@ class ZData:
             raise ValueError(
                 f"zdata_read returned {nreq} rows but {len(local_rows)} were requested "
                 f"for {file_path}. This usually indicates the C binary truncated the "
-                f"row list — rebuild zdata_read with the latest source."
+                f"row list -- rebuild zdata_read with the latest source."
             )
 
         # Version -> (numpy dtype, bytes). Canonical table lives in

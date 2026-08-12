@@ -108,7 +108,7 @@ class TestObsIndexCol:
         """read_rows with mapping returns the correct matrix rows."""
         zd_mapped = ZData(str(zdata_with_filtered_obs), obs_index_col="_row_index")
 
-        # Query obs row 0 in the mapped dataset → should be matrix row 0
+        # Query obs row 0 in the mapped dataset -> should be matrix row 0
         mapped_rows = zd_mapped.read_rows([0])
         direct_rows = zdata_instance.read_rows([0])
 
