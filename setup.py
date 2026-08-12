@@ -9,6 +9,26 @@ from pathlib import Path
 from setuptools import setup, find_packages
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
+from setuptools.dist import Distribution
+
+
+class BinaryDistribution(Distribution):
+    """Mark the distribution as platform-specific.
+
+    This package ships compiled C tools but declares no ext_modules, so
+    setuptools would otherwise consider it pure Python and tag every wheel
+    ``py3-none-any``. That tag claims the wheel works on any platform, while
+    the wheel actually contains a binary for whichever platform built it --
+    so a macOS or Windows user would receive a Linux executable and hit
+    "Exec format error" at runtime.
+
+    Returning True here gives wheels a platform tag (e.g.
+    ``py3-none-linux_x86_64``), so each platform's wheel is a distinct file
+    and pip resolves the right one.
+    """
+
+    def has_ext_modules(self):  # noqa: D102
+        return True
 
 
 def find_zstd_base():
@@ -346,6 +366,7 @@ setup(
     license="MIT",
     packages=["zdata", "zdata.core", "zdata.build_zdata", "zdata.ctools", "zdata.files"],
     package_dir={"zdata": "."},
+    distclass=BinaryDistribution,
     include_package_data=True,
     # Never ship compiled binaries in an sdist. include_package_data sweeps in
     # whatever sits under a package directory, so a maintainer who has run the
