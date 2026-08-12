@@ -4,9 +4,10 @@
 include ctools/*.c
 include ctools/*.h
 
-# Include README and LICENSE
+# Include README, LICENSE and changelog
 include README.md
 include LICENSE
+include CHANGELOG.md
 
 # Include default gene list (required for alignment)
 include files/2ks10c_genes.txt
