@@ -13,8 +13,8 @@ from pathlib import Path
 
 # Add the parent directory to the path so we can import zdata
 _test_dir = Path(__file__).parent
-_project_root = _test_dir.parent  # This is /home/ubuntu/zdata_work/zdata
-_parent_dir = _project_root.parent  # This is /home/ubuntu/zdata_work
+_project_root = _test_dir.parent          # the zdata package root
+_parent_dir = _project_root.parent        # its containing directory
 sys.path.insert(0, str(_parent_dir))
 
 # Import build_zdata_from_zarr
