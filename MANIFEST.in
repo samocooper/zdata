@@ -1,5 +1,8 @@
-# Include C source files
+# Include C source files. The headers matter as much as the .c: dtype_table.h
+# is generated from zdata/dtypes.py and #included by both tools, so omitting it
+# breaks compilation from an sdist.
 include ctools/*.c
+include ctools/*.h
 
 # Include README and LICENSE
 include README.md
@@ -10,8 +13,9 @@ include files/2ks10c_genes.txt
 
 # Include package data
 recursive-include core *.py
-recursive-include build *.py
+recursive-include build_zdata *.py
 recursive-include ctools *.c
+recursive-include ctools *.h
 
 # Include pre-compiled binaries if they exist (for fallback)
 # Platform-specific binaries

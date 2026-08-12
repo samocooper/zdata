@@ -28,6 +28,10 @@ DTYPE_SPECS = [
     ("int16",   np.int16,   [-32768, -1, 0, 1, 32767]),
     ("int32",   np.int32,   [-(2**30), -1, 0, 1, 2**30]),
     ("int64",   np.int64,   [-1000000, -1, 0, 1, 1000000]),
+    # binary16: values chosen to be exactly representable in half precision so
+    # the round-trip is lossless (max finite half is 65504; smallest normal
+    # 6.104e-5). 0.5/1.5/-3.25 have exact half representations.
+    ("float16", np.float16, [0.0, 1.5, -3.25, 2048.0]),
     ("float32", np.float32, [0.0, 1.5, -3.14, 1e6]),
     ("float64", np.float64, [0.0, 1.5, -3.14159265358979, 1e15]),
 ]
@@ -102,19 +106,8 @@ def _read_rows_binary(bin_path: Path, rows: list[int], block_rows: int = 4) -> l
     blob = result.stdout
     nreq, ncols, version = struct.unpack_from("<III", blob, 0)
 
-    # Version → numpy dtype mapping (mirrors core/zdata.py)
-    VERSION_DTYPE = {
-        2:  (np.uint16,  2),
-        3:  (np.float32, 4),
-        4:  (np.uint8,   1),
-        5:  (np.uint32,  4),
-        6:  (np.uint64,  8),
-        7:  (np.int8,    1),
-        8:  (np.int16,   2),
-        9:  (np.int32,   4),
-        10: (np.int64,   8),
-        11: (np.float64, 8),
-    }
+    # Canonical table -- see zdata/dtypes.py (single source of truth).
+    from zdata.dtypes import VERSION_TO_NUMPY as VERSION_DTYPE
     val_dtype, val_bytes = VERSION_DTYPE[version]
 
     off = 12

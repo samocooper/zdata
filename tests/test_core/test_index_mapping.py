@@ -207,3 +207,62 @@ class TestCombinedMapping:
         # Row reads should work
         rows = zd.read_rows([0])
         assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# No inference: a mapping column is used only when explicitly named
+# ---------------------------------------------------------------------------
+@pytest.fixture()
+def zdata_filtered_obs_no_map(zdata_instance: ZData, tmp_path: Path) -> Path:
+    """Filtered obs with NO ``_row_index`` column (unrecoverable subset)."""
+    import shutil
+
+    src = Path(zdata_instance.dir_path)
+    dst = tmp_path / "filtered_obs_no_map"
+    shutil.copytree(src, dst)
+
+    obs = pl.read_parquet(str(dst / "obs.parquet"))
+    filtered = obs[list(range(0, len(obs), 2))]
+    # The stock test obs carries a real _row_index column; drop it so this
+    # fixture genuinely represents "subset obs with no way to recover the map".
+    if "_row_index" in filtered.columns:
+        filtered = filtered.drop("_row_index")
+    filtered.write_parquet(str(dst / "obs.parquet"))
+    return dst
+
+
+class TestNoAutomaticInference:
+    """The mapping column is never inferred -- naming it is the only way in."""
+
+    def test_default_ignores_present_row_index(self, zdata_with_filtered_obs: Path):
+        """Even with _row_index present, the default stays standard row value."""
+        with pytest.raises(ValueError, match="obs.parquet has .* rows but the expression matrix"):
+            ZData(str(zdata_with_filtered_obs))
+
+    def test_named_column_is_used(self, zdata_with_filtered_obs: Path):
+        """Naming the column opts in to the mapping."""
+        zd = ZData(str(zdata_with_filtered_obs), obs_index_col="_row_index")
+        assert zd._obs_row_index_map is not None
+        assert len(zd.obs) < zd.nrows
+        assert len(zd.read_rows([0])) == 1
+
+    def test_missing_named_column_raises(self, zdata_filtered_obs_no_map: Path):
+        """Naming a column that does not exist is an error, not a fallback."""
+        with pytest.raises(ValueError, match="obs_index_col '_row_index' not found"):
+            ZData(str(zdata_filtered_obs_no_map), obs_index_col="_row_index")
+
+    def test_subset_without_column_raises(self, zdata_filtered_obs_no_map: Path):
+        """A genuine mismatch with no mapping column still raises."""
+        with pytest.raises(ValueError, match="obs.parquet has .* rows but the expression matrix"):
+            ZData(str(zdata_filtered_obs_no_map))
+
+    def test_var_named_column_is_used(self, zdata_with_filtered_var: Path):
+        """Symmetry: var behaves identically with an explicit name."""
+        zd = ZData(str(zdata_with_filtered_var), var_index_col="_col_index")
+        assert zd._var_col_index_map is not None
+        assert len(zd.var) < zd.ncols
+
+    def test_var_default_ignores_present_col_index(self, zdata_with_filtered_var: Path):
+        """var default is also standard column value, no inference."""
+        with pytest.raises(ValueError, match="var.parquet has .* rows but the expression matrix"):
+            ZData(str(zdata_with_filtered_var))

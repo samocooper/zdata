@@ -17,10 +17,15 @@ from enum import Enum
 from functools import partial
 from inspect import Parameter, signature
 from types import GenericAlias
-from typing import TYPE_CHECKING, Callable, NamedTuple, TypeGuard, cast
+from typing import TYPE_CHECKING, Callable, NamedTuple, TypeGuard, TypeVar, cast
 
 if TYPE_CHECKING:
     from typing import Any, Self
+
+# Python 3.11 compatibility: use explicit TypeVars instead of PEP 695 generic
+# syntax (`class Foo[T]` / `def bar[T]`), which is 3.12+ only.
+T = TypeVar("T")
+V = TypeVar("V")
 
 
 class DeprecatedOption(NamedTuple):
@@ -56,7 +61,7 @@ def describe(self: RegisteredOption, *, as_rst: bool = False) -> str:
     return textwrap.dedent(doc)
 
 
-class RegisteredOption[T](NamedTuple):
+class RegisteredOption(NamedTuple):
     """A registered configuration option."""
 
     option: str
@@ -68,7 +73,7 @@ class RegisteredOption[T](NamedTuple):
     describe = describe
 
 
-def check_and_get_environ_var[T](
+def check_and_get_environ_var(
     key: str,
     default_value: str,
     allowed_values: Iterable[str] | None = None,
@@ -214,7 +219,7 @@ class SettingsManager:
             option, message, removal_version
         )
 
-    def register[T](
+    def register(
         self,
         option: str,
         *,
@@ -405,7 +410,7 @@ settings = SettingsManager()
 ##################################################################################
 
 
-def gen_validator[V](_type: type[V] | tuple[type[V], ...], /) -> Callable[[V, SettingsManager], None]:
+def gen_validator(_type: type[V] | tuple[type[V], ...], /) -> Callable[[V, SettingsManager], None]:
     """Generate a validator function for a given type."""
 
     def validate_type(val: V, settings: SettingsManager) -> None:

@@ -19,6 +19,7 @@ import polars as pl
 from scipy.sparse import csc_matrix, csr_matrix
 
 from .._settings import settings
+from ..dtypes import DEFAULT_VERSION, VERSION_TO_NUMPY
 from .index import normalize_column_indices, normalize_row_indices
 from .utils import get_available_memory_bytes
 
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
     from polars import DataFrame as PolarsDataFrame
+
+# Conventional names for the optional position -> matrix-index mapping columns.
+# Nothing is ever detected automatically: the default is the standard row/column
+# value (1-to-1 alignment), and a mapping column is used only when the caller
+# names it explicitly. These constants exist so error messages can suggest the
+# conventional name.
+DEFAULT_OBS_INDEX_COL = "_row_index"
+DEFAULT_VAR_INDEX_COL = "_col_index"
 
 # Get the path to the zdata_read executable
 # This assumes the module structure: zdata/core/zdata.py and zdata/ctools/zdata_read
@@ -215,6 +224,7 @@ class ZData:
         dir_name: str | Path,
         obs_index_col: str | None = None,
         var_index_col: str | None = None,
+        obs_columns: "list[str] | None" = None,
     ) -> None:
         """\
         Initialize the reader for a zdata directory.
@@ -224,17 +234,21 @@ class ZData:
         dir_name
             Name or path of the zdata directory.
         obs_index_col
-            Optional column name (integer-typed) in obs.parquet to use as
-            a mapping from obs row positions to expression-matrix row indices.
-            When ``None`` (default), obs rows and matrix rows are assumed to
-            be aligned 1-to-1, and ``len(obs)`` must equal ``nrows``.
-            When set (e.g. ``"_row_index"``), queries index into obs first,
-            then the named column translates to the actual matrix row.
+            Controls how obs row positions map to expression-matrix rows.
+
+            * ``None`` (default) -- obs rows and matrix rows are aligned 1-to-1
+              (the standard row value *is* the matrix row). ``len(obs)`` must
+              equal ``nrows``, otherwise ``ValueError`` is raised.
+            * a string -- name of an integer column in obs.parquet holding, for
+              each obs position, its expression-matrix row index. Use this when
+              obs is a filtered subset of the matrix (e.g. cells dropped by QC);
+              the conventional name is ``"_row_index"``.
+
+            No column is ever selected automatically: a subset obs is only
+            handled when the caller names the mapping column.
         var_index_col
-            Same concept for var.parquet → expression-matrix column indices.
-            When ``None`` (default), var rows and matrix columns are aligned.
-            When set, the named column translates var positions to matrix
-            column indices.
+            Same contract for var.parquet -> matrix columns; the conventional
+            name is ``"_col_index"``.
 
         Raises
         ------
@@ -312,7 +326,19 @@ class ZData:
             )
         
         try:
-            self._obs_df: PolarsDataFrame = pl.read_parquet(obs_file)
+            if obs_columns is not None:
+                # Lazy / column-subset obs load: read only the requested columns
+                # plus those ZData needs internally (the index-mapping column and
+                # 'nnz' for read memory checks). Big memory win for wide obs.
+                avail = pl.scan_parquet(obs_file).collect_schema().names()
+                needed = list(obs_columns)
+                for must in (obs_index_col, "_row_index", "nnz"):
+                    if must and must in avail and must not in needed:
+                        needed.append(must)
+                needed = [c for c in needed if c in avail]
+                self._obs_df: PolarsDataFrame = pl.read_parquet(obs_file, columns=needed)
+            else:
+                self._obs_df = pl.read_parquet(obs_file)
             self._obs_wrapper: ObsWrapper = ObsWrapper(self._obs_df)
 
             var_polars = pl.read_parquet(var_file)
@@ -323,6 +349,9 @@ class ZData:
             raise RuntimeError(f"Failed to load parquet files: {e}") from e
 
         # --- obs index mapping ---------------------------------------------------
+        # Contract (see __init__ docstring):
+        #   None   -> standard row value; obs rows align 1-to-1 with matrix rows
+        #   <name> -> explicit mapping column. Never inferred.
         obs_nrows = len(self._obs_df)
         if obs_index_col is not None:
             if obs_index_col not in self._obs_df.columns:
@@ -346,11 +375,13 @@ class ZData:
                     f"obs.parquet has {obs_nrows} rows but the expression matrix "
                     f"has {self.nrows} rows. Dimensions must match when no "
                     f"obs_index_col is specified. To use a mapping column, pass "
-                    f"obs_index_col='<column_name>' (e.g. obs_index_col='_row_index')."
+                    f"obs_index_col='<column_name>' (e.g. "
+                    f"obs_index_col='{DEFAULT_OBS_INDEX_COL}')."
                 )
             self._obs_row_index_map = None
 
         # --- var index mapping ---------------------------------------------------
+        # Same contract as obs: None -> 1-to-1, or an explicitly named column.
         var_nrows = len(self._var_df)
         if var_index_col is not None:
             if var_index_col not in self._var_df.columns:
@@ -506,19 +537,10 @@ class ZData:
                 f"row list — rebuild zdata_read with the latest source."
             )
 
-        # Map version number to numpy dtype
-        _VERSION_DTYPE = {
-            2:  (np.uint16,  2),
-            3:  (np.float32, 4),
-            4:  (np.uint8,   1),
-            5:  (np.uint32,  4),
-            6:  (np.uint64,  8),
-            7:  (np.int8,    1),
-            8:  (np.int16,   2),
-            9:  (np.int32,   4),
-            10: (np.int64,   8),
-            11: (np.float64, 8),
-        }
+        # Version -> (numpy dtype, bytes). Canonical table lives in
+        # zdata/dtypes.py and is shared with the C tools via the generated
+        # ctools/dtype_table.h, so this cannot drift out of step.
+        _VERSION_DTYPE = VERSION_TO_NUMPY
         if version in _VERSION_DTYPE:
             val_dtype, val_bytes = _VERSION_DTYPE[version]
         else:

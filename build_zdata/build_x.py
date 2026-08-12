@@ -18,18 +18,14 @@ _PROJECT_ROOT = _MODULE_DIR.parent   # zdata/
 _MTX_TO_ZDATA = _PROJECT_ROOT / "ctools" / "mtx_to_zdata"
 
 # All numpy numerical dtypes supported by the C tools
-SUPPORTED_DTYPES = frozenset({
-    "uint8", "uint16", "uint32", "uint64",
-    "int8", "int16", "int32", "int64",
-    "float32", "float64",
-})
+# Canonical definitions live in zdata/dtypes.py -- the single source of truth
+# shared with the C tools (via the generated ctools/dtype_table.h) and the
+# reader. Do not re-declare the table here.
+from zdata.dtypes import NAME_TO_NUMPY as _DTYPE_NP  # noqa: E402
+from zdata.dtypes import SUPPORTED_DTYPES  # noqa: E402,F401
 
-# Map dtype name -> numpy scalar type (for the binary streaming protocol)
-_DTYPE_NP = {
-    "uint8": np.uint8, "uint16": np.uint16, "uint32": np.uint32, "uint64": np.uint64,
-    "int8": np.int8, "int16": np.int16, "int32": np.int32, "int64": np.int64,
-    "float32": np.float32, "float64": np.float64,
-}
+# (_DTYPE_NP -- name -> numpy scalar type, used by the binary streaming
+#  protocol -- is imported above from the canonical table.)
 
 
 def _coo_values_for_dtype(data, dtype):

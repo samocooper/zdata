@@ -12,29 +12,52 @@
 #define INITIAL_ROWS   8192
 
 /* -----------------------------------------------------------------------
-   Abstract dtype system – mirrors the table in mtx_to_zdata.c
+   Abstract dtype system. DTypeRead and DTYPE_READ_TABLE are generated from
+   zdata/dtypes.py -- the single source of truth shared with the Python layer
+   and with mtx_to_zdata.c. Regenerate with:
+       python -m zdata.dtypes --write-header
    ----------------------------------------------------------------------- */
-typedef struct {
-    uint32_t    version;
-    size_t      val_size;
-    const char *name;
-    const char *fmt;       /* printf format for text output */
-    int         is_float;  /* non-zero if floating-point type */
-} DTypeRead;
+#include "dtype_table.h"
 
-static const DTypeRead DTYPE_TABLE[] = {
-    {  2,  2, "uint16",  "%u",    0 },
-    {  3,  4, "float32", "%.6g",  1 },
-    {  4,  1, "uint8",   "%u",    0 },
-    {  5,  4, "uint32",  "%u",    0 },
-    {  6,  8, "uint64",  "%llu",  0 },
-    {  7,  1, "int8",    "%d",    0 },
-    {  8,  2, "int16",   "%d",    0 },
-    {  9,  4, "int32",   "%d",    0 },
-    { 10,  8, "int64",   "%lld",  0 },
-    { 11,  8, "float64", "%.15g", 1 },
-};
-#define NUM_DTYPES (sizeof(DTYPE_TABLE) / sizeof(DTYPE_TABLE[0]))
+#define DTYPE_TABLE DTYPE_READ_TABLE
+
+/* IEEE-754 binary16 -> float. Mirrors float_to_half_bits() in mtx_to_zdata.c;
+   native _Float16 where the compiler has it, explicit bit decode otherwise. */
+#if defined(__FLT16_MAX__) && !defined(ZDATA_NO_NATIVE_FLOAT16)
+#  define ZDATA_HAVE_NATIVE_FLOAT16 1
+#endif
+
+static float half_bits_to_float(uint16_t bits) {
+#ifdef ZDATA_HAVE_NATIVE_FLOAT16
+    _Float16 h;
+    memcpy(&h, &bits, sizeof h);
+    return (float)h;
+#else
+    uint32_t sign = (uint32_t)(bits & 0x8000u) << 16;
+    uint32_t expo = (bits >> 10) & 0x1Fu;
+    uint32_t mant = bits & 0x3FFu;
+    uint32_t out;
+    if (expo == 0u) {
+        if (mant == 0u) { out = sign; }             /* +/-0 */
+        else {                                       /* subnormal -> normalise */
+            expo = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0u) { mant <<= 1; expo--; }
+            mant &= 0x3FFu;
+            out = sign | (expo << 23) | (mant << 13);
+        }
+    } else if (expo == 0x1Fu) {                      /* Inf / NaN */
+        out = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out = sign | ((expo - 15 + 127) << 23) | (mant << 13);
+    }
+    {
+        float f;
+        memcpy(&f, &out, sizeof f);
+        return f;
+    }
+#endif
+}
+#define NUM_DTYPES ZDATA_NUM_DTYPES
 
 static const DTypeRead *dtype_by_version(uint32_t ver) {
     for (size_t i = 0; i < NUM_DTYPES; i++)
@@ -179,6 +202,7 @@ static void print_value(const void *data, uint32_t idx, const DTypeRead *dt) {
     case 9:  printf("%d",    ((const int32_t*)data)[idx]);  break;
     case 10: printf("%lld",  (long long)((const int64_t*)data)[idx]); break;
     case 11: printf("%.15g", ((const double*)data)[idx]);   break;
+    case 12: printf("%.4g",  half_bits_to_float(((const uint16_t*)data)[idx])); break;
     default: printf("?"); break;
     }
 }

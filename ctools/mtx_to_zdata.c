@@ -19,27 +19,12 @@
 /* -----------------------------------------------------------------------
    Abstract dtype system: version ↔ element size ↔ name
    ----------------------------------------------------------------------- */
-typedef struct {
-    uint32_t    version;
-    size_t      val_size;      /* bytes per element */
-    const char *name;          /* CLI name, e.g. "uint16" */
-} DTypeInfo;
+/* DTypeInfo and DTYPE_TABLE are generated from zdata/dtypes.py -- the single
+   source of truth shared with the Python layer. Regenerate with:
+       python -m zdata.dtypes --write-header                                  */
+#include "dtype_table.h"
 
-/* Lookup table – order does not matter; searched linearly (tiny table). */
-static const DTypeInfo DTYPE_TABLE[] = {
-    /* version, bytes, name */
-    {  2,  2, "uint16"  },   /* backward-compatible default */
-    {  3,  4, "float32" },   /* backward-compatible */
-    {  4,  1, "uint8"   },
-    {  5,  4, "uint32"  },
-    {  6,  8, "uint64"  },
-    {  7,  1, "int8"    },
-    {  8,  2, "int16"   },
-    {  9,  4, "int32"   },
-    { 10,  8, "int64"   },
-    { 11,  8, "float64" },
-};
-#define NUM_DTYPES (sizeof(DTYPE_TABLE) / sizeof(DTYPE_TABLE[0]))
+#define NUM_DTYPES ZDATA_NUM_DTYPES
 
 /* Currently selected dtype (default: uint16, version 2) */
 static const DTypeInfo *g_dtype = &DTYPE_TABLE[0];
@@ -64,6 +49,54 @@ static const DTypeInfo *dtype_by_version(uint32_t ver) {
     for (size_t i = 0; i < NUM_DTYPES; i++)
         if (DTYPE_TABLE[i].version == ver) return &DTYPE_TABLE[i];
     return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+   IEEE-754 binary16 ("half") encoding.
+
+   Uses the compiler's native _Float16 where available (GCC 12+, Clang 15+ on
+   common targets); otherwise falls back to an explicit bit-level conversion so
+   the on-disk bytes are identical either way. Both paths round-to-nearest and
+   saturate to +/-Inf on overflow, matching numpy's float16 cast.
+   --------------------------------------------------------------------------- */
+#if defined(__FLT16_MAX__) && !defined(ZDATA_NO_NATIVE_FLOAT16)
+#  define ZDATA_HAVE_NATIVE_FLOAT16 1
+#endif
+
+static uint16_t float_to_half_bits(double value) {
+#ifdef ZDATA_HAVE_NATIVE_FLOAT16
+    _Float16 h = (_Float16)value;
+    uint16_t bits;
+    memcpy(&bits, &h, sizeof bits);
+    return bits;
+#else
+    float f = (float)value;
+    uint32_t x;
+    memcpy(&x, &f, sizeof x);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t expo = (x >> 23) & 0xFFu;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (expo == 0xFFu)                       /* Inf / NaN */
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x0200u : 0u));
+
+    int32_t e = (int32_t)expo - 127 + 15;    /* rebias 127 -> 15 */
+    if (e >= 0x1F)                           /* overflow -> Inf */
+        return (uint16_t)(sign | 0x7C00u);
+    if (e <= 0) {                            /* subnormal or zero */
+        if (e < -10) return (uint16_t)sign;
+        mant |= 0x800000u;                   /* restore implicit leading 1 */
+        uint32_t shift = (uint32_t)(14 - e);
+        uint32_t h = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) h += 1u;   /* round half up */
+        return (uint16_t)(sign | h);
+    }
+    {
+        uint32_t h = ((uint32_t)e << 10) | (mant >> 13);
+        if (mant & 0x1000u) h += 1u;         /* round half up (may carry) */
+        return (uint16_t)(sign | h);
+    }
+#endif
 }
 
 /* Convert a double value (read from MTX text) to the target dtype and
@@ -132,6 +165,11 @@ static void store_value(void *dst, double value, const DTypeInfo *dt) {
     case 11: /* float64 */
         *(double *)dst = value;
         break;
+    case 12: { /* float16 (IEEE-754 binary16) */
+        uint16_t bits = float_to_half_bits(value);
+        memcpy(dst, &bits, sizeof bits);
+        break;
+    }
     default:
         /* Fallback: treat as uint16 */
         *(uint16_t *)dst = (uint16_t)(value + 0.5);
