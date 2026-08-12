@@ -135,3 +135,52 @@ Build parameters
    * - ``gene_list_path``
      - package default
      - Path to standard gene list
+
+Post-build steps
+----------------
+
+After the matrix and metadata are written, ``build_zdata_from_zarr`` and
+``build_zdata_from_mtx_csv`` run three optional steps. Each can be disabled
+with its own flag; all are on by default.
+
+``sample_id`` / ``sample_uid``
+    A ``sample_name`` is only unique *within* a study -- the same identifier
+    recurs across studies, and some studies leave it null. For batch correction
+    you need one globally-unique key, so :func:`zdata.assign_global_sample_id`
+    adds a monotonic integer ``sample_id`` (contiguous per study) and a readable
+    ``sample_uid``, falling back ``sample_name`` -> ``donor_id`` ->
+    ``sample_idx`` where values are missing.
+
+obs dtype optimisation
+    :func:`zdata.optimize_obs_parquet` recasts low-cardinality strings to
+    ``Enum`` and integers to their smallest fitting width. The win is in
+    **decoded** size -- on a large obs this is commonly 5-10x, which is what
+    matters when the whole table is loaded for training. On-disk size may be
+    flat or marginally worse, since parquet already compresses strings well.
+
+feature-presence matrix
+    In a multi-study atlas each study measures a different subset of genes.
+    Genes a study never measured are *structural* zeros, not biological ones,
+    and must be masked out of a reconstruction loss.
+    :func:`zdata.build_feature_presence_matrix` derives the mask from each
+    study's ``var.csv`` rather than from expression non-zeros -- a measured gene
+    that simply isn't expressed would otherwise be wrongly marked absent.
+
+    This step needs a per-study ``var.csv`` source. The MTX+CSV builder uses its
+    own input directories; the zarr builder has no such source, so pass
+    ``feature_presence_var_dirs=[...]`` to enable it.
+
+Failure policy
+~~~~~~~~~~~~~~
+
+These steps are optional, but several are load-bearing downstream: the
+feature-presence matrix is indexed by ``sample_id``, so a failure in the first
+step invalidates the third. By default a failure is reported and the build
+continues, with a summary at the end and dependent steps skipped rather than
+producing a second confusing error.
+
+Pass ``strict_post_build=True`` to raise on the first failure instead. That is
+the right choice for automated pipelines, where an atlas that *looks* built but
+is missing its batch key is worse than a loud error::
+
+    build_zdata_from_mtx_csv(input_dir, output_dir, strict_post_build=True)

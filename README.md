@@ -153,6 +153,49 @@ build_zdata_from_zarr(
 
 ---
 
+## Multi-study atlases
+
+When a zdata object integrates many studies, three optional steps run at the end
+of a build (each can be disabled; all are on by default):
+
+**Globally-unique sample keys.** A `sample_name` is only unique *within* a
+study, and some studies leave it null. `assign_global_sample_id` adds a
+monotonic integer `sample_id` — contiguous per study — plus a readable
+`sample_uid`, falling back `sample_name` → `donor_id` → `sample_idx`:
+
+```python
+from zdata import assign_global_sample_id
+assign_global_sample_id("my_dataset.zdata")
+```
+
+**Compact obs dtypes.** `optimize_obs_parquet` recasts low-cardinality strings
+to `Enum` and integers to their smallest fitting width. The saving is in
+*decoded* size — commonly 5–10× on a large obs, which is what matters when the
+whole table is loaded for training. It streams, so peak memory is not tied to
+file size.
+
+**Feature-presence mask.** In a multi-study atlas each study measures a
+different subset of genes. Genes a study never measured are *structural* zeros,
+not biological ones, and should be masked out of a reconstruction loss:
+
+```python
+from zdata import build_feature_presence_matrix
+build_feature_presence_matrix(
+    "my_dataset.zdata",
+    var_source_dirs=["/path/to/per_study_mtx"],   # each has <study>/var.csv
+    row_col="study_idx",                          # or "sample_id"
+)
+```
+
+Presence comes from each study's `var.csv`, not from expression non-zeros — a
+measured gene that simply isn't expressed in any cell would otherwise be wrongly
+marked absent.
+
+For pipelines, pass `strict_post_build=True` to the builders so a failed step
+raises instead of leaving an atlas that looks built but is missing its batch key.
+
+---
+
 ## Configuration
 
 Settings can be changed at runtime, via environment variables, or with a context manager:

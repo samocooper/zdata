@@ -25,6 +25,26 @@ Building datasets
 .. autofunction:: zdata.build_zdata
 
 
+Post-build steps
+----------------
+
+Optional steps run after a dataset is built. They are what turn a readable
+zdata object into one that machine-learning pipelines can train on: a
+globally-unique sample key, compact obs dtypes, and a structural-zero mask.
+
+.. autofunction:: zdata.run_post_build_steps
+
+.. autoexception:: zdata.PostBuildError
+
+.. autofunction:: zdata.assign_global_sample_id
+
+.. autofunction:: zdata.build_feature_presence_matrix
+
+.. autofunction:: zdata.optimize_obs_parquet
+
+.. autofunction:: zdata.optimize_obs_dtypes
+
+
 Utilities
 ---------
 
